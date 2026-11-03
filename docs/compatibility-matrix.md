@@ -7,8 +7,9 @@ own end-to-end tests do not cover every content type.
 
 The matrix covers the HFC installer and its carried content. It does **not** cover the
 experimental in-client interpreter in `crates/hfc-runtime`; that runtime has its own
-[design note](architecture/fabric-runtime.md) and its own limits (no Java screens, Mixins,
-GUI or general Fabric API).
+[design note](architecture/fabric-runtime.md) and its own limits (no Mixins, no general
+Fabric API, and only a partial replayed GUI: Mod Menu's list opens, but icons, scissor
+clipping and some description text are missing).
 
 ## Player-facing result
 
@@ -17,7 +18,7 @@ GUI or general Fabric API).
 | Pure data/content jar (no entrypoints, mixins or access widener) | generated content folder, enabled | content loads; `ready` |
 | Content mod with Java registration code (the common case) | blocks/items/models/textures/lang/recipes/tags that the carry pipeline supports | content loads; **Java code does not run**; `content-only` |
 | Library / code-only mod | nothing installed | `not portable` (or blocked on a missing dependency) |
-| Client UI/keybind/HUD mod | assets may be carried; UI, keys and HUD do not exist | `content-only` at best |
+| Client UI/keybind/HUD mod | assets may be carried; the installer provides no UI, keys or HUD (the separate experimental runtime can replay some screens) | `content-only` at best |
 | Shader pack (Iris/OptiFine) | not handled by jar conversion | see [shaders.md](architecture/shaders.md) |
 | Mod with an id Horizon cannot load (e.g. `fabric-api`) | analyzed, not installed | blocked with a rename message |
 | Broken/non-Fabric jar | analyzed, reported, skipped | untouched |
@@ -99,10 +100,11 @@ install the result safely.
 | Generated code / native mods | none in v1 |
 | Shader packs | not handled |
 
-## Explicitly not compatible in v1
+## Explicitly not compatible in the installer path (v1)
 
 - Fabric Loader entry points, Mixins, access wideners and Fabric API.
-- Client screens, keybinds, HUD, rendering hooks and client events.
+- Client screens, keybinds, HUD, rendering hooks and client events; the experimental runtime
+  has a partial screen host, but it is not part of the installer and makes no general claim.
 - Networking, entities, block entities, menus, inventories as *behaviour*.
 - Anything that requires Minecraft Java classes or a JVM.
 - Iris/OptiFine shader packs.

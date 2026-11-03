@@ -37,12 +37,17 @@ mod's id or class name is not coverage and must not be added.
 | `hfc-cache` (keying, commit, recovery, prune, stats) | 6 |
 | `hfc-bootstrap` unit (config, state, report, install, ids, carry verification) | 12 |
 | `hfc-bootstrap` end to end | 5 |
-| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics) | 12 |
-| **HFC total** | **56** |
+| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, Mod Menu screen) | 13 |
+| **HFC total** | **57** |
 | Launcher `fabric_compat` (`cargo test --lib fabric_compat`) | 3 |
 
 `cargo test --workspace` also runs the tests of the path-dependency crates under
 `workspace/horizon`; those are Horizon's own suites, not HFC tests.
+
+The runtime suite also opens Mod Menu's own `ModsScreen` through its registered Fabric key
+mapping, replays more than 100 `GuiGraphicsExtractor` draws, checks rendered labels, and
+closes the screen with Escape. That test skips when the pinned jars or a Minecraft install
+are absent.
 
 The end-to-end tests cover:
 

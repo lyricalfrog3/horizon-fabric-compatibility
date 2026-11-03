@@ -11,6 +11,10 @@ pub struct Heap {
     interned_classes: HashMap<String, usize>,
     pub loaded_mods: HashMap<String, crate::bridge::FabricModMetadata>,
     pub translations: HashMap<String, String>,
+    /// Process-wide objects such as `Minecraft.getInstance()` and its font.
+    /// A JVM keeps these in the class's static fields; the runtime keeps them
+    /// here so builtins can share one without an interpreter borrow.
+    singletons: HashMap<String, usize>,
 }
 
 impl Heap {
@@ -21,7 +25,16 @@ impl Heap {
             interned_classes: HashMap::new(),
             loaded_mods: HashMap::new(),
             translations: HashMap::new(),
+            singletons: HashMap::new(),
         }
+    }
+
+    pub fn get_singleton(&self, key: &str) -> Option<usize> {
+        self.singletons.get(key).copied()
+    }
+
+    pub fn set_singleton(&mut self, key: &str, id: usize) {
+        self.singletons.insert(key.to_string(), id);
     }
 
     /// Add a collection of translations to the heap.

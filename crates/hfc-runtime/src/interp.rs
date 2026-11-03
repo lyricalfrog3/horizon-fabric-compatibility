@@ -85,7 +85,15 @@ impl Interpreter {
 
     fn note_missing(&mut self, what: String) {
         if self.trace_missing {
-            self.missing.push(what);
+            let caller = if self.trace_calls {
+                self.call_stack
+                    .last()
+                    .map(|frame| format!(" <- {frame}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            self.missing.push(format!("{what}{caller}"));
         }
     }
 
@@ -340,6 +348,226 @@ impl Interpreter {
             }
         }
 
+        // Java streams: keep the common lazy-looking operations eager. Fabric and
+        // Minecraft GUI code builds lists with filter/map/collect; dropping them
+        // silently empties screens and config models.
+        if class_name == "java/util/stream/Stream" && !args.is_empty() {
+            let stream_id = args[0].as_obj();
+            let items = stream_id.and_then(|id| match self.heap.get(id) {
+                Some(JavaObject::Stream(items)) => Some(items.clone()),
+                _ => None,
+            });
+            if let Some(items) = items {
+                match method_name {
+                    "filter" | "anyMatch" | "allMatch" | "noneMatch" => {
+                        let predicate = args.get(1).cloned().unwrap_or(Value::NULL);
+                        let mut kept = Vec::new();
+                        let (mut any, mut all) = (false, true);
+                        for item in items {
+                            let result = self.execute_method(
+                                "java/util/function/Predicate",
+                                "test",
+                                "(Ljava/lang/Object;)Z",
+                                &[predicate.clone(), item.clone()],
+                            )?;
+                            let pass = result.as_bool();
+                            any |= pass;
+                            all &= pass;
+                            if method_name == "filter" && pass {
+                                kept.push(item);
+                            }
+                        }
+                        return Ok(match method_name {
+                            "filter" => {
+                                Value::Object(Some(self.heap.alloc(JavaObject::Stream(kept))))
+                            }
+                            "anyMatch" => Value::from_bool(any),
+                            "allMatch" => Value::from_bool(all),
+                            _ => Value::from_bool(!any),
+                        });
+                    }
+                    "map" => {
+                        let function = args.get(1).cloned().unwrap_or(Value::NULL);
+                        let mut mapped = Vec::new();
+                        for item in items {
+                            mapped.push(self.execute_method(
+                                "java/util/function/Function",
+                                "apply",
+                                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[function.clone(), item],
+                            )?);
+                        }
+                        return Ok(Value::Object(Some(
+                            self.heap.alloc(JavaObject::Stream(mapped)),
+                        )));
+                    }
+                    "sorted" => {
+                        let comparator = args.get(1).cloned().unwrap_or(Value::NULL);
+                        let mut sorted = items;
+                        // Insertion sort: the comparator may be interpreted Java, so
+                        // it cannot run inside a Rust `sort_by` closure that borrows self.
+                        for i in 1..sorted.len() {
+                            let mut j = i;
+                            while j > 0 {
+                                let order = if comparator.is_null() {
+                                    natural_order(&sorted[j - 1], &sorted[j])
+                                } else {
+                                    self.execute_method(
+                                        "java/util/Comparator",
+                                        "compare",
+                                        "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                                        &[
+                                            comparator.clone(),
+                                            sorted[j - 1].clone(),
+                                            sorted[j].clone(),
+                                        ],
+                                    )?
+                                    .as_int()
+                                };
+                                if order <= 0 {
+                                    break;
+                                }
+                                sorted.swap(j - 1, j);
+                                j -= 1;
+                            }
+                        }
+                        return Ok(Value::Object(Some(
+                            self.heap.alloc(JavaObject::Stream(sorted)),
+                        )));
+                    }
+                    "distinct" => {
+                        let mut unique: Vec<Value> = Vec::new();
+                        for item in items {
+                            if !unique.contains(&item) {
+                                unique.push(item);
+                            }
+                        }
+                        return Ok(Value::Object(Some(
+                            self.heap.alloc(JavaObject::Stream(unique)),
+                        )));
+                    }
+                    "forEach" => {
+                        let consumer = args.get(1).cloned().unwrap_or(Value::NULL);
+                        for item in items {
+                            let _ = self.execute_method(
+                                "java/util/function/Consumer",
+                                "accept",
+                                "(Ljava/lang/Object;)V",
+                                &[consumer.clone(), item],
+                            );
+                        }
+                        return Ok(Value::NULL);
+                    }
+                    "count" => return Ok(Value::Long(items.len() as i64)),
+                    "toList" => {
+                        return Ok(Value::Object(Some(self.heap.alloc_list(items))));
+                    }
+                    "findFirst" | "findAny" => {
+                        let mut fields = HashMap::new();
+                        if let Some(first) = items.first() {
+                            fields.insert("value".into(), first.clone());
+                        }
+                        let id = self.heap.alloc(JavaObject::Instance {
+                            class_name: "java/util/Optional".into(),
+                            fields,
+                        });
+                        return Ok(Value::Object(Some(id)));
+                    }
+                    "collect" => {
+                        let kind = args
+                            .get(1)
+                            .and_then(|v| v.as_obj())
+                            .and_then(|id| match self.heap.get(id) {
+                                Some(JavaObject::Instance { fields, .. }) => {
+                                    fields.get("type").and_then(|v| v.as_obj())
+                                }
+                                _ => None,
+                            })
+                            .and_then(|id| self.heap.get_string(id))
+                            .unwrap_or("toList")
+                            .to_string();
+                        return Ok(match kind.as_str() {
+                            "toSet" => Value::Object(Some(self.heap.alloc_set(items))),
+                            "joining" => {
+                                let joined = items
+                                    .iter()
+                                    .filter_map(|v| {
+                                        v.as_obj().and_then(|id| self.heap.get_string(id))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                Value::Object(Some(self.heap.alloc_string(joined)))
+                            }
+                            _ => Value::Object(Some(self.heap.alloc_list(items))),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Comparator built from an int-key function, and its reverse. The
+        // actual comparison stays here so the key function can be Java.
+        if class_name == "java/util/Comparator" && !args.is_empty() {
+            if method_name == "comparingInt" {
+                let function = args.get(1).cloned().unwrap_or(Value::NULL);
+                let mut fields = HashMap::new();
+                fields.insert("function".into(), function);
+                let id = self.heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Comparator".into(),
+                    fields,
+                });
+                return Ok(Value::Object(Some(id)));
+            }
+            if method_name == "reversed" {
+                let mut fields = HashMap::new();
+                fields.insert("reversed".into(), args[0].clone());
+                let id = self.heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Comparator".into(),
+                    fields,
+                });
+                return Ok(Value::Object(Some(id)));
+            }
+            if method_name == "compare" && args.len() >= 3 {
+                let fields = match self.heap.get(args[0].as_obj().unwrap_or(usize::MAX)) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.clone(),
+                    _ => HashMap::new(),
+                };
+                if let Some(inner) = fields.get("reversed").cloned() {
+                    let inner_order = self.execute_method(
+                        "java/util/Comparator",
+                        "compare",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                        &[inner, args[1].clone(), args[2].clone()],
+                    )?;
+                    return Ok(Value::Int(-inner_order.as_int()));
+                }
+                if let Some(function) = fields.get("function").cloned() {
+                    let left = self.execute_method(
+                        "java/util/function/ToIntFunction",
+                        "applyAsInt",
+                        "(Ljava/lang/Object;)I",
+                        &[function.clone(), args[1].clone()],
+                    )?;
+                    let right = self.execute_method(
+                        "java/util/function/ToIntFunction",
+                        "applyAsInt",
+                        "(Ljava/lang/Object;)I",
+                        &[function, args[2].clone()],
+                    )?;
+                    let (left, right) = (left.as_int(), right.as_int());
+                    return Ok(Value::Int(if left < right {
+                        -1
+                    } else if left > right {
+                        1
+                    } else {
+                        0
+                    }));
+                }
+                // A lambda comparator is unpacked by the branch at the top.
+            }
+        }
+
         if class_name == "java/lang/Thread" && (method_name == "start" || method_name == "start0") {
             return Ok(Value::NULL);
         }
@@ -355,7 +583,14 @@ impl Interpreter {
         }
 
         // 1. Built-in shims
-        match dispatch_builtin(&mut self.heap, class_name, method_name, descriptor, args) {
+        match dispatch_builtin(
+            &mut self.heap,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+            virtual_dispatch,
+        ) {
             BuiltinResult::Handled(v) => {
                 log::trace!("  Builtin returned: {:?}", v);
                 return Ok(v);
@@ -1388,6 +1623,27 @@ impl Interpreter {
         }
 
         // Minecraft enum/singleton constants
+        if class_name == "com/mojang/blaze3d/platform/InputConstants$Key" {
+            let mut f = HashMap::new();
+            f.insert("value".into(), Value::Int(-1));
+            let id = self.heap.alloc(JavaObject::Instance {
+                class_name: class_name.into(),
+                fields: f,
+            });
+            return Value::Object(Some(id));
+        }
+
+        if class_name == "net/minecraft/client/KeyMapping$Category" {
+            let fid = self.heap.alloc_string(field_name);
+            let mut f = HashMap::new();
+            f.insert("name".into(), Value::Object(Some(fid)));
+            let id = self.heap.alloc(JavaObject::Instance {
+                class_name: class_name.into(),
+                fields: f,
+            });
+            return Value::Object(Some(id));
+        }
+
         if class_name == "net/minecraft/world/InteractionHand" {
             let fid = self.heap.alloc_string(field_name);
             let id = self.heap.alloc(JavaObject::Instance {
@@ -1525,6 +1781,25 @@ impl Interpreter {
             id: field_name.to_lowercase(),
         });
         Value::Object(Some(id))
+    }
+}
+
+/// Order two values for `Stream.sorted()` without a comparator. Objects have
+/// no natural order here; callers that need one pass a comparator.
+fn natural_order(a: &Value, b: &Value) -> i32 {
+    let order = match (a, b) {
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Long(a), Value::Long(b)) => a.cmp(b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Double(a), Value::Double(b)) => {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        _ => std::cmp::Ordering::Equal,
+    };
+    match order {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }
 

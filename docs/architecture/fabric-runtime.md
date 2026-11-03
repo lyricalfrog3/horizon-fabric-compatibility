@@ -18,6 +18,7 @@ gameplay, screens, rendering or networking work.
 | Runtime builtins | `crates/hfc-runtime/src/builtins.rs` | Java/JDK, Fabric API and Minecraft shims |
 | Client adapter | `workspace/horizon/crates/horizon-client/src/game/fabric_bridge.rs` | Loads jars, supplies the real Minecraft classpath, bridges host blocks/items |
 | Client hooks | `.../game/native_hooks.rs`, `.../game/stations.rs` | Right-click dispatch, tooltip text and tooltip colors |
+| Fabric screens | `.../game/fabric_bridge.rs`, `Screen::Fabric` in `game.rs` | Replays the recorded GUI calls and routes mouse/key/char input |
 
 The interpreter is **not a JVM and not a sandbox**. It executes mod bytecode in the client
 process with a custom heap and builtins. Only run mods you trust.
@@ -92,17 +93,35 @@ the server applies the harvest.
 | Fabric `ItemTooltipCallback` | dispatched | text lines can be added/changed |
 | Iceberg `RenderTooltipEvents.COLOREXT` | dispatched | background/border colors and gradient flags |
 | Iceberg `GATHER` / `POSTEXT` | **not dispatched** | Legendary Tooltips needs these for its frame |
-| Fabric `ScreenEvents.AFTER_INIT` | **not dispatched** | Mod Menu cannot add its title-screen button or open `ModsScreen` |
-| Fabric `ClientTickEvents` | **not dispatched** | keybinds and tick-driven UI do not run |
+| Fabric `ScreenEvents.AFTER_INIT` | dispatched | runs for every initialized mod screen |
+| Fabric `ClientTickEvents` | dispatched | runs once per host tick, before the screen tick |
+| Fabric key mappings | supported | `KeyMapping`, `KeyMappingHelper` and `consumeClick`; the host binds by translation key or physical key |
 | Mixins / access wideners | **not applied** | Java patches are outside this runtime |
 
 ### Mod Menu
 
-`ModMenu.onInitializeClient` now completes with the 10M budget. Its UI still cannot appear:
-`ModsScreen` extends the real `Screen`, builds widgets and renders through
-`GuiGraphicsExtractor`. The runtime has no `Minecraft.setScreen`, `Screen`, widget-list or
-GUI renderer, so Horizon's native Mods page remains the visible screen. This is a missing
-host feature, not a budget failure.
+`ModMenu.onInitializeClient` completes, registers a Fabric key mapping and a client-tick
+listener. Pressing that mapping through the host opens `ModsScreen`; the host initializes it
+and replays its `GuiGraphicsExtractor` display list. The list itself is real: it builds an
+`AbstractSelectionList`, filters all loaded mods and renders their names. A pinned test
+(`tests/modmenu_screen.rs`) opens the screen from the key mapping, asserts more than 100
+draws, checks that `Minecraft` and other labels are present, and closes it with Escape.
+
+The rendering is partial, and the runtime does not claim Mod Menu is fully working:
+
+- **Icons are placeholders.** Texture loading is a host boundary. `NativeImage.read`,
+  `DynamicTexture`, `TextureManager.register` and `Minecraft.getTextureManager` avoid the GPU,
+  so icon creation can complete; the host has no mod icon to draw.
+- **Scissor state is recorded but not replayed.** A scrolled list can draw rows past its
+  bounds until the host adds clipping.
+- **Description text is incomplete.** The description panel can render `null` and an empty
+  component while fields it reads are still missing; names, titles, buttons and the list are
+  the parts demonstrated by the test.
+- **Input uses 26.3's SDL scancodes.** `KeyEvent.key` is a scancode (`Escape` is 41), not a
+  GLFW key number; the host maps winit keys to that convention before dispatching.
+- **Only the Fabric screen host exists.** There is no general widget/layout engine; the real
+  Minecraft `Screen`, `AbstractSelectionList` and widget bytecode runs, and the host replays
+  the recorded calls.
 
 ### Legendary Tooltips
 
@@ -114,6 +133,35 @@ only a solid background plus top/bottom border colors. Mod tooltip textures are 
 Until a textured tooltip renderer, those two events and a live client level exist, the mod's
 frame will not be visible even though its listener runs.
 
+## GUI replay
+
+`GuiGraphicsExtractor` calls are recorded into a `GuiDraw` display list
+(`crates/hfc-runtime/src/minecraft.rs`) instead of touching the GPU:
+`fill`, `fillGradient`, `text`, `centeredText`, `blit`, `blitSprite`, and scissor bounds.
+`FabricBridge::render_screen(width, height, partial_tick)` runs the real
+`Screen.extractRenderStateWithTooltipAndSubtitles` and returns that list. The host
+(`Game::draw_fabric_screen`) replays fills and text through `HudBatch`; it draws a blit only
+when the HUD atlas has the sprite. `Screen::init` runs whenever the screen object or GUI size
+changes.
+
+Input is a host boundary too. `FabricBridge` builds real `KeyEvent`, `CharacterEvent` and
+`MouseButtonEvent` objects (with their 26.3 field layouts) and dispatches to the screen's
+`keyPressed`/`charTyped`/`mouseClicked`/`mouseReleased`/`mouseScrolled`/`mouseMoved`.
+`Minecraft` and `Gui.setScreen` keep the installed screen where mods read it back.
+
+Key mappings are registered by `KeyMappingHelper.registerKeyMapping` and stored in the
+runtime's mapping registry. `FabricBridge::press_key_mapping(name)` triggers one by its
+translation key and then runs `ClientTickEvents.END_CLIENT_TICK`, which is how Mod Menu opens
+its screen. `press_key_code` does the same for every mapping bound to a physical key. The
+host exposes the translation-key form as:
+
+```sh
+horizon-ctl fabric-key key.modmenu.open_menu
+```
+
+This is a generic binding action: it looks up any Fabric mapping by its registered name and
+does not know which mod owns it.
+
 ## Tests
 
 Runtime tests use third-party jars from `test-mods/` and, for classpath tests, a local
@@ -124,9 +172,10 @@ cargo test -p hfc-runtime
 cargo fmt --check -p hfc-runtime
 ```
 
-The suite covers bridge loading, RCH harvesting, real JDK/Minecraft bytecode, JImage loading
-and missing-class diagnostics. A test that needs the real game classpath skips or fails
-clearly when the installation is absent; it must not silently pass with fabricated classes.
+The suite covers bridge loading, RCH harvesting, real JDK/Minecraft bytecode, JImage loading,
+missing-class diagnostics and the Mod Menu screen path. A test that needs the real game
+classpath skips or fails clearly when the installation is absent; it must not silently pass
+with fabricated classes.
 
 ## Adding a builtin or event
 

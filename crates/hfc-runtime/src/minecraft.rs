@@ -5,6 +5,70 @@ use crate::value::{NativeObject, Value};
 use std::any::Any;
 use std::collections::HashMap;
 
+/// One recorded `GuiGraphics` operation. The runtime cannot issue GPU calls
+/// itself, so a screen's extraction pass records what it would draw and the
+/// host replays the list in its own draw batch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GuiDraw {
+    Fill {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        color: i32,
+    },
+    Text {
+        text: String,
+        x: i32,
+        y: i32,
+        color: i32,
+    },
+    Blit {
+        texture: String,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    Scissor {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+    },
+    ScissorOff,
+}
+
+/// A `GuiGraphicsExtractor` display list, sized in GUI pixels.
+#[derive(Debug, Clone)]
+pub struct GuiGraphics {
+    pub width: i32,
+    pub height: i32,
+    pub draws: Vec<GuiDraw>,
+}
+
+impl GuiGraphics {
+    pub fn new(width: i32, height: i32) -> Self {
+        Self {
+            width,
+            height,
+            draws: Vec::new(),
+        }
+    }
+}
+
+impl NativeObject for GuiGraphics {
+    fn class_name(&self) -> &str {
+        "net/minecraft/client/gui/GuiGraphicsExtractor"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// A BlockPos (x, y, z).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockPos {

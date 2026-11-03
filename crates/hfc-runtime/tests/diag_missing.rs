@@ -16,15 +16,15 @@ fn an_unimplemented_class_is_null_and_recorded() {
 
     let value = interp
         .execute_method(
-            "net/minecraft/client/Minecraft",
-            "getInstance",
-            "()Lnet/minecraft/client/Minecraft;",
+            "hfc/runtime/NotImplemented",
+            "run",
+            "()Lhfc/runtime/NotImplemented;",
             &[],
         )
         .expect("an unknown class is a null result, not a failure");
 
     assert_eq!(value, Value::NULL);
-    assert_eq!(interp.missing, ["class net/minecraft/client/Minecraft"]);
+    assert_eq!(interp.missing, ["class hfc/runtime/NotImplemented"]);
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn nothing_is_recorded_when_tracing_is_off() {
     let mut interp = Interpreter::new();
 
     let value = interp
-        .execute_method("net/minecraft/client/Minecraft", "getInstance", "()V", &[])
+        .execute_method("hfc/runtime/NotImplemented", "run", "()V", &[])
         .expect("still null");
 
     assert_eq!(value, Value::NULL);

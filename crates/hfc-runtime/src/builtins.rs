@@ -32,6 +32,106 @@ fn get_default_drops(block_id: &str) -> Vec<(String, i32)> {
     }
 }
 
+/// The values a Java collection-like object holds, for `addAll`/`addAll`
+/// style calls that cross List, Set, Array and Stream representations.
+fn collection_items(heap: &Heap, val: &Value) -> Vec<Value> {
+    let Some(id) = val.as_obj() else {
+        return Vec::new();
+    };
+    match heap.get(id) {
+        Some(JavaObject::List(items)) | Some(JavaObject::Set(items)) => items.clone(),
+        Some(JavaObject::Stream(items)) => items.clone(),
+        Some(JavaObject::Array { elements, .. }) => elements.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Text carried by a string, component, or formatted text object. Components
+/// built by the runtime keep their plain text in a `text` field; formatted
+/// sequences copy it from the component they were made from.
+fn text_of_value(heap: &Heap, val: &Value) -> String {
+    if let Some(id) = val.as_obj() {
+        if let Some(s) = heap.get_string(id) {
+            return s.to_string();
+        }
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+            for key in ["text", "value", "string", "contents"] {
+                if let Some(inner) = fields.get(key) {
+                    if !inner.is_null() {
+                        return text_of_value(heap, inner);
+                    }
+                }
+            }
+            if let Some(sibs_id) = fields.get("siblings").and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::List(parts)) = heap.get(sibs_id) {
+                    return parts.iter().map(|p| text_of_value(heap, p)).collect();
+                }
+            }
+        }
+    }
+    value_to_string(heap, val)
+}
+
+/// Font width in GUI pixels. The runtime has no glyph atlas, so text layout
+/// uses the vanilla-like 6 pixel advance (4 for a space). The host draws the
+/// same strings with its own font, so this only affects the layout arithmetic
+/// mods do themselves.
+fn text_width(text: &str) -> i32 {
+    text.chars()
+        .map(|c| if c == ' ' { 4 } else { 6 })
+        .sum::<i32>()
+}
+
+/// The resource id of a `Identifier`/`ResourceLocation` object.
+fn identifier_of(heap: &Heap, val: &Value) -> String {
+    if let Some(id) = val.as_obj() {
+        if let Some(s) = heap.get_string(id) {
+            return s.to_string();
+        }
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+            let namespace = fields.get("namespace").map(|v| text_of_value(heap, v));
+            let path = fields.get("path").map(|v| text_of_value(heap, v));
+            if let (Some(namespace), Some(path)) = (namespace, path) {
+                if !path.is_empty() {
+                    return if namespace.is_empty() {
+                        path
+                    } else {
+                        format!("{namespace}:{path}")
+                    };
+                }
+            }
+            for key in ["id", "value"] {
+                if let Some(v) = fields.get(key) {
+                    let s = text_of_value(heap, v);
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// The first `Identifier` argument, skipping a render pipeline or sprite.
+fn identifier_argument(heap: &Heap, args: &[Value], from: usize) -> String {
+    for arg in args.iter().skip(from) {
+        let Some(id) = arg.as_obj() else {
+            continue;
+        };
+        let Some(JavaObject::Instance { class_name, .. }) = heap.get(id) else {
+            continue;
+        };
+        if class_name.ends_with("Identifier") || class_name.ends_with("ResourceLocation") {
+            let value = identifier_of(heap, arg);
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+    String::new()
+}
+
 fn value_to_string(heap: &Heap, val: &Value) -> String {
     match val {
         Value::Int(i) => i.to_string(),
@@ -121,7 +221,41 @@ pub fn dispatch_builtin(
     method_name: &str,
     descriptor: &str,
     args: &[Value],
+    virtual_dispatch: bool,
 ) -> BuiltinResult {
+    // Collection builtins model the runtime's own List/Map/Set/Iterator objects.
+    // A real Java implementation reached through an interface call must run its
+    // own bytecode instead, otherwise e.g. AbstractSelectionList$TrackedList.size()
+    // would be answered with the native list size (0) and the list would render empty.
+    if virtual_dispatch
+        && args
+            .first()
+            .and_then(|v| v.as_obj())
+            .is_some_and(|id| matches!(heap.get(id), Some(JavaObject::Instance { .. })))
+        && matches!(
+            class_name,
+            "java/util/List"
+                | "java/util/ArrayList"
+                | "java/util/LinkedList"
+                | "java/util/Collection"
+                | "java/lang/Iterable"
+                | "java/util/Set"
+                | "java/util/HashSet"
+                | "java/util/LinkedHashSet"
+                | "java/util/TreeSet"
+                | "java/util/Map"
+                | "java/util/HashMap"
+                | "java/util/LinkedHashMap"
+                | "java/util/TreeMap"
+                | "java/util/concurrent/ConcurrentHashMap"
+                | "java/util/concurrent/ConcurrentMap"
+                | "java/util/Map$Entry"
+                | "java/util/Iterator"
+        )
+    {
+        return BuiltinResult::NotHandled;
+    }
+
     // -------------------------------------------------------------
     // 1. java/lang/Object
     // -------------------------------------------------------------
@@ -1137,6 +1271,19 @@ pub fn dispatch_builtin(
                     return BuiltinResult::Handled(Value::from_bool(true));
                 }
             }
+        } else if method_name == "addAll" && args.len() >= 2 {
+            let added = collection_items(heap, &args[1]);
+            if let Some(id) = args[0].as_obj() {
+                match heap.get_mut(id) {
+                    Some(JavaObject::List(items)) | Some(JavaObject::Set(items)) => {
+                        let count = added.len();
+                        items.extend(added);
+                        return BuiltinResult::Handled(Value::from_bool(count > 0));
+                    }
+                    _ => {}
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
         } else if method_name == "clear" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(JavaObject::List(items)) = heap.get_mut(id) {
@@ -2447,6 +2594,465 @@ pub fn dispatch_builtin(
     }
 
     // -------------------------------------------------------------
+    // 14b. Client GUI
+    // -------------------------------------------------------------
+    // Minecraft's client singleton. Mods read `font`, `gui`, `options`,
+    // `level`, `player` and `window` from it, and open their screens through
+    // `minecraft.gui.setScreen`.
+    if class_name == "net/minecraft/client/Minecraft" {
+        if method_name == "getInstance" {
+            if let Some(id) = heap.get_singleton("net/minecraft/client/Minecraft") {
+                return BuiltinResult::Handled(Value::Object(Some(id)));
+            }
+            let font = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/client/gui/Font".into(),
+                fields: [("lineHeight".to_string(), Value::Int(9))].into(),
+            });
+            let gui = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/client/gui/Gui".into(),
+                fields: [("screen".to_string(), Value::NULL)].into(),
+            });
+            let options = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/client/Options".into(),
+                fields: [
+                    ("guiScale".to_string(), Value::Int(2)),
+                    ("renderDistance".to_string(), Value::Int(12)),
+                    ("fullscreen".to_string(), Value::from_bool(false)),
+                ]
+                .into(),
+            });
+            let window = heap.alloc(JavaObject::Instance {
+                class_name: "com/mojang/blaze3d/platform/Window".into(),
+                fields: [
+                    ("width".to_string(), Value::Int(1280)),
+                    ("height".to_string(), Value::Int(720)),
+                    ("guiScaledWidth".to_string(), Value::Int(640)),
+                    ("guiScaledHeight".to_string(), Value::Int(360)),
+                    ("guiScale".to_string(), Value::Int(2)),
+                ]
+                .into(),
+            });
+            let level = heap.alloc_level(Level::new(true));
+            let player = heap.alloc_player(Player::new(0));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/client/Minecraft".into(),
+                fields: [
+                    ("font".to_string(), Value::Object(Some(font))),
+                    ("gui".to_string(), Value::Object(Some(gui))),
+                    ("options".to_string(), Value::Object(Some(options))),
+                    ("window".to_string(), Value::Object(Some(window))),
+                    ("level".to_string(), Value::Object(Some(level))),
+                    ("player".to_string(), Value::Object(Some(player))),
+                    ("screen".to_string(), Value::NULL),
+                ]
+                .into(),
+            });
+            heap.set_singleton("net/minecraft/client/Minecraft", id);
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "getWindow" {
+            if let Some(id) = heap.get_singleton("net/minecraft/client/Minecraft") {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(window) = fields.get("window") {
+                        return BuiltinResult::Handled(window.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "hasShiftDown" {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "setScreen" && args.len() >= 2 {
+            let screen = args[1].clone();
+            if let Some(mc) = heap.get_singleton("net/minecraft/client/Minecraft") {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(mc) {
+                    fields.insert("screen".into(), screen.clone());
+                    if let Some(gui) = fields.get("gui").and_then(|v| v.as_obj()) {
+                        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(gui) {
+                            fields.insert("screen".into(), screen);
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getTextureManager" {
+            let tm = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/client/renderer/texture/TextureManager".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(tm)));
+        }
+    }
+
+    // Texture loading is a host boundary: the runtime has no GPU and no glyph
+    // atlas, so decoded images are placeholders and registered textures are
+    // never uploaded. The host draws the display list itself.
+    if class_name == "com/mojang/blaze3d/platform/NativeImage" {
+        if method_name == "read" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "com/mojang/blaze3d/platform/NativeImage".into(),
+                fields: [
+                    ("width".to_string(), Value::Int(64)),
+                    ("height".to_string(), Value::Int(64)),
+                ]
+                .into(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "getWidth" {
+            return BuiltinResult::Handled(Value::Int(64));
+        } else if method_name == "getHeight" {
+            return BuiltinResult::Handled(Value::Int(64));
+        }
+    }
+
+    if class_name == "net/minecraft/client/renderer/texture/DynamicTexture"
+        && method_name == "<init>"
+    {
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    if class_name == "net/minecraft/client/renderer/texture/TextureManager"
+        && method_name == "register"
+    {
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    if class_name == "net/minecraft/client/Options" && method_name == "guiScale" {
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/client/OptionInstance".into(),
+            fields: [("value".to_string(), Value::Int(2))].into(),
+        });
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
+    if class_name == "net/minecraft/client/OptionInstance" && method_name == "get" {
+        return BuiltinResult::Handled(Value::Int(2));
+    }
+
+    if class_name == "net/minecraft/client/renderer/texture/AbstractTexture"
+        && method_name == "close"
+    {
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    // Fabric key mappings: the host owns the keyboard, the runtime keeps the
+    // mapping objects so ClientTickEvents listeners can consume clicks.
+    if class_name == "net/minecraft/client/KeyMapping" {
+        if method_name == "<init>" {
+            if let Some(this_id) = args.first().and_then(|v| v.as_obj()) {
+                let mut fields = HashMap::new();
+                if let Some(name) = args.get(1).cloned() {
+                    fields.insert("name".into(), name);
+                }
+                if let Some(key) = args.get(3).cloned() {
+                    fields.insert("key".into(), key);
+                }
+                if let Some(category) = args.get(4).cloned() {
+                    fields.insert("category".into(), category);
+                }
+                fields.insert("clickCount".into(), Value::Int(0));
+                if let Some(JavaObject::Instance { fields: f, .. }) = heap.get_mut(this_id) {
+                    *f = fields;
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "consumeClick" {
+            if let Some(this_id) = args.first().and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                    let count = fields.get("clickCount").map(|v| v.as_int()).unwrap_or(0);
+                    if count > 0 {
+                        fields.insert("clickCount".into(), Value::Int(count - 1));
+                        return BuiltinResult::Handled(Value::from_bool(true));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "isDown" {
+            if let Some(this_id) = args.first().and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                    return BuiltinResult::Handled(Value::from_bool(
+                        fields.get("isDown").map(|v| v.as_bool()).unwrap_or(false),
+                    ));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "setKey" && args.len() >= 2 {
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                    fields.insert("key".into(), args[1].clone());
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getKey" {
+            if let Some(this_id) = args.first().and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                    return BuiltinResult::Handled(
+                        fields.get("key").cloned().unwrap_or(Value::Int(-1)),
+                    );
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(-1));
+        } else if method_name == "matches" && args.len() >= 3 {
+            let key = args[0]
+                .as_obj()
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => {
+                        fields.get("key").map(|v| v.as_int())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(-1);
+            return BuiltinResult::Handled(Value::from_bool(key == args[1].as_int()));
+        }
+    }
+
+    if class_name == "net/fabricmc/fabric/api/client/keymapping/v1/KeyMappingHelper"
+        && method_name == "registerKeyMapping"
+    {
+        let mapping = args.first().cloned().unwrap_or(Value::NULL);
+        let registry = heap
+            .get_singleton("hfc:fabric_key_mappings")
+            .unwrap_or_else(|| heap.alloc_list(Vec::new()));
+        heap.set_singleton("hfc:fabric_key_mappings", registry);
+        if let Some(JavaObject::List(items)) = heap.get_mut(registry) {
+            items.push(mapping.clone());
+        }
+        return BuiltinResult::Handled(mapping);
+    }
+
+    if class_name == "com/mojang/blaze3d/platform/InputConstants$Key" && method_name == "getValue" {
+        if let Some(this_id) = args.first().and_then(|v| v.as_obj()) {
+            if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                if let Some(value) = fields.get("value") {
+                    return BuiltinResult::Handled(value.clone());
+                }
+            }
+        }
+        return BuiltinResult::Handled(Value::Int(-1));
+    }
+
+    // Gui.setScreen shows a screen and keeps it where mods read it back from.
+    if class_name == "net/minecraft/client/gui/Gui" {
+        if method_name == "setScreen" && args.len() >= 2 {
+            let screen = args[1].clone();
+            if let Some(gui) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(gui) {
+                    fields.insert("screen".into(), screen.clone());
+                }
+            }
+            if let Some(mc) = heap.get_singleton("net/minecraft/client/Minecraft") {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(mc) {
+                    fields.insert("screen".into(), screen);
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if (method_name == "screen" || method_name == "getScreen") && !args.is_empty() {
+            if let Some(gui) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(gui) {
+                    return BuiltinResult::Handled(
+                        fields.get("screen").cloned().unwrap_or(Value::NULL),
+                    );
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Font: metrics used by screens for layout. GuiGraphicsExtractor carries
+    // the actual string, so measurement only needs a stable approximation.
+    if class_name == "net/minecraft/client/gui/Font" {
+        if method_name == "width" && args.len() >= 2 {
+            return BuiltinResult::Handled(Value::Int(text_width(&text_of_value(heap, &args[1]))));
+        } else if method_name == "lineHeight" {
+            return BuiltinResult::Handled(Value::Int(9));
+        } else if method_name == "plainSubstrByWidth" && args.len() >= 3 {
+            let text = text_of_value(heap, &args[1]);
+            let max = args[2].as_int();
+            let mut out = String::new();
+            for c in text.chars() {
+                let mut next = out.clone();
+                next.push(c);
+                if text_width(&next) > max {
+                    break;
+                }
+                out = next;
+            }
+            let sid = heap.alloc_string(out);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "split" && args.len() >= 3 {
+            let text = text_of_value(heap, &args[1]);
+            let max = args[2].as_int().max(1);
+            let mut lines = Vec::new();
+            let mut current = String::new();
+            for word in text.split_inclusive(' ') {
+                if !current.is_empty() && text_width(&(current.clone() + word)) > max {
+                    lines.push(heap.alloc_string(current.trim_end().to_string()));
+                    current.clear();
+                }
+                current.push_str(word);
+            }
+            if !current.is_empty() {
+                lines.push(heap.alloc_string(current.trim_end().to_string()));
+            }
+            let values = lines
+                .into_iter()
+                .map(|id| Value::Object(Some(id)))
+                .collect();
+            let list = heap.alloc_list(values);
+            return BuiltinResult::Handled(Value::Object(Some(list)));
+        } else if method_name == "wordWrapHeight" && args.len() >= 3 {
+            let text = text_of_value(heap, &args[1]);
+            let max = args[2].as_int().max(1);
+            let lines = (text_width(&text) + max - 1) / max;
+            return BuiltinResult::Handled(Value::Int(lines.max(1) * 9));
+        }
+    }
+
+    // GuiGraphicsExtractor display-list recording. The host replays this list;
+    // the runtime never touches the GPU.
+    if class_name == "net/minecraft/client/gui/GuiGraphicsExtractor" {
+        let mut draw = None;
+        if method_name == "fill" && args.len() >= 6 {
+            draw = Some(GuiDraw::Fill {
+                x1: args[1].as_int(),
+                y1: args[2].as_int(),
+                x2: args[3].as_int(),
+                y2: args[4].as_int(),
+                color: args[5].as_int(),
+            });
+        } else if method_name == "fillGradient" && args.len() >= 7 {
+            draw = Some(GuiDraw::Fill {
+                x1: args[1].as_int(),
+                y1: args[2].as_int(),
+                x2: args[3].as_int(),
+                y2: args[4].as_int(),
+                color: args[5].as_int(),
+            });
+        } else if (method_name == "horizontalLine" || method_name == "verticalLine")
+            && args.len() >= 5
+        {
+            draw = Some(GuiDraw::Fill {
+                x1: args[1].as_int(),
+                y1: args[2].as_int(),
+                x2: args[3].as_int(),
+                y2: args[4].as_int(),
+                color: args
+                    .get(5)
+                    .map(Value::as_int)
+                    .unwrap_or(0xFFFF_FFFFu32 as i32),
+            });
+        } else if (method_name == "text" || method_name == "centeredText") && args.len() >= 6 {
+            let text = text_of_value(heap, &args[2]);
+            let mut x = args[3].as_int();
+            if method_name == "centeredText" {
+                x -= text_width(&text) / 2;
+            }
+            draw = Some(GuiDraw::Text {
+                text,
+                x,
+                y: args[4].as_int(),
+                color: args[5].as_int(),
+            });
+        } else if method_name == "textWithWordWrap" && args.len() >= 7 {
+            draw = Some(GuiDraw::Text {
+                text: text_of_value(heap, &args[2]),
+                x: args[3].as_int(),
+                y: args[4].as_int(),
+                color: args
+                    .get(6)
+                    .map(Value::as_int)
+                    .unwrap_or(0xFFFF_FFFFu32 as i32),
+            });
+        } else if (method_name == "blit" || method_name == "blitSprite") && args.len() >= 5 {
+            // Pipeline-taking overloads carry the pipeline before the texture.
+            let texture = identifier_argument(heap, args, 1);
+            let (x, y, width, height) = if method_name == "blit" && descriptor.contains("IIFF") {
+                // blit(pipeline, texture, x, y, u, v, w, h, texW, texH, color)
+                (
+                    args.get(3).map(Value::as_int).unwrap_or(0),
+                    args.get(4).map(Value::as_int).unwrap_or(0),
+                    args.get(7).map(Value::as_int).unwrap_or(16).max(1),
+                    args.get(8).map(Value::as_int).unwrap_or(16).max(1),
+                )
+            } else {
+                (
+                    args.get(3).map(Value::as_int).unwrap_or(0),
+                    args.get(4).map(Value::as_int).unwrap_or(0),
+                    args.get(5).map(Value::as_int).unwrap_or(16).max(1),
+                    args.get(6).map(Value::as_int).unwrap_or(16).max(1),
+                )
+            };
+            draw = Some(GuiDraw::Blit {
+                texture,
+                x,
+                y,
+                width,
+                height,
+            });
+        } else if method_name == "enableScissor" && args.len() >= 5 {
+            draw = Some(GuiDraw::Scissor {
+                x1: args[1].as_int(),
+                y1: args[2].as_int(),
+                x2: args[3].as_int(),
+                y2: args[4].as_int(),
+            });
+        } else if method_name == "disableScissor" {
+            draw = Some(GuiDraw::ScissorOff);
+        } else if matches!(
+            method_name,
+            "item"
+                | "fakeItem"
+                | "itemDecorations"
+                | "setTooltipForNextFrame"
+                | "setComponentTooltipForNextFrame"
+                | "tooltip"
+                | "requestCursor"
+                | "applyCursor"
+                | "nextStratum"
+                | "blurBeforeThisStratum"
+                | "textHighlight"
+                | "outline"
+                | "textWithBackdrop"
+                | "extractDeferredElements"
+                | "setPreeditOverlay"
+        ) {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+        if let Some(draw) = draw {
+            if let Some(graphics) = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native_mut::<GuiGraphics>(id))
+            {
+                graphics.draws.push(draw);
+            }
+            return BuiltinResult::Handled(if method_name == "containsPointInScissor" {
+                Value::from_bool(true)
+            } else if method_name == "guiWidth" {
+                Value::Int(0)
+            } else if method_name == "guiHeight" {
+                Value::Int(0)
+            } else {
+                Value::NULL
+            });
+        }
+        if method_name == "guiWidth" {
+            if let Some(graphics) = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<GuiGraphics>(id))
+            {
+                return BuiltinResult::Handled(Value::Int(graphics.width));
+            }
+        } else if method_name == "guiHeight" {
+            if let Some(graphics) = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<GuiGraphics>(id))
+            {
+                return BuiltinResult::Handled(Value::Int(graphics.height));
+            }
+        } else if method_name == "containsPointInScissor" {
+            return BuiltinResult::Handled(Value::from_bool(true));
+        }
+    }
+
+    // -------------------------------------------------------------
     // 15. Minecraft Types
     // -------------------------------------------------------------
     // BlockPos
@@ -3045,9 +3651,16 @@ pub fn dispatch_builtin(
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
         } else if method_name == "getVisualOrderText" {
+            let text = args
+                .first()
+                .map(|v| text_of_value(heap, v))
+                .unwrap_or_default();
+            let sid = heap.alloc_string(text);
+            let mut fields = HashMap::new();
+            fields.insert("text".into(), Value::Object(Some(sid)));
             let id = heap.alloc(JavaObject::Instance {
                 class_name: "net/minecraft/util/FormattedCharSequence".into(),
-                fields: HashMap::new(),
+                fields,
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
         } else if method_name == "empty" {
@@ -3266,9 +3879,16 @@ pub fn dispatch_builtin(
             let sid = heap.alloc_string(val);
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         } else if method_name == "getVisualOrder" {
+            let text = args
+                .get(1)
+                .map(|v| text_of_value(heap, v))
+                .unwrap_or_default();
+            let sid = heap.alloc_string(text);
+            let mut fields = HashMap::new();
+            fields.insert("text".into(), Value::Object(Some(sid)));
             let id = heap.alloc(JavaObject::Instance {
                 class_name: "net/minecraft/util/FormattedCharSequence".into(),
-                fields: HashMap::new(),
+                fields,
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
         }

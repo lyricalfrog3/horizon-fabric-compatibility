@@ -1,0 +1,20 @@
+[package]
+name = "hfc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command line front end for Horizon Fabric Compatibility"
+
+[[bin]]
+name = "hfc"
+path = "src/main.rs"
+
+[dependencies]
+hfc-core = { path = "../hfc-core" }
+hfc-fabric = { path = "../hfc-fabric" }
+hfc-cache = { path = "../hfc-cache" }
+hfc-bootstrap = { path = "../hfc-bootstrap" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

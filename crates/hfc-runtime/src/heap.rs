@@ -1,0 +1,155 @@
+//! Heap memory storage for JVM objects.
+
+use crate::value::{JavaObject, NativeObject, Value};
+use std::collections::HashMap;
+
+/// The heap storing all allocated Java objects.
+#[derive(Default, Debug)]
+pub struct Heap {
+    objects: Vec<Option<JavaObject>>,
+    interned_strings: HashMap<String, usize>,
+    interned_classes: HashMap<String, usize>,
+    pub loaded_mods: HashMap<String, crate::bridge::FabricModMetadata>,
+    pub translations: HashMap<String, String>,
+}
+
+impl Heap {
+    pub fn new() -> Self {
+        Self {
+            objects: Vec::new(),
+            interned_strings: HashMap::new(),
+            interned_classes: HashMap::new(),
+            loaded_mods: HashMap::new(),
+            translations: HashMap::new(),
+        }
+    }
+
+    /// Add a collection of translations to the heap.
+    pub fn add_translations(&mut self, entries: impl IntoIterator<Item = (String, String)>) {
+        self.translations.extend(entries);
+    }
+
+    /// Get a translation by key.
+    pub fn get_translation(&self, key: &str) -> Option<&str> {
+        self.translations.get(key).map(|s| s.as_str())
+    }
+
+    /// Check if a translation key exists.
+    pub fn has_translation(&self, key: &str) -> bool {
+        self.translations.contains_key(key)
+    }
+
+    /// Register a loaded Fabric mod's metadata.
+    pub fn register_mod(&mut self, meta: crate::bridge::FabricModMetadata) {
+        self.loaded_mods.insert(meta.id.clone(), meta);
+    }
+
+    /// Check if a mod with the given ID is loaded.
+    pub fn is_mod_loaded(&self, id: &str) -> bool {
+        self.loaded_mods.contains_key(id)
+            || matches!(id, "fabric" | "fabricloader" | "minecraft" | "java")
+    }
+
+    /// Look up a mod's metadata by ID.
+    pub fn get_mod(&self, id: &str) -> Option<&crate::bridge::FabricModMetadata> {
+        self.loaded_mods.get(id)
+    }
+
+    /// Allocate a new object and return its ID.
+    pub fn alloc(&mut self, obj: JavaObject) -> usize {
+        let id = self.objects.len();
+        self.objects.push(Some(obj));
+        id
+    }
+
+    /// Allocate a native object.
+    pub fn alloc_native<T: NativeObject + 'static>(&mut self, obj: T) -> usize {
+        self.alloc(JavaObject::Native(Box::new(obj)))
+    }
+
+    /// Intern a string and return its heap ID.
+    pub fn alloc_string(&mut self, s: impl Into<String>) -> usize {
+        let s = s.into();
+        if let Some(&id) = self.interned_strings.get(&s) {
+            return id;
+        }
+        let id = self.alloc(JavaObject::String(s.clone()));
+        self.interned_strings.insert(s, id);
+        id
+    }
+
+    /// Intern a class and return its heap ID.
+    pub fn alloc_class(&mut self, s: impl Into<String>) -> usize {
+        let s = s.into().replace('.', "/");
+        if let Some(&id) = self.interned_classes.get(&s) {
+            return id;
+        }
+        let id = self.alloc(JavaObject::Class(s.clone()));
+        self.interned_classes.insert(s, id);
+        id
+    }
+
+    /// Get an object reference by ID.
+    pub fn get(&self, id: usize) -> Option<&JavaObject> {
+        self.objects.get(id).and_then(Option::as_ref)
+    }
+
+    /// Get a mutable object reference by ID.
+    pub fn get_mut(&mut self, id: usize) -> Option<&mut JavaObject> {
+        self.objects.get_mut(id).and_then(Option::as_mut)
+    }
+
+    /// Get a string value by ID.
+    pub fn get_string(&self, id: usize) -> Option<&str> {
+        match self.get(id)? {
+            JavaObject::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Downcast a native object reference.
+    pub fn get_native<T: 'static>(&self, id: usize) -> Option<&T> {
+        match self.get(id)? {
+            JavaObject::Native(n) => n.as_any().downcast_ref::<T>(),
+            _ => None,
+        }
+    }
+
+    /// Mutably downcast a native object reference.
+    pub fn get_native_mut<T: 'static>(&mut self, id: usize) -> Option<&mut T> {
+        match self.get_mut(id)? {
+            JavaObject::Native(n) => n.as_any_mut().downcast_mut::<T>(),
+            _ => None,
+        }
+    }
+
+    /// Convenience for creating a Value::Object.
+    pub fn obj_val(&mut self, obj: JavaObject) -> Value {
+        Value::Object(Some(self.alloc(obj)))
+    }
+
+    /// Allocate a Java List object.
+    pub fn alloc_list(&mut self, items: Vec<Value>) -> usize {
+        self.alloc(JavaObject::List(items))
+    }
+
+    /// Allocate a Java Map object.
+    pub fn alloc_map(&mut self, entries: Vec<(Value, Value)>) -> usize {
+        self.alloc(JavaObject::Map(entries))
+    }
+
+    /// Allocate a Java Set object.
+    pub fn alloc_set(&mut self, items: Vec<Value>) -> usize {
+        self.alloc(JavaObject::Set(items))
+    }
+
+    /// Allocate a Java Stream object.
+    pub fn alloc_stream(&mut self, items: Vec<Value>) -> usize {
+        self.alloc(JavaObject::Stream(items))
+    }
+
+    /// Allocate a Java Iterator object.
+    pub fn alloc_iterator(&mut self, items: Vec<Value>) -> usize {
+        self.alloc(JavaObject::Iterator { items, cursor: 0 })
+    }
+}

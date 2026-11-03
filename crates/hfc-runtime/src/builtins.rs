@@ -1,0 +1,3320 @@
+//! Built-in shims for Java standard library, Fabric API, and Minecraft runtime classes.
+
+use crate::heap::Heap;
+use crate::minecraft::*;
+use crate::value::{JavaObject, Value};
+use std::collections::HashMap;
+
+/// Result of dispatching a method to builtins.
+pub enum BuiltinResult {
+    /// Handled by a builtin; returns a value (or Value::NULL for void).
+    Handled(Value),
+    /// Not a builtin; should be executed as bytecode.
+    NotHandled,
+}
+
+/// Default drop table for vanilla Minecraft crop blocks.
+fn get_default_drops(block_id: &str) -> Vec<(String, i32)> {
+    match block_id {
+        "minecraft:wheat" => vec![
+            ("minecraft:wheat".to_string(), 1),
+            ("minecraft:wheat_seeds".to_string(), 2),
+        ],
+        "minecraft:carrots" => vec![("minecraft:carrot".to_string(), 2)],
+        "minecraft:potatoes" => vec![("minecraft:potato".to_string(), 2)],
+        "minecraft:beetroots" => vec![
+            ("minecraft:beetroot".to_string(), 1),
+            ("minecraft:beetroot_seeds".to_string(), 2),
+        ],
+        "minecraft:nether_wart" => vec![("minecraft:nether_wart".to_string(), 2)],
+        "minecraft:cocoa" => vec![("minecraft:cocoa_beans".to_string(), 2)],
+        _ => vec![(block_id.to_string(), 1)],
+    }
+}
+
+fn value_to_string(heap: &Heap, val: &Value) -> String {
+    match val {
+        Value::Int(i) => i.to_string(),
+        Value::Long(l) => l.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Object(Some(id)) => {
+            if let Some(s) = heap.get_string(*id) {
+                s.to_string()
+            } else if let Some(JavaObject::Instance { fields, .. }) = heap.get(*id) {
+                if let Some(Value::Object(Some(sid))) = fields.get("text") {
+                    if let Some(s) = heap.get_string(*sid) {
+                        return s.to_string();
+                    }
+                }
+                format!("[Object {id}]")
+            } else {
+                format!("[Object {id}]")
+            }
+        }
+        Value::Object(None) => "null".to_string(),
+    }
+}
+
+fn format_translation(template: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return template.to_string();
+    }
+    let mut res = String::new();
+    let mut chars = template.chars().peekable();
+    let mut arg_idx = 0;
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let Some(&next) = chars.peek() {
+                if next == '%' {
+                    chars.next();
+                    res.push('%');
+                    continue;
+                }
+                if next.is_ascii_digit() {
+                    let mut num_str = String::new();
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() {
+                            num_str.push(d);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if chars.peek() == Some(&'$') {
+                        chars.next();
+                        let spec = chars.next().unwrap_or('s');
+                        let _ = spec;
+                        if let Ok(idx) = num_str.parse::<usize>() {
+                            if idx > 0 && idx <= args.len() {
+                                res.push_str(&args[idx - 1]);
+                                continue;
+                            }
+                        }
+                    } else {
+                        res.push('%');
+                        res.push_str(&num_str);
+                        continue;
+                    }
+                } else if next == 's' || next == 'd' || next == 'f' {
+                    chars.next();
+                    if arg_idx < args.len() {
+                        res.push_str(&args[arg_idx]);
+                        arg_idx += 1;
+                    } else {
+                        res.push('%');
+                        res.push(next);
+                    }
+                    continue;
+                }
+            }
+        }
+        res.push(c);
+    }
+    res
+}
+
+/// Try to dispatch a method call to built-in handlers.
+pub fn dispatch_builtin(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> BuiltinResult {
+    // -------------------------------------------------------------
+    // 1. java/lang/Object
+    // -------------------------------------------------------------
+    if class_name == "java/lang/Object" {
+        if method_name == "<init>" {
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getClass" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                let cls_name = heap
+                    .get(id)
+                    .map(|o| o.class_name().to_string())
+                    .unwrap_or_default();
+                let cid = heap.alloc_class(cls_name);
+                return BuiltinResult::Handled(Value::Object(Some(cid)));
+            }
+        } else if method_name == "toString" && !args.is_empty() {
+            let str_id = heap.alloc_string(format!("[Object {:?}]", args[0]));
+            return BuiltinResult::Handled(Value::Object(Some(str_id)));
+        } else if method_name == "hashCode" {
+            return BuiltinResult::Handled(Value::Int(
+                args.get(0).map(|v| v.as_int()).unwrap_or(0),
+            ));
+        } else if method_name == "equals" && args.len() >= 2 {
+            if args[0] == args[1] {
+                return BuiltinResult::Handled(Value::from_bool(true));
+            }
+            if let (Some(id1), Some(id2)) = (args[0].as_obj(), args[1].as_obj()) {
+                if let (Some(JavaObject::Class(c1)), Some(JavaObject::Class(c2))) =
+                    (heap.get(id1), heap.get(id2))
+                {
+                    return BuiltinResult::Handled(Value::from_bool(
+                        c1.replace('.', "/") == c2.replace('.', "/"),
+                    ));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 2. java/lang/Class
+    // -------------------------------------------------------------
+    if class_name == "java/lang/Class" {
+        if method_name == "getName" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                let name = match heap.get(id) {
+                    Some(JavaObject::Class(c)) => c.replace('/', "."),
+                    _ => "java.lang.Object".to_string(),
+                };
+                let sid = heap.alloc_string(name);
+                return BuiltinResult::Handled(Value::Object(Some(sid)));
+            }
+        } else if method_name == "getSimpleName" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                let name = match heap.get(id) {
+                    Some(JavaObject::Class(c)) => c.rsplit('/').next().unwrap_or(c).to_string(),
+                    _ => "Object".to_string(),
+                };
+                let sid = heap.alloc_string(name);
+                return BuiltinResult::Handled(Value::Object(Some(sid)));
+            }
+        } else if method_name == "isPrimitive" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Class(c)) = heap.get(id) {
+                    let is_prim = matches!(
+                        c.as_str(),
+                        "boolean"
+                            | "byte"
+                            | "char"
+                            | "short"
+                            | "int"
+                            | "long"
+                            | "float"
+                            | "double"
+                            | "void"
+                            | "Z"
+                            | "B"
+                            | "C"
+                            | "S"
+                            | "I"
+                            | "J"
+                            | "F"
+                            | "D"
+                            | "V"
+                    );
+                    return BuiltinResult::Handled(Value::from_bool(is_prim));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "getPrimitiveClass" && !args.is_empty() {
+            let prim_name = if let Some(id) = args[0].as_obj() {
+                heap.get_string(id).unwrap_or("void").to_string()
+            } else {
+                "void".to_string()
+            };
+            let cid = heap.alloc_class(prim_name);
+            return BuiltinResult::Handled(Value::Object(Some(cid)));
+        } else if (method_name == "forName" || method_name == "forName0") && !args.is_empty() {
+            let name = if let Some(id) = args[0].as_obj() {
+                heap.get_string(id)
+                    .map(|s| s.replace('.', "/"))
+                    .unwrap_or_else(|| "java/lang/Object".to_string())
+            } else {
+                "java/lang/Object".to_string()
+            };
+            let cid = heap.alloc_class(name);
+            return BuiltinResult::Handled(Value::Object(Some(cid)));
+        } else if method_name == "getClassLoader" {
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getComponentType" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Class(c)) = heap.get(id) {
+                    if let Some(rest) = c.strip_prefix('[') {
+                        let comp = if rest.starts_with('L') && rest.ends_with(';') {
+                            &rest[1..rest.len() - 1]
+                        } else if rest.starts_with('[') {
+                            rest
+                        } else {
+                            match rest {
+                                "Z" => "boolean",
+                                "B" => "byte",
+                                "C" => "char",
+                                "S" => "short",
+                                "I" => "int",
+                                "J" => "long",
+                                "F" => "float",
+                                "D" => "double",
+                                _ => rest,
+                            }
+                        };
+                        let cid = heap.alloc_class(comp.to_string());
+                        return BuiltinResult::Handled(Value::Object(Some(cid)));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "isArray" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Class(c)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::from_bool(c.starts_with('[')));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "getModifiers" {
+            return BuiltinResult::Handled(Value::Int(1)); // Modifier.PUBLIC
+        } else if method_name == "getSuperclass" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Class(c)) = heap.get(id) {
+                    if c != "java/lang/Object" && !c.is_empty() {
+                        let cid = heap.alloc_class("java/lang/Object");
+                        return BuiltinResult::Handled(Value::Object(Some(cid)));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getInterfaces" {
+            let aid = heap.alloc(JavaObject::Array {
+                elem_type: "java/lang/Class".into(),
+                elements: Vec::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(aid)));
+        } else if method_name == "cast" && args.len() >= 2 {
+            return BuiltinResult::Handled(args[1].clone());
+        } else if method_name == "getDeclaredFields" || method_name == "getFields" {
+            let aid = heap.alloc(JavaObject::Array {
+                elem_type: "java/lang/reflect/Field".into(),
+                elements: Vec::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(aid)));
+        } else if method_name == "getDeclaredMethods" || method_name == "getMethods" {
+            let aid = heap.alloc(JavaObject::Array {
+                elem_type: "java/lang/reflect/Method".into(),
+                elements: Vec::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(aid)));
+        } else if method_name == "isInstance" || method_name == "isAssignableFrom" {
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name == "desiredAssertionStatus"
+            || method_name == "desiredAssertionStatus0"
+        {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        }
+    }
+
+    if class_name == "sun/invoke/util/Wrapper" {
+        if method_name == "asPrimitiveType" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Class(c)) = heap.get(id) {
+                    let norm = c.replace('.', "/");
+                    let prim = match norm.as_str() {
+                        "java/lang/Integer" => Some("int"),
+                        "java/lang/Boolean" => Some("boolean"),
+                        "java/lang/Byte" => Some("byte"),
+                        "java/lang/Short" => Some("short"),
+                        "java/lang/Character" => Some("char"),
+                        "java/lang/Long" => Some("long"),
+                        "java/lang/Float" => Some("float"),
+                        "java/lang/Double" => Some("double"),
+                        "java/lang/Void" => Some("void"),
+                        _ => None,
+                    };
+                    if let Some(p) = prim {
+                        let cid = heap.alloc_class(p);
+                        return BuiltinResult::Handled(Value::Object(Some(cid)));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "asWrapperType" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Class(c)) = heap.get(id) {
+                    let norm = c.replace('.', "/");
+                    let wrap = match norm.as_str() {
+                        "int" | "I" => Some("java/lang/Integer"),
+                        "boolean" | "Z" => Some("java/lang/Boolean"),
+                        "byte" | "B" => Some("java/lang/Byte"),
+                        "short" | "S" => Some("java/lang/Short"),
+                        "char" | "C" => Some("java/lang/Character"),
+                        "long" | "J" => Some("java/lang/Long"),
+                        "float" | "F" => Some("java/lang/Float"),
+                        "double" | "D" => Some("java/lang/Double"),
+                        "void" | "V" => Some("java/lang/Void"),
+                        _ => None,
+                    };
+                    if let Some(w) = wrap {
+                        let cid = heap.alloc_class(w);
+                        return BuiltinResult::Handled(Value::Object(Some(cid)));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(args[0].clone());
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 2b. Unsafe & JVM Internals
+    // -------------------------------------------------------------
+    if class_name == "java/lang/invoke/MethodHandles" {
+        if method_name == "lookup" {
+            let lid = heap.alloc(JavaObject::Instance {
+                class_name: "java/lang/invoke/MethodHandles$Lookup".to_string(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(lid)));
+        }
+    }
+
+    if class_name == "java/lang/invoke/MethodHandles$Lookup" {
+        if method_name == "findVarHandle" && args.len() >= 3 {
+            let field_name = if let Some(id) = args[2].as_obj() {
+                heap.get_string(id).unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
+            let mut fields = HashMap::new();
+            let name_id = heap.alloc_string(field_name);
+            fields.insert("fieldName".to_string(), Value::Object(Some(name_id)));
+            let vid = heap.alloc(JavaObject::Instance {
+                class_name: "java/lang/invoke/VarHandle".to_string(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(vid)));
+        }
+    }
+
+    if class_name == "java/lang/invoke/VarHandle" {
+        if method_name.starts_with("set") {
+            let field_name = args.get(0).and_then(|v| v.as_obj()).and_then(|vid| {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(vid) {
+                    fields
+                        .get("fieldName")
+                        .and_then(|f| f.as_obj())
+                        .and_then(|sid| heap.get_string(sid))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+            let target_obj = args.get(1).and_then(|v| v.as_obj());
+            let val = args.get(2).cloned().unwrap_or(Value::NULL);
+            if let (Some(t_id), Some(fname)) = (target_obj, field_name) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(t_id) {
+                    fields.insert(fname, val);
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name.starts_with("compareAndSet")
+            || method_name.starts_with("weakCompareAndSet")
+        {
+            let field_name = args.get(0).and_then(|v| v.as_obj()).and_then(|vid| {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(vid) {
+                    fields
+                        .get("fieldName")
+                        .and_then(|f| f.as_obj())
+                        .and_then(|sid| heap.get_string(sid))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+            let target_obj = args.get(1).and_then(|v| v.as_obj());
+            let new_val = args.get(3).cloned().unwrap_or(Value::NULL);
+            if let (Some(t_id), Some(fname)) = (target_obj, field_name) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(t_id) {
+                    fields.insert(fname, new_val);
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name.starts_with("compareAndExchange") {
+            let field_name = args.get(0).and_then(|v| v.as_obj()).and_then(|vid| {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(vid) {
+                    fields
+                        .get("fieldName")
+                        .and_then(|f| f.as_obj())
+                        .and_then(|sid| heap.get_string(sid))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+            let target_obj = args.get(1).and_then(|v| v.as_obj());
+            let expected = args.get(2).cloned().unwrap_or(Value::NULL);
+            let new_val = args.get(3).cloned().unwrap_or(Value::NULL);
+            if let (Some(t_id), Some(fname)) = (target_obj, field_name) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(t_id) {
+                    fields.insert(fname, new_val);
+                }
+            }
+            return BuiltinResult::Handled(expected);
+        } else if method_name.starts_with("get") {
+            let field_name = args.get(0).and_then(|v| v.as_obj()).and_then(|vid| {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(vid) {
+                    fields
+                        .get("fieldName")
+                        .and_then(|f| f.as_obj())
+                        .and_then(|sid| heap.get_string(sid))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+            let target_obj = args.get(1).and_then(|v| v.as_obj());
+            if let (Some(t_id), Some(fname)) = (target_obj, field_name) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(t_id) {
+                    if let Some(v) = fields.get(&fname) {
+                        return BuiltinResult::Handled(v.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "sun/misc/Unsafe" || class_name == "jdk/internal/misc/Unsafe" {
+        if method_name == "getUnsafe" || method_name == "theUnsafe" {
+            let uid = heap.alloc(JavaObject::Instance {
+                class_name: class_name.to_string(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(uid)));
+        } else if method_name == "registerNatives" || method_name == "ensureClassInitialized" {
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "arrayBaseOffset" || method_name == "arrayBaseOffset0" {
+            return BuiltinResult::Handled(Value::Int(16));
+        } else if method_name == "arrayIndexScale" || method_name == "arrayIndexScale0" {
+            return BuiltinResult::Handled(Value::Int(8));
+        } else if method_name == "objectFieldOffset"
+            || method_name == "objectFieldOffset0"
+            || method_name == "staticFieldOffset"
+        {
+            return BuiltinResult::Handled(Value::Long(16));
+        } else if method_name.starts_with("compareAndSet")
+            || method_name.starts_with("compareAndSwap")
+        {
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name.starts_with("get") && method_name.ends_with("Volatile") {
+            if descriptor.ends_with(")J") {
+                return BuiltinResult::Handled(Value::Long(0));
+            } else if descriptor.ends_with(")I") {
+                return BuiltinResult::Handled(Value::Int(0));
+            } else if descriptor.ends_with(")Z") {
+                return BuiltinResult::Handled(Value::from_bool(false));
+            } else {
+                return BuiltinResult::Handled(Value::NULL);
+            }
+        } else if method_name.starts_with("put") {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name.starts_with("java/net/http/HttpClient")
+        || class_name.starts_with("jdk/internal/net/http/HttpClient")
+    {
+        if method_name == "send" {
+            let body_id = heap.alloc_string("{}");
+            let mut fields = HashMap::new();
+            fields.insert("statusCode".to_string(), Value::Int(404));
+            fields.insert("body".to_string(), Value::Object(Some(body_id)));
+            let rid = heap.alloc(JavaObject::Instance {
+                class_name: "java/net/http/HttpResponse".to_string(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(rid)));
+        } else if method_name == "build" {
+            let hid = heap.alloc(JavaObject::Instance {
+                class_name: "java/net/http/HttpClient".to_string(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(hid)));
+        }
+    }
+
+    if class_name == "com/terraformersmc/modmenu/util/HttpUtil" {
+        if method_name == "request" {
+            let body_id = heap.alloc_string("{}");
+            let mut fields = HashMap::new();
+            fields.insert("statusCode".to_string(), Value::Int(404));
+            fields.insert("body".to_string(), Value::Object(Some(body_id)));
+            let rid = heap.alloc(JavaObject::Instance {
+                class_name: "java/net/http/HttpResponse".to_string(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(rid)));
+        }
+    }
+
+    if class_name.starts_with("java/net/http/HttpResponse") {
+        if method_name == "statusCode" {
+            if let Some(id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(code) = fields.get("statusCode") {
+                        return BuiltinResult::Handled(code.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(404));
+        } else if method_name == "body" {
+            if let Some(id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(body) = fields.get("body") {
+                        return BuiltinResult::Handled(body.clone());
+                    }
+                }
+            }
+            let bid = heap.alloc_string("{}");
+            return BuiltinResult::Handled(Value::Object(Some(bid)));
+        }
+    }
+
+    if class_name == "java/util/concurrent/CompletableFuture" {
+        if method_name == "get" || method_name == "join" || method_name == "waitingGet" {
+            if let Some(id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(res) = fields.get("result") {
+                        return BuiltinResult::Handled(res.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name.starts_with("java/util/concurrent/ForkJoinPool") {
+        if method_name == "managedBlock" || method_name == "unmanagedBlock" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name.contains("Signaller") || class_name.contains("ManagedBlocker") {
+        if method_name == "isReleasable" || method_name == "block" {
+            return BuiltinResult::Handled(Value::from_bool(true));
+        }
+    }
+
+    if class_name == "jdk/internal/misc/CDS" {
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    if class_name == "java/lang/System" {
+        if method_name == "registerNatives" {
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "currentTimeMillis" {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            return BuiltinResult::Handled(Value::Long(ms));
+        } else if method_name == "nanoTime" {
+            return BuiltinResult::Handled(Value::Long(0));
+        }
+    }
+
+    if class_name == "java/lang/Throwable" {
+        if method_name == "fillInStackTrace" {
+            return BuiltinResult::Handled(args.get(0).cloned().unwrap_or(Value::NULL));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 3. java/lang/Enum & Primitives
+    // -------------------------------------------------------------
+    if class_name == "java/lang/Enum" || method_name == "ordinal" {
+        if method_name == "ordinal" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(ord) = fields.get("ordinal") {
+                        return BuiltinResult::Handled(ord.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(2));
+        } else if method_name == "name" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(name) = fields.get("name") {
+                        return BuiltinResult::Handled(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if class_name.starts_with('[') && method_name == "clone" && !args.is_empty() {
+        if let Some(id) = args[0].as_obj() {
+            if let Some(JavaObject::Array {
+                elem_type,
+                elements,
+            }) = heap.get(id)
+            {
+                let cloned_arr = JavaObject::Array {
+                    elem_type: elem_type.clone(),
+                    elements: elements.clone(),
+                };
+                let new_id = heap.alloc(cloned_arr);
+                return BuiltinResult::Handled(Value::Object(Some(new_id)));
+            }
+        }
+    }
+
+    if class_name == "java/lang/Integer" {
+        if (method_name == "valueOf" || method_name == "intValue") && !args.is_empty() {
+            return BuiltinResult::Handled(Value::Int(args[0].as_int()));
+        }
+    }
+
+    if class_name == "java/lang/Boolean" {
+        if (method_name == "valueOf" || method_name == "booleanValue") && !args.is_empty() {
+            return BuiltinResult::Handled(Value::from_bool(args[0].as_bool()));
+        }
+    }
+
+    if class_name == "java/lang/Math" {
+        if method_name == "min" && args.len() >= 2 {
+            if descriptor == "(JJ)J"
+                || matches!(
+                    (&args[0], &args[1]),
+                    (Value::Long(_), _) | (_, Value::Long(_))
+                )
+            {
+                return BuiltinResult::Handled(Value::Long(
+                    args[0].as_long().min(args[1].as_long()),
+                ));
+            } else if descriptor == "(DD)D"
+                || matches!(
+                    (&args[0], &args[1]),
+                    (Value::Double(_), _) | (_, Value::Double(_))
+                )
+            {
+                return BuiltinResult::Handled(Value::Double(
+                    args[0].as_double().min(args[1].as_double()),
+                ));
+            } else if descriptor == "(FF)F"
+                || matches!(
+                    (&args[0], &args[1]),
+                    (Value::Float(_), _) | (_, Value::Float(_))
+                )
+            {
+                return BuiltinResult::Handled(Value::Float(
+                    args[0].as_float().min(args[1].as_float()),
+                ));
+            } else {
+                return BuiltinResult::Handled(Value::Int(args[0].as_int().min(args[1].as_int())));
+            }
+        } else if method_name == "max" && args.len() >= 2 {
+            if descriptor == "(JJ)J"
+                || matches!(
+                    (&args[0], &args[1]),
+                    (Value::Long(_), _) | (_, Value::Long(_))
+                )
+            {
+                return BuiltinResult::Handled(Value::Long(
+                    args[0].as_long().max(args[1].as_long()),
+                ));
+            } else if descriptor == "(DD)D"
+                || matches!(
+                    (&args[0], &args[1]),
+                    (Value::Double(_), _) | (_, Value::Double(_))
+                )
+            {
+                return BuiltinResult::Handled(Value::Double(
+                    args[0].as_double().max(args[1].as_double()),
+                ));
+            } else if descriptor == "(FF)F"
+                || matches!(
+                    (&args[0], &args[1]),
+                    (Value::Float(_), _) | (_, Value::Float(_))
+                )
+            {
+                return BuiltinResult::Handled(Value::Float(
+                    args[0].as_float().max(args[1].as_float()),
+                ));
+            } else {
+                return BuiltinResult::Handled(Value::Int(args[0].as_int().max(args[1].as_int())));
+            }
+        } else if method_name == "abs" && !args.is_empty() {
+            if descriptor == "(J)J" || matches!(&args[0], Value::Long(_)) {
+                return BuiltinResult::Handled(Value::Long(args[0].as_long().abs()));
+            } else if descriptor == "(D)D" || matches!(&args[0], Value::Double(_)) {
+                return BuiltinResult::Handled(Value::Double(args[0].as_double().abs()));
+            } else if descriptor == "(F)F" || matches!(&args[0], Value::Float(_)) {
+                return BuiltinResult::Handled(Value::Float(args[0].as_float().abs()));
+            } else {
+                return BuiltinResult::Handled(Value::Int(args[0].as_int().abs()));
+            }
+        } else if method_name == "ceil" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::Double(args[0].as_double().ceil()));
+        } else if method_name == "floor" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::Double(args[0].as_double().floor()));
+        } else if method_name == "sqrt" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::Double(args[0].as_double().sqrt()));
+        } else if method_name == "sin" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::Double(args[0].as_double().sin()));
+        } else if method_name == "cos" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::Double(args[0].as_double().cos()));
+        } else if method_name == "pow" && args.len() >= 2 {
+            return BuiltinResult::Handled(Value::Double(
+                args[0].as_double().powf(args[1].as_double()),
+            ));
+        } else if method_name == "round" && !args.is_empty() {
+            if descriptor == "(F)I" || matches!(&args[0], Value::Float(_)) {
+                return BuiltinResult::Handled(Value::Int(args[0].as_float().round() as i32));
+            } else {
+                return BuiltinResult::Handled(Value::Long(args[0].as_double().round() as i64));
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 4. java/lang/String & StringBuilder
+    // -------------------------------------------------------------
+    if class_name == "java/lang/StringBuilder" {
+        if method_name == "<init>" {
+            let initial = if args.len() > 1 {
+                if let Some(id) = args[1].as_obj() {
+                    heap.get_string(id).unwrap_or("").to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(obj) = heap.get_mut(this_id) {
+                    *obj = JavaObject::String(initial);
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "append" {
+            let appended = if args.len() > 1 {
+                match &args[1] {
+                    Value::Int(i) => i.to_string(),
+                    Value::Long(l) => l.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Double(d) => d.to_string(),
+                    Value::Object(Some(id)) => heap.get_string(*id).unwrap_or("[obj]").to_string(),
+                    Value::Object(None) => "null".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
+                    s.push_str(&appended);
+                }
+                return BuiltinResult::Handled(Value::Object(Some(this_id)));
+            }
+        } else if method_name == "toString" && !args.is_empty() {
+            if let Some(this_id) = args[0].as_obj() {
+                let s = heap.get_string(this_id).unwrap_or("").to_string();
+                let sid = heap.alloc_string(s);
+                return BuiltinResult::Handled(Value::Object(Some(sid)));
+            }
+        }
+    }
+
+    if class_name == "java/lang/String" {
+        if method_name == "valueOf" && !args.is_empty() {
+            let s = match &args[0] {
+                Value::Int(i) => i.to_string(),
+                Value::Long(l) => l.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Double(d) => d.to_string(),
+                Value::Object(Some(id)) => heap.get_string(*id).unwrap_or("").to_string(),
+                Value::Object(None) => "null".to_string(),
+            };
+            let sid = heap.alloc_string(s);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "equals" && args.len() >= 2 {
+            let s1 = args[0].as_obj().and_then(|id| heap.get_string(id));
+            let s2 = args[1].as_obj().and_then(|id| heap.get_string(id));
+            return BuiltinResult::Handled(Value::from_bool(s1 == s2));
+        } else if method_name == "length" && !args.is_empty() {
+            let len = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .map(|s| s.len() as i32)
+                .unwrap_or(0);
+            return BuiltinResult::Handled(Value::Int(len));
+        } else if method_name == "compareTo" && args.len() >= 2 {
+            let s1 = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let s2 = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let res = match s1.cmp(s2) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            return BuiltinResult::Handled(Value::Int(res));
+        } else if method_name == "compareToIgnoreCase" && args.len() >= 2 {
+            let s1 = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let s2 = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let res = match s1.to_lowercase().cmp(&s2.to_lowercase()) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            return BuiltinResult::Handled(Value::Int(res));
+        } else if method_name == "toLowerCase" && !args.is_empty() {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let sid = heap.alloc_string(s.to_lowercase());
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "toUpperCase" && !args.is_empty() {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let sid = heap.alloc_string(s.to_uppercase());
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "contains" && args.len() >= 2 {
+            let s1 = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let s2 = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            return BuiltinResult::Handled(Value::from_bool(s1.contains(s2)));
+        } else if method_name == "startsWith" && args.len() >= 2 {
+            let s1 = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let s2 = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            return BuiltinResult::Handled(Value::from_bool(s1.starts_with(s2)));
+        } else if method_name == "endsWith" && args.len() >= 2 {
+            let s1 = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let s2 = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            return BuiltinResult::Handled(Value::from_bool(s1.ends_with(s2)));
+        } else if method_name == "isEmpty" && !args.is_empty() {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            return BuiltinResult::Handled(Value::from_bool(s.is_empty()));
+        } else if method_name == "hashCode" && !args.is_empty() {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let mut h: i32 = 0;
+            for b in s.bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as i32);
+            }
+            return BuiltinResult::Handled(Value::Int(h));
+        } else if method_name == "format" && !args.is_empty() {
+            let (fmt_str, varargs_val) = if args.len() >= 3 {
+                (
+                    args[1]
+                        .as_obj()
+                        .and_then(|id| heap.get_string(id))
+                        .unwrap_or(""),
+                    args.get(2),
+                )
+            } else {
+                (
+                    args[0]
+                        .as_obj()
+                        .and_then(|id| heap.get_string(id))
+                        .unwrap_or(""),
+                    args.get(1),
+                )
+            };
+            let mut formatted = fmt_str.to_string();
+            if let Some(Value::Object(Some(arr_id))) = varargs_val {
+                if let Some(JavaObject::Array { elements, .. }) = heap.get(*arr_id) {
+                    if fmt_str == "#%06X" || fmt_str == "#%06x" {
+                        let val = elements.first().map(|v| v.as_int()).unwrap_or(0);
+                        formatted = format!("#{:06X}", val);
+                    } else if fmt_str == "%s" {
+                        let val = elements
+                            .first()
+                            .and_then(|v| v.as_obj())
+                            .and_then(|id| heap.get_string(id))
+                            .unwrap_or("");
+                        formatted = val.to_string();
+                    } else if fmt_str == "%d" {
+                        let val = elements.first().map(|v| v.as_int()).unwrap_or(0);
+                        formatted = format!("{val}");
+                    }
+                }
+            }
+            let sid = heap.alloc_string(formatted);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 5. java/util/Objects
+    // -------------------------------------------------------------
+    if class_name == "java/util/Objects" {
+        if method_name == "requireNonNull" && !args.is_empty() {
+            return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "equals" && args.len() >= 2 {
+            return BuiltinResult::Handled(Value::from_bool(args[0] == args[1]));
+        } else if method_name == "hashCode" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::Int(args[0].as_int()));
+        } else if method_name == "isNull" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::from_bool(args[0].is_null()));
+        } else if method_name == "nonNull" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::from_bool(!args[0].is_null()));
+        } else if method_name == "toString" && !args.is_empty() {
+            if args[0].is_null() && args.len() >= 2 {
+                return BuiltinResult::Handled(args[1].clone());
+            }
+            let sid = heap.alloc_string(format!("{:?}", args[0]));
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 6. java/util/Optional
+    // -------------------------------------------------------------
+    if class_name == "java/util/Optional" {
+        if method_name == "empty" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if (method_name == "of" || method_name == "ofNullable") && !args.is_empty() {
+            let mut fields = HashMap::new();
+            if !args[0].is_null() {
+                fields.insert("value".into(), args[0].clone());
+            }
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "isPresent" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    let has_val = fields.get("value").map(|v| !v.is_null()).unwrap_or(false);
+                    return BuiltinResult::Handled(Value::from_bool(has_val));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "isEmpty" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    let has_val = fields.get("value").map(|v| !v.is_null()).unwrap_or(false);
+                    return BuiltinResult::Handled(Value::from_bool(!has_val));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name == "get" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(v) = fields.get("value") {
+                        return BuiltinResult::Handled(v.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "orElse" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(v) = fields.get("value") {
+                        if !v.is_null() {
+                            return BuiltinResult::Handled(v.clone());
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(args[1].clone());
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 7. Collections (List, Map, Set, Iterator, Collections)
+    // -------------------------------------------------------------
+    if class_name == "java/util/Collections" {
+        if method_name == "emptyList" {
+            let id = heap.alloc_list(Vec::new());
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "emptyMap" {
+            let id = heap.alloc_map(Vec::new());
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "emptySet" {
+            let id = heap.alloc_set(Vec::new());
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "singletonList" && !args.is_empty() {
+            let id = heap.alloc_list(vec![args[0].clone()]);
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "singleton" && !args.is_empty() {
+            let id = heap.alloc_set(vec![args[0].clone()]);
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "singletonMap" && args.len() >= 2 {
+            let id = heap.alloc_map(vec![(args[0].clone(), args[1].clone())]);
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if (method_name == "unmodifiableList"
+            || method_name == "unmodifiableMap"
+            || method_name == "unmodifiableSet")
+            && !args.is_empty()
+        {
+            return BuiltinResult::Handled(args[0].clone());
+        }
+    }
+
+    // List & ArrayList & LinkedList
+    if class_name == "java/util/List"
+        || class_name == "java/util/ArrayList"
+        || class_name == "java/util/LinkedList"
+    {
+        if method_name == "<init>" {
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(obj) = heap.get_mut(this_id) {
+                    *obj = JavaObject::List(Vec::new());
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "size" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::Int(items.len() as i32));
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        } else if method_name == "isEmpty" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::from_bool(items.is_empty()));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name == "get" && args.len() >= 2 {
+            let idx = args[1].as_int().max(0) as usize;
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get(id) {
+                    let v = items.get(idx).cloned().unwrap_or(Value::NULL);
+                    return BuiltinResult::Handled(v);
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "add" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get_mut(id) {
+                    if args.len() == 2 {
+                        items.push(args[1].clone());
+                    } else {
+                        let idx = args[1].as_int().max(0) as usize;
+                        let item = args[2].clone();
+                        if idx <= items.len() {
+                            items.insert(idx, item);
+                        } else {
+                            items.push(item);
+                        }
+                    }
+                    return BuiltinResult::Handled(Value::from_bool(true));
+                }
+            }
+        } else if method_name == "clear" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get_mut(id) {
+                    items.clear();
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "iterator" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get(id) {
+                    let iter_id = heap.alloc(JavaObject::Iterator {
+                        items: items.clone(),
+                        cursor: 0,
+                    });
+                    return BuiltinResult::Handled(Value::Object(Some(iter_id)));
+                }
+            }
+        } else if method_name == "toArray" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get(id) {
+                    let aid = heap.alloc(JavaObject::Array {
+                        elem_type: "java/lang/Object".into(),
+                        elements: items.clone(),
+                    });
+                    return BuiltinResult::Handled(Value::Object(Some(aid)));
+                }
+            }
+        } else if method_name == "stream" && !args.is_empty() {
+            let items = if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get(id) {
+                    items.clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            let sid = heap.alloc_stream(items);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // Collection & Iterable
+    if class_name == "java/util/Collection" || class_name == "java/lang/Iterable" {
+        if method_name == "iterator" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                let items = match heap.get(id) {
+                    Some(JavaObject::List(items)) => Some(items.clone()),
+                    Some(JavaObject::Set(items)) => Some(items.clone()),
+                    _ => None,
+                };
+                if let Some(items) = items {
+                    let iter_id = heap.alloc(JavaObject::Iterator { items, cursor: 0 });
+                    return BuiltinResult::Handled(Value::Object(Some(iter_id)));
+                }
+            }
+        } else if method_name == "size" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                let len = match heap.get(id) {
+                    Some(JavaObject::List(items)) => items.len(),
+                    Some(JavaObject::Set(items)) => items.len(),
+                    _ => 0,
+                };
+                return BuiltinResult::Handled(Value::Int(len as i32));
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        } else if method_name == "isEmpty" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                let empty = match heap.get(id) {
+                    Some(JavaObject::List(items)) => items.is_empty(),
+                    Some(JavaObject::Set(items)) => items.is_empty(),
+                    _ => true,
+                };
+                return BuiltinResult::Handled(Value::from_bool(empty));
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name == "stream" && !args.is_empty() {
+            let items = if let Some(id) = args[0].as_obj() {
+                match heap.get(id) {
+                    Some(JavaObject::List(items)) => items.clone(),
+                    Some(JavaObject::Set(items)) => items.clone(),
+                    Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                    Some(JavaObject::Stream(items)) => items.clone(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let sid = heap.alloc_stream(items);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // java.util.Arrays
+    if class_name == "java/util/Arrays" {
+        if method_name == "stream" && !args.is_empty() {
+            let items = if let Some(id) = args[0].as_obj() {
+                match heap.get(id) {
+                    Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                    Some(JavaObject::List(items)) => items.clone(),
+                    Some(JavaObject::Set(items)) => items.clone(),
+                    Some(JavaObject::Stream(items)) => items.clone(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let sid = heap.alloc_stream(items);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "asList" && !args.is_empty() {
+            let items = if let Some(id) = args[0].as_obj() {
+                match heap.get(id) {
+                    Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let lid = heap.alloc_list(items);
+            return BuiltinResult::Handled(Value::Object(Some(lid)));
+        }
+    }
+
+    // java.util.Objects
+    if class_name == "java/util/Objects" {
+        if method_name == "nonNull" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::from_bool(!args[0].is_null()));
+        } else if method_name == "isNull" && !args.is_empty() {
+            return BuiltinResult::Handled(Value::from_bool(args[0].is_null()));
+        } else if method_name == "requireNonNull" && !args.is_empty() {
+            return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "equals" && args.len() >= 2 {
+            return BuiltinResult::Handled(Value::from_bool(args[0] == args[1]));
+        }
+    }
+
+    // java.util.stream.Collectors
+    if class_name == "java/util/stream/Collectors" {
+        let name = match method_name {
+            "toSet" => "toSet",
+            "toList" => "toList",
+            "joining" => "joining",
+            _ => "collector",
+        };
+        let mut fields = HashMap::new();
+        let nid = heap.alloc_string(name);
+        fields.insert("type".into(), Value::Object(Some(nid)));
+        let cid = heap.alloc(JavaObject::Instance {
+            class_name: "java/util/stream/Collector".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(cid)));
+    }
+
+    // Map & HashMap & LinkedHashMap & ConcurrentHashMap
+    if class_name == "java/util/Map"
+        || class_name == "java/util/HashMap"
+        || class_name == "java/util/LinkedHashMap"
+        || class_name == "java/util/TreeMap"
+        || class_name == "java/util/concurrent/ConcurrentHashMap"
+        || class_name == "java/util/concurrent/ConcurrentMap"
+    {
+        if method_name == "<init>" {
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(obj) = heap.get_mut(this_id) {
+                    *obj = JavaObject::Map(Vec::new());
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "put" && args.len() >= 3 {
+            let key = args[1].clone();
+            let val = args[2].clone();
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get_mut(id) {
+                    for (k, v) in entries.iter_mut() {
+                        if k == &key {
+                            let old = v.clone();
+                            *v = val;
+                            return BuiltinResult::Handled(old);
+                        }
+                    }
+                    entries.push((key, val));
+                    return BuiltinResult::Handled(Value::NULL);
+                }
+            }
+        } else if method_name == "get" && args.len() >= 2 {
+            let key = &args[1];
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    for (k, v) in entries {
+                        if k == key {
+                            return BuiltinResult::Handled(v.clone());
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getOrDefault" && args.len() >= 3 {
+            let key = &args[1];
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    for (k, v) in entries {
+                        if k == key {
+                            return BuiltinResult::Handled(v.clone());
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(args[2].clone());
+        } else if method_name == "containsKey" && args.len() >= 2 {
+            let key = &args[1];
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    for (k, _) in entries {
+                        if k == key {
+                            return BuiltinResult::Handled(Value::from_bool(true));
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "remove" && args.len() >= 2 {
+            let key = &args[1];
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get_mut(id) {
+                    if let Some(pos) = entries.iter().position(|(k, _)| k == key) {
+                        let (_, v) = entries.remove(pos);
+                        return BuiltinResult::Handled(v);
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "clear" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get_mut(id) {
+                    entries.clear();
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "size" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::Int(entries.len() as i32));
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        } else if method_name == "isEmpty" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::from_bool(entries.is_empty()));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name == "keySet" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+                    let sid = heap.alloc_set(keys);
+                    return BuiltinResult::Handled(Value::Object(Some(sid)));
+                }
+            }
+        } else if method_name == "values" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    let vals: Vec<Value> = entries.iter().map(|(_, v)| v.clone()).collect();
+                    let lid = heap.alloc_list(vals);
+                    return BuiltinResult::Handled(Value::Object(Some(lid)));
+                }
+            }
+        } else if method_name == "entrySet" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                    let mut entry_objs = Vec::new();
+                    for (k, v) in entries.clone() {
+                        let mut f = HashMap::new();
+                        f.insert("key".into(), k);
+                        f.insert("value".into(), v);
+                        let eid = heap.alloc(JavaObject::Instance {
+                            class_name: "java/util/Map$Entry".into(),
+                            fields: f,
+                        });
+                        entry_objs.push(Value::Object(Some(eid)));
+                    }
+                    let sid = heap.alloc_set(entry_objs);
+                    return BuiltinResult::Handled(Value::Object(Some(sid)));
+                }
+            }
+        }
+    }
+
+    if class_name == "java/util/Map$Entry" {
+        if method_name == "getKey" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(k) = fields.get("key") {
+                        return BuiltinResult::Handled(k.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getValue" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(v) = fields.get("value") {
+                        return BuiltinResult::Handled(v.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Set & HashSet & LinkedHashSet
+    if class_name == "java/util/Set"
+        || class_name == "java/util/HashSet"
+        || class_name == "java/util/LinkedHashSet"
+        || class_name == "java/util/TreeSet"
+    {
+        if method_name == "<init>" {
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(obj) = heap.get_mut(this_id) {
+                    *obj = JavaObject::Set(Vec::new());
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "add" && args.len() >= 2 {
+            let item = args[1].clone();
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
+                    if !items.contains(&item) {
+                        items.push(item);
+                        return BuiltinResult::Handled(Value::from_bool(true));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "remove" && args.len() >= 2 {
+            let item = &args[1];
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
+                    if let Some(pos) = items.iter().position(|x| x == item) {
+                        items.remove(pos);
+                        return BuiltinResult::Handled(Value::from_bool(true));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "clear" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
+                    items.clear();
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "contains" && args.len() >= 2 {
+            let item = &args[1];
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::from_bool(items.contains(item)));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "size" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::Int(items.len() as i32));
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        } else if method_name == "isEmpty" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::from_bool(items.is_empty()));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name == "iterator" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get(id) {
+                    let iter_id = heap.alloc(JavaObject::Iterator {
+                        items: items.clone(),
+                        cursor: 0,
+                    });
+                    return BuiltinResult::Handled(Value::Object(Some(iter_id)));
+                }
+            }
+        }
+    }
+
+    // Iterator
+    if class_name == "java/util/Iterator" {
+        if method_name == "hasNext" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Iterator { items, cursor }) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::from_bool(*cursor < items.len()));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "next" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Iterator { items, cursor }) = heap.get_mut(id) {
+                    if *cursor < items.len() {
+                        let item = items[*cursor].clone();
+                        *cursor += 1;
+                        return BuiltinResult::Handled(item);
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 8. java/nio/file/Path, Paths, Files & File
+    // -------------------------------------------------------------
+    if class_name == "java/nio/file/Path" {
+        if method_name == "resolve" && args.len() >= 2 {
+            let sub = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("sub")
+                .to_string();
+            let mut fields = HashMap::new();
+            let pid = heap.alloc_string(&sub);
+            fields.insert("path".into(), Value::Object(Some(pid)));
+            let new_path = heap.alloc(JavaObject::Instance {
+                class_name: "java/nio/file/Path".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(new_path)));
+        } else if method_name == "toString" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(p) = fields.get("path") {
+                        return BuiltinResult::Handled(p.clone());
+                    }
+                }
+            }
+            let sid = heap.alloc_string("config");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "toFile" {
+            let fid = heap.alloc(JavaObject::Instance {
+                class_name: "java/io/File".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(fid)));
+        }
+    }
+
+    if class_name == "java/nio/file/Paths" && method_name == "get" {
+        let sid = heap.alloc_string("config");
+        let mut fields = HashMap::new();
+        fields.insert("path".into(), Value::Object(Some(sid)));
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "java/nio/file/Path".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
+    if class_name == "jdk/internal/util/ReferencedKeyMap" && method_name == "removeStaleReferences"
+    {
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    if class_name.starts_with("java/lang/ref/ReferenceQueue") {
+        if method_name == "poll" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "java/lang/ThreadLocal" {
+        if method_name == "<init>" {
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "get" {
+            if let Some(id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(v) = fields.get("value") {
+                        return BuiltinResult::Handled(v.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "set" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("value".into(), args[1].clone());
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "remove" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.remove("value");
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "com/google/gson/Gson" {
+        if method_name == "toJson" {
+            let sid = heap.alloc_string("{}");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    if class_name == "java/nio/file/Files" {
+        if method_name == "exists" || method_name == "isDirectory" || method_name == "isRegularFile"
+        {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "createDirectories" {
+            return BuiltinResult::Handled(args.get(0).cloned().unwrap_or(Value::NULL));
+        } else if method_name == "newBufferedWriter" {
+            let wid = heap.alloc(JavaObject::Instance {
+                class_name: "java/io/BufferedWriter".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(wid)));
+        } else if method_name == "newBufferedReader" {
+            let rid = heap.alloc(JavaObject::Instance {
+                class_name: "java/io/BufferedReader".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(rid)));
+        }
+    }
+
+    if class_name == "java/io/Writer"
+        || class_name == "java/io/BufferedWriter"
+        || class_name == "java/io/StringWriter"
+    {
+        if method_name == "write" || method_name == "close" || method_name == "flush" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "java/io/Reader" || class_name == "java/io/BufferedReader" {
+        if method_name == "readLine" || method_name == "close" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "java/io/File" {
+        if method_name == "exists" || method_name == "isDirectory" || method_name == "isFile" {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "getPath" || method_name == "getAbsolutePath" {
+            let sid = heap.alloc_string("config");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 9. Either (com/mojang/datafixers/util/Either)
+    // -------------------------------------------------------------
+    if class_name == "com/mojang/datafixers/util/Either" {
+        if method_name == "left" && !args.is_empty() {
+            let mut fields = HashMap::new();
+            fields.insert("left".into(), args[0].clone());
+            fields.insert("is_left".into(), Value::from_bool(true));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "com/mojang/datafixers/util/Either".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "right" && !args.is_empty() {
+            let mut fields = HashMap::new();
+            fields.insert("right".into(), args[0].clone());
+            fields.insert("is_left".into(), Value::from_bool(false));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "com/mojang/datafixers/util/Either".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "left" && args.len() == 1 {
+            // Returns Optional<L>
+            let val = args[0]
+                .as_obj()
+                .and_then(|id| {
+                    if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                        fields.get("left").cloned()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(Value::NULL);
+            let mut opt_fields = HashMap::new();
+            if !val.is_null() {
+                opt_fields.insert("value".into(), val);
+            }
+            let opt_id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields: opt_fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(opt_id)));
+        } else if method_name == "right" && args.len() == 1 {
+            // Returns Optional<R>
+            let val = args[0]
+                .as_obj()
+                .and_then(|id| {
+                    if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                        fields.get("right").cloned()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(Value::NULL);
+            let mut opt_fields = HashMap::new();
+            if !val.is_null() {
+                opt_fields.insert("value".into(), val);
+            }
+            let opt_id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields: opt_fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(opt_id)));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 10. Identifier / ResourceLocation
+    // -------------------------------------------------------------
+    if class_name == "net/minecraft/resources/ResourceLocation"
+        || class_name == "net/minecraft/resources/Identifier"
+    {
+        if method_name == "<init>" {
+            let (ns, path) = if args.len() >= 3 {
+                let ns_str = args[1]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .unwrap_or("minecraft")
+                    .to_string();
+                let path_str = args[2]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .unwrap_or("")
+                    .to_string();
+                (ns_str, path_str)
+            } else if args.len() >= 2 {
+                let full = args[1]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .unwrap_or("");
+                if let Some((n, p)) = full.split_once(':') {
+                    (n.to_string(), p.to_string())
+                } else {
+                    ("minecraft".to_string(), full.to_string())
+                }
+            } else {
+                ("minecraft".to_string(), "".to_string())
+            };
+            let ns_id = heap.alloc_string(ns);
+            let p_id = heap.alloc_string(path);
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                    fields.insert("namespace".into(), Value::Object(Some(ns_id)));
+                    fields.insert("path".into(), Value::Object(Some(p_id)));
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "fromNamespaceAndPath"
+            || method_name == "of"
+            || method_name == "parse"
+            || method_name == "tryParse"
+        {
+            let (ns, path) = if args.len() >= 2 {
+                let ns_str = args[0]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .unwrap_or("minecraft")
+                    .to_string();
+                let path_str = args[1]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .unwrap_or("")
+                    .to_string();
+                (ns_str, path_str)
+            } else if !args.is_empty() {
+                let full = args[0]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .unwrap_or("");
+                if let Some((n, p)) = full.split_once(':') {
+                    (n.to_string(), p.to_string())
+                } else {
+                    ("minecraft".to_string(), full.to_string())
+                }
+            } else {
+                ("minecraft".to_string(), "".to_string())
+            };
+            let mut fields = HashMap::new();
+            let ns_id = heap.alloc_string(ns);
+            let p_id = heap.alloc_string(path);
+            fields.insert("namespace".into(), Value::Object(Some(ns_id)));
+            fields.insert("path".into(), Value::Object(Some(p_id)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/resources/Identifier".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "getNamespace" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(ns) = fields.get("namespace") {
+                        return BuiltinResult::Handled(ns.clone());
+                    }
+                }
+            }
+            let sid = heap.alloc_string("minecraft");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "getPath" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(p) = fields.get("path") {
+                        return BuiltinResult::Handled(p.clone());
+                    }
+                }
+            }
+            let sid = heap.alloc_string("");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "toString" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    let ns = fields
+                        .get("namespace")
+                        .and_then(|v| v.as_obj())
+                        .and_then(|i| heap.get_string(i))
+                        .unwrap_or("minecraft");
+                    let p = fields
+                        .get("path")
+                        .and_then(|v| v.as_obj())
+                        .and_then(|i| heap.get_string(i))
+                        .unwrap_or("");
+                    let sid = heap.alloc_string(format!("{ns}:{p}"));
+                    return BuiltinResult::Handled(Value::Object(Some(sid)));
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 11. Logging: org/slf4j & org/apache/logging/log4j
+    // -------------------------------------------------------------
+    if (class_name == "org/slf4j/LoggerFactory"
+        || class_name == "org/apache/logging/log4j/LogManager"
+        || class_name == "org/apache/log4j/LogManager")
+        && (method_name == "getLogger"
+            || method_name == "getRootLogger"
+            || method_name == "getContext"
+            || method_name == "getFormatterLogger")
+    {
+        let name = if let Some(Some(id)) = args.get(0).map(|v| v.as_obj()) {
+            heap.get_string(id).unwrap_or("HFC").to_string()
+        } else {
+            "HFC".to_string()
+        };
+        let mut fields = HashMap::new();
+        let nid = heap.alloc_string(name);
+        fields.insert("name".into(), Value::Object(Some(nid)));
+        let lid = heap.alloc(JavaObject::Instance {
+            class_name: "org/slf4j/Logger".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(lid)));
+    }
+
+    if class_name == "org/slf4j/Logger"
+        || class_name == "org/apache/logging/log4j/Logger"
+        || class_name == "org/apache/log4j/Logger"
+        || class_name.contains("Logger")
+    {
+        if method_name.starts_with("is") && method_name.ends_with("Enabled") {
+            return BuiltinResult::Handled(Value::Int(1));
+        }
+        if method_name == "getName" {
+            if let Some(Some(this_id)) = args.get(0).map(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                    if let Some(val) = fields.get("name") {
+                        return BuiltinResult::Handled(val.clone());
+                    }
+                }
+            }
+            let sid = heap.alloc_string("HFC");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+        let msg = args
+            .get(1)
+            .and_then(|v| v.as_obj())
+            .and_then(|id| heap.get_string(id))
+            .unwrap_or("");
+        log::info!("[MOD] {msg}");
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    // -------------------------------------------------------------
+    // 12. Fabric Loader API
+    // -------------------------------------------------------------
+    if class_name == "net/fabricmc/loader/api/FabricLoader" {
+        if method_name == "getInstance" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/loader/api/FabricLoader".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "isModLoaded" {
+            let mod_id = args
+                .get(1)
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let loaded = heap.is_mod_loaded(mod_id);
+            return BuiltinResult::Handled(Value::from_bool(loaded));
+        } else if method_name == "getConfigDir" || method_name == "getGameDir" {
+            let mut fields = HashMap::new();
+            let sid = heap.alloc_string("config");
+            fields.insert("path".into(), Value::Object(Some(sid)));
+            let pid = heap.alloc(JavaObject::Instance {
+                class_name: "java/nio/file/Path".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(pid)));
+        } else if method_name == "getAllMods" {
+            let mut list = Vec::new();
+            let defaults = [
+                (
+                    "fabricloader",
+                    "Fabric Loader",
+                    "0.16.10",
+                    "Fabric Mod Loader",
+                ),
+                ("minecraft", "Minecraft", "26.3", "Minecraft: Java Edition"),
+                ("java", "Java", "25", "Java Runtime Environment"),
+            ];
+            for (mid, mname, mver, mdesc) in defaults {
+                list.push((
+                    mid.to_string(),
+                    mname.to_string(),
+                    mver.to_string(),
+                    mdesc.to_string(),
+                ));
+            }
+            for meta in heap.loaded_mods.values() {
+                if !list.iter().any(|(id, _, _, _)| id == &meta.id) {
+                    list.push((
+                        meta.id.clone(),
+                        meta.name.clone(),
+                        meta.version.clone(),
+                        meta.description.clone(),
+                    ));
+                }
+            }
+            let mut containers = Vec::new();
+            for (mid, mname, mver, mdesc) in list {
+                let mut meta_fields = HashMap::new();
+                let mid_id = heap.alloc_string(mid);
+                let mname_id = heap.alloc_string(mname);
+                let mdesc_id = heap.alloc_string(mdesc);
+                meta_fields.insert("id".into(), Value::Object(Some(mid_id)));
+                meta_fields.insert("name".into(), Value::Object(Some(mname_id)));
+                meta_fields.insert("description".into(), Value::Object(Some(mdesc_id)));
+
+                let mut ver_fields = HashMap::new();
+                let ver_str_id = heap.alloc_string(mver);
+                ver_fields.insert("friendlyString".into(), Value::Object(Some(ver_str_id)));
+                let ver_id = heap.alloc(JavaObject::Instance {
+                    class_name: "net/fabricmc/loader/api/Version".into(),
+                    fields: ver_fields,
+                });
+                meta_fields.insert("version".into(), Value::Object(Some(ver_id)));
+
+                let meta_id = heap.alloc(JavaObject::Instance {
+                    class_name: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+                    fields: meta_fields,
+                });
+
+                let mut container_fields = HashMap::new();
+                container_fields.insert("metadata".into(), Value::Object(Some(meta_id)));
+                let cid = heap.alloc(JavaObject::Instance {
+                    class_name: "net/fabricmc/loader/api/ModContainer".into(),
+                    fields: container_fields,
+                });
+                containers.push(Value::Object(Some(cid)));
+            }
+            let list_id = heap.alloc_list(containers);
+            return BuiltinResult::Handled(Value::Object(Some(list_id)));
+        } else if method_name == "getModContainer" && args.len() >= 2 {
+            let mod_id = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let (mname, mver, mdesc) = if let Some(meta) = heap.loaded_mods.get(&mod_id) {
+                (
+                    meta.name.clone(),
+                    meta.version.clone(),
+                    meta.description.clone(),
+                )
+            } else if mod_id == "minecraft" {
+                (
+                    "Minecraft".into(),
+                    "26.3".into(),
+                    "Minecraft: Java Edition".into(),
+                )
+            } else if mod_id == "fabricloader" {
+                (
+                    "Fabric Loader".into(),
+                    "0.16.10".into(),
+                    "Fabric Mod Loader".into(),
+                )
+            } else {
+                (mod_id.clone(), "1.0.0".into(), String::new())
+            };
+            let mut meta_fields = HashMap::new();
+            let mid_id = heap.alloc_string(&mod_id);
+            let mname_id = heap.alloc_string(&mname);
+            let mdesc_id = heap.alloc_string(&mdesc);
+            meta_fields.insert("id".into(), Value::Object(Some(mid_id)));
+            meta_fields.insert("name".into(), Value::Object(Some(mname_id)));
+            meta_fields.insert("description".into(), Value::Object(Some(mdesc_id)));
+
+            let mut ver_fields = HashMap::new();
+            let ver_str_id = heap.alloc_string(&mver);
+            ver_fields.insert("friendlyString".into(), Value::Object(Some(ver_str_id)));
+            let ver_id = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/loader/api/Version".into(),
+                fields: ver_fields,
+            });
+            meta_fields.insert("version".into(), Value::Object(Some(ver_id)));
+
+            let meta_id = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+                fields: meta_fields,
+            });
+            let mut container_fields = HashMap::new();
+            container_fields.insert("metadata".into(), Value::Object(Some(meta_id)));
+            let cid = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/loader/api/ModContainer".into(),
+                fields: container_fields,
+            });
+            let mut opt_fields = HashMap::new();
+            opt_fields.insert("value".into(), Value::Object(Some(cid)));
+            let opt_id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields: opt_fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(opt_id)));
+        } else if method_name == "getEntrypointContainers" || method_name == "getEntrypoints" {
+            let lid = heap.alloc_list(Vec::new());
+            return BuiltinResult::Handled(Value::Object(Some(lid)));
+        } else if method_name == "getEnvironmentType" {
+            let mut f = HashMap::new();
+            let name_id = heap.alloc_string("CLIENT");
+            f.insert("name".into(), Value::Object(Some(name_id)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/api/EnvType".into(),
+                fields: f,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
+    }
+
+    // ModContainer & ModMetadata
+    if class_name == "net/fabricmc/loader/api/ModContainer" {
+        if method_name == "getMetadata" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(m) = fields.get("metadata") {
+                        return BuiltinResult::Handled(m.clone());
+                    }
+                }
+            }
+        } else if method_name == "getContainingMod" {
+            let opt_id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(opt_id)));
+        } else if method_name == "getOrigin" {
+            let oid = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/loader/api/metadata/ModOrigin".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(oid)));
+        }
+    }
+
+    if class_name == "net/fabricmc/loader/api/metadata/ModMetadata" {
+        if method_name == "getId" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(mid) = fields.get("id") {
+                        return BuiltinResult::Handled(mid.clone());
+                    }
+                }
+            }
+            let sid = heap.alloc_string("mod");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "getName" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(n) = fields.get("name") {
+                        return BuiltinResult::Handled(n.clone());
+                    }
+                }
+            }
+            let sid = heap.alloc_string("Mod");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "getVersion" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(v) = fields.get("version") {
+                        return BuiltinResult::Handled(v.clone());
+                    }
+                }
+            }
+            let mut vf = HashMap::new();
+            let sid = heap.alloc_string("1.0.0");
+            vf.insert("friendlyString".into(), Value::Object(Some(sid)));
+            let vid = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/loader/api/Version".into(),
+                fields: vf,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(vid)));
+        } else if method_name == "getDescription" {
+            let sid = heap.alloc_string("");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "getProvides"
+            || method_name == "getAuthors"
+            || method_name == "getContributors"
+            || method_name == "getLicense"
+        {
+            let lid = heap.alloc_list(Vec::new());
+            return BuiltinResult::Handled(Value::Object(Some(lid)));
+        } else if method_name == "containsCustomValue" {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "getCustomValue" {
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getIconPath" {
+            let opt_id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(opt_id)));
+        } else if method_name == "getEnvironment" {
+            let mut f = HashMap::new();
+            let name_id = heap.alloc_string("CLIENT");
+            f.insert("name".into(), Value::Object(Some(name_id)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/loader/api/metadata/ModEnvironment".into(),
+                fields: f,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "getType" {
+            let sid = heap.alloc_string("fabric");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    if class_name == "net/fabricmc/loader/api/Version" {
+        if method_name == "getFriendlyString" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(s) = fields.get("friendlyString") {
+                        return BuiltinResult::Handled(s.clone());
+                    }
+                }
+            }
+            let sid = heap.alloc_string("1.0.0");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 13. Fabric Event API: EventFactory & Event
+    // -------------------------------------------------------------
+    if class_name.contains("networking")
+        || class_name.contains("Networking")
+        || class_name.starts_with("net/fabricmc/fabric/api/command")
+    {
+        if method_name.starts_with("register") || method_name == "isSupported" {
+            return BuiltinResult::Handled(Value::Int(1));
+        }
+        if method_name == "canSend" {
+            return BuiltinResult::Handled(Value::Int(0));
+        }
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: class_name.into(),
+            fields: HashMap::new(),
+        });
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
+    if class_name == "net/fabricmc/fabric/api/event/EventFactory" {
+        if method_name == "createArrayBacked" {
+            let mut fields = HashMap::new();
+            let listeners_id = heap.alloc(JavaObject::Array {
+                elem_type: "java/lang/Object".into(),
+                elements: Vec::new(),
+            });
+            fields.insert("listeners".into(), Value::Object(Some(listeners_id)));
+            if args.len() > 1 {
+                fields.insert("invokerFactory".into(), args[1].clone());
+            }
+            let eid = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/fabric/api/event/Event".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(eid)));
+        }
+    }
+
+    if class_name == "net/fabricmc/fabric/api/event/Event"
+        || class_name == "com/anthonyhilyard/iceberg/events/Event"
+        || class_name == "com/anthonyhilyard/iceberg/events/TypeTrackedEvent"
+        || class_name.ends_with("/Event")
+        || class_name.contains("event/Event")
+    {
+        if method_name == "register" && args.len() >= 2 {
+            if let Some(this_id) = args[0].as_obj() {
+                let listener = if args.len() >= 3 {
+                    args[2].clone()
+                } else {
+                    args[1].clone()
+                };
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                    if let Some(Value::Object(Some(arr_id))) = fields.get("listeners") {
+                        let arr_id = *arr_id;
+                        if let Some(JavaObject::Array { elements, .. }) = heap.get_mut(arr_id) {
+                            elements.push(listener);
+                        }
+                    } else {
+                        let arr_id = heap.alloc(JavaObject::Array {
+                            elem_type: "java/lang/Object".into(),
+                            elements: vec![listener],
+                        });
+                        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                            fields.insert("listeners".into(), Value::Object(Some(arr_id)));
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "invoker" && !args.is_empty() {
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                    if let Some(Value::Object(Some(arr_id))) = fields.get("listeners") {
+                        if let Some(JavaObject::Array { elements, .. }) = heap.get(*arr_id) {
+                            if let Some(first) = elements.first() {
+                                return BuiltinResult::Handled(first.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "listenerCount" && !args.is_empty() {
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                    if let Some(Value::Object(Some(arr_id))) = fields.get("listeners") {
+                        if let Some(JavaObject::Array { elements, .. }) = heap.get(*arr_id) {
+                            return BuiltinResult::Handled(Value::Int(elements.len() as i32));
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 14. JamLib API
+    // -------------------------------------------------------------
+    if class_name == "io/github/jamalam360/jamlib/JamLib" {
+        if method_name == "checkForJarRenaming" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "io/github/jamalam360/jamlib/api/platform/Platform" {
+        if method_name == "getModLoader" {
+            let mut fields = HashMap::new();
+            let name_id = heap.alloc_string("Fabric");
+            fields.insert("name".into(), Value::Object(Some(name_id)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "io/github/jamalam360/jamlib/api/platform/ModLoader".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
+    }
+
+    if class_name == "io/github/jamalam360/jamlib/api/platform/ModLoader" {
+        if method_name == "name" {
+            let id = heap.alloc_string("Fabric");
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
+    }
+
+    if class_name == "io/github/jamalam360/jamlib/api/config/ConfigManager" {
+        if method_name == "<init>" {
+            let mut cfg_fields = HashMap::new();
+            cfg_fields.insert("requireHoe".into(), Value::from_bool(false));
+            cfg_fields.insert("harvestInRadius".into(), Value::from_bool(true));
+            let hunger_none = heap.alloc(JavaObject::Instance {
+                class_name: "io/github/jamalam360/rightclickharvest/Config$HungerLevel".into(),
+                fields: {
+                    let mut f = HashMap::new();
+                    f.insert("modifier".into(), Value::Float(0.0));
+                    f
+                },
+            });
+            cfg_fields.insert("hungerLevel".into(), Value::Object(Some(hunger_none)));
+            let exp_none = heap.alloc(JavaObject::Instance {
+                class_name: "io/github/jamalam360/rightclickharvest/Config$ExperienceType".into(),
+                fields: {
+                    let mut f = HashMap::new();
+                    f.insert("ordinal".into(), Value::Int(2));
+                    f
+                },
+            });
+            cfg_fields.insert("experienceType".into(), Value::Object(Some(exp_none)));
+            cfg_fields.insert(
+                "hasUserBeenWarnedForNotUsingHoe".into(),
+                Value::from_bool(false),
+            );
+            cfg_fields.insert("showServerWarning".into(), Value::from_bool(false));
+
+            let cfg_id = heap.alloc(JavaObject::Instance {
+                class_name: "io/github/jamalam360/rightclickharvest/Config".into(),
+                fields: cfg_fields,
+            });
+
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                    fields.insert("config".into(), Value::Object(Some(cfg_id)));
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "get" {
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                    if let Some(cfg) = fields.get("config") {
+                        return BuiltinResult::Handled(cfg.clone());
+                    }
+                }
+            }
+        } else if method_name == "save" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "io/github/jamalam360/jamlib/api/events/core/CancellableEvent"
+        || class_name == "io/github/jamalam360/jamlib/api/events/core/Event"
+    {
+        if method_name == "listen" && args.len() >= 2 {
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(listener) = args.last() {
+                    let mut arr_id_opt = None;
+                    if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                        fields.insert("listener".into(), listener.clone());
+                        if let Some(Value::Object(Some(arr_id))) = fields.get("listeners") {
+                            arr_id_opt = Some(*arr_id);
+                        }
+                    }
+                    if let Some(arr_id) = arr_id_opt {
+                        if let Some(JavaObject::Array { elements, .. }) = heap.get_mut(arr_id) {
+                            elements.push(listener.clone());
+                        }
+                    } else {
+                        let arr_id = heap.alloc(JavaObject::Array {
+                            elem_type: "java/lang/Object".into(),
+                            elements: vec![listener.clone()],
+                        });
+                        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                            fields.insert("listeners".into(), Value::Object(Some(arr_id)));
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "io/github/jamalam360/jamlib/api/events/core/EventResult" {
+        if method_name == "pass" {
+            let id = heap.alloc_event_result(EventResult::pass());
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "cancel" && !args.is_empty() {
+            let val = args[0].clone();
+            let id = heap.alloc_event_result(EventResult::cancel(val));
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if (method_name == "isCancelled" || method_name == "wasCancelled")
+            && !args.is_empty()
+        {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(res) = heap.get_native::<EventResult>(id) {
+                    return BuiltinResult::Handled(Value::from_bool(res.cancelled));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "value" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(res) = heap.get_native::<EventResult>(id) {
+                    return BuiltinResult::Handled(res.value.clone());
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 15. Minecraft Types
+    // -------------------------------------------------------------
+    // BlockPos
+    if class_name == "net/minecraft/core/BlockPos" {
+        if method_name == "<init>" && args.len() >= 4 {
+            let x = args[1].as_int();
+            let y = args[2].as_int();
+            let z = args[3].as_int();
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(obj) = heap.get_mut(this_id) {
+                    *obj = JavaObject::Native(Box::new(BlockPos { x, y, z }));
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getX" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(pos) = heap.get_native::<BlockPos>(id) {
+                    return BuiltinResult::Handled(Value::Int(pos.x));
+                }
+            }
+        } else if method_name == "getY" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(pos) = heap.get_native::<BlockPos>(id) {
+                    return BuiltinResult::Handled(Value::Int(pos.y));
+                }
+            }
+        } else if method_name == "getZ" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(pos) = heap.get_native::<BlockPos>(id) {
+                    return BuiltinResult::Handled(Value::Int(pos.z));
+                }
+            }
+        } else if method_name == "relative" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(pos) = heap.get_native::<BlockPos>(id).cloned() {
+                    if let Some(dir_id) = args[1].as_obj() {
+                        if let Some(dir) = heap.get_native::<Direction>(dir_id) {
+                            let new_id =
+                                heap.alloc_block_pos(pos.x + dir.x, pos.y + dir.y, pos.z + dir.z);
+                            return BuiltinResult::Handled(Value::Object(Some(new_id)));
+                        }
+                    }
+                    if args.len() >= 3 {
+                        let offset = args[2].as_int();
+                        let new_id = heap.alloc_block_pos(pos.x + offset, pos.y, pos.z);
+                        return BuiltinResult::Handled(Value::Object(Some(new_id)));
+                    }
+                }
+            }
+        } else if method_name == "distManhattan" && args.len() >= 2 {
+            if let (Some(id1), Some(id2)) = (args[0].as_obj(), args[1].as_obj()) {
+                if let (Some(p1), Some(p2)) = (
+                    heap.get_native::<BlockPos>(id1),
+                    heap.get_native::<BlockPos>(id2),
+                ) {
+                    let d = (p1.x - p2.x).abs() + (p1.y - p2.y).abs() + (p1.z - p2.z).abs();
+                    return BuiltinResult::Handled(Value::Int(d));
+                }
+            }
+        }
+    }
+
+    // BlockHitResult
+    if class_name == "net/minecraft/world/phys/BlockHitResult" {
+        if method_name == "<init>" {
+            let mut found_pos = BlockPos { x: 0, y: 0, z: 0 };
+            let mut found_dir = Direction::UP;
+            for arg in &args[1..] {
+                if let Some(id) = arg.as_obj() {
+                    if let Some(pos) = heap.get_native::<BlockPos>(id) {
+                        found_pos = pos.clone();
+                    } else if let Some(dir) = heap.get_native::<Direction>(id) {
+                        found_dir = dir.clone();
+                    }
+                }
+            }
+            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
+                if let Some(obj) = heap.get_mut(this_id) {
+                    *obj = JavaObject::Native(Box::new(BlockHitResult {
+                        pos: found_pos,
+                        direction: found_dir,
+                    }));
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getBlockPos" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(hit) = heap.get_native::<BlockHitResult>(id) {
+                    let pid = heap.alloc_block_pos(hit.pos.x, hit.pos.y, hit.pos.z);
+                    return BuiltinResult::Handled(Value::Object(Some(pid)));
+                }
+            }
+        } else if method_name == "getDirection" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(hit) = heap.get_native::<BlockHitResult>(id) {
+                    let did = heap.alloc_direction(hit.direction.clone());
+                    return BuiltinResult::Handled(Value::Object(Some(did)));
+                }
+            }
+        } else if method_name == "withPosition" && args.len() >= 2 {
+            if let (Some(id), Some(pos_id)) = (args[0].as_obj(), args[1].as_obj()) {
+                if let (Some(hit), Some(pos)) = (
+                    heap.get_native::<BlockHitResult>(id),
+                    heap.get_native::<BlockPos>(pos_id),
+                ) {
+                    let new_id = heap.alloc_hit_result(pos.clone(), hit.direction.clone());
+                    return BuiltinResult::Handled(Value::Object(Some(new_id)));
+                }
+            }
+        }
+    }
+
+    // BlockState
+    if class_name == "net/minecraft/world/level/block/state/BlockState" {
+        if method_name == "getBlock" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(state) = heap.get_native::<BlockState>(id) {
+                    let bid = heap.alloc_native(state.block.clone());
+                    return BuiltinResult::Handled(Value::Object(Some(bid)));
+                }
+            }
+        } else if method_name == "getValue" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(state) = heap.get_native::<BlockState>(id) {
+                    let age = state.get_age();
+                    return BuiltinResult::Handled(Value::Int(age));
+                }
+            }
+        } else if method_name == "setValue" && args.len() >= 3 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(state) = heap.get_native::<BlockState>(id) {
+                    let mut new_state = state.clone();
+                    let val = args[2].as_int().to_string();
+                    new_state.properties.insert("age".into(), val);
+                    let new_id = heap.alloc_block_state(new_state);
+                    return BuiltinResult::Handled(Value::Object(Some(new_id)));
+                }
+            }
+        } else if method_name == "is" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(state) = heap.get_native::<BlockState>(id) {
+                    if let Some(tag_id) = args[1].as_obj() {
+                        if let Some(tag) = heap.get_native::<TagKey>(tag_id) {
+                            let matches = match tag.id.as_str() {
+                                "crops" => state.block.is_crop,
+                                "blacklist" | "radius_harvest_blacklist" => false,
+                                "hoe_never_required" => true,
+                                _ => false,
+                            };
+                            return BuiltinResult::Handled(Value::from_bool(matches));
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "getCloneItemStack" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(state) = heap.get_native::<BlockState>(id) {
+                    let seed_id = match state.block.id.as_str() {
+                        "minecraft:wheat" => "minecraft:wheat_seeds",
+                        "minecraft:carrots" => "minecraft:carrot",
+                        "minecraft:potatoes" => "minecraft:potato",
+                        "minecraft:beetroots" => "minecraft:beetroot_seeds",
+                        "minecraft:nether_wart" => "minecraft:nether_wart",
+                        "minecraft:cocoa" => "minecraft:cocoa_beans",
+                        _ => &state.block.id,
+                    };
+                    let stack_id = heap.alloc_item_stack(ItemStack::new(seed_id, 1));
+                    return BuiltinResult::Handled(Value::Object(Some(stack_id)));
+                }
+            }
+        } else if method_name == "spawnAfterBreak" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Block & CropBlock
+    if class_name == "net/minecraft/world/level/block/CropBlock"
+        || class_name == "net/minecraft/world/level/block/Block"
+        || class_name == "io/github/jamalam360/rightclickharvest/mixin/CropBlockAccessor"
+    {
+        if method_name == "isMaxAge" && args.len() >= 2 {
+            if let Some(id) = args[1].as_obj() {
+                if let Some(state) = heap.get_native::<BlockState>(id) {
+                    return BuiltinResult::Handled(Value::from_bool(state.is_max_age()));
+                }
+            }
+        } else if method_name == "getMaxAge" {
+            return BuiltinResult::Handled(Value::Int(7));
+        } else if method_name == "getAgeProperty" || method_name == "invokeGetAgeProperty" {
+            let pid = heap.alloc_native(IntegerProperty {
+                name: "age".into(),
+                min: 0,
+                max: 7,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(pid)));
+        } else if method_name == "asItem" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(block) = heap.get_native::<Block>(id) {
+                    let iid = heap.alloc_native(Item {
+                        id: block.id.clone(),
+                    });
+                    return BuiltinResult::Handled(Value::Object(Some(iid)));
+                }
+            }
+        } else if method_name == "getDrops" {
+            let mut block_id = "minecraft:wheat".to_string();
+            for arg in args {
+                if let Some(id) = arg.as_obj() {
+                    if let Some(s) = heap.get_native::<BlockState>(id) {
+                        block_id = s.block.id.clone();
+                        break;
+                    }
+                }
+            }
+            let drops = get_default_drops(&block_id);
+            let drop_objs: Vec<Value> = drops
+                .into_iter()
+                .map(|(item_id, count)| {
+                    let stk_id = heap.alloc_item_stack(ItemStack::new(item_id, count));
+                    Value::Object(Some(stk_id))
+                })
+                .collect();
+            let list_id = heap.alloc_list(drop_objs);
+            return BuiltinResult::Handled(Value::Object(Some(list_id)));
+        } else if method_name == "popResource" {
+            let mut found_lvl: Option<usize> = None;
+            let mut found_pos: Option<BlockPos> = None;
+            let mut found_stk: Option<ItemStack> = None;
+            for arg in args {
+                if let Some(id) = arg.as_obj() {
+                    if heap.get_native::<Level>(id).is_some() {
+                        found_lvl = Some(id);
+                    } else if let Some(p) = heap.get_native::<BlockPos>(id) {
+                        found_pos = Some(p.clone());
+                    } else if let Some(s) = heap.get_native::<ItemStack>(id) {
+                        found_stk = Some(s.clone());
+                    }
+                }
+            }
+            if let (Some(lvl_id), Some(pos), Some(stk)) = (found_lvl, found_pos, found_stk) {
+                if stk.count > 0 && !stk.is_empty() {
+                    if let Some(level) = heap.get_native_mut::<Level>(lvl_id) {
+                        level.dropped_stacks.push((pos, stk.item.id, stk.count));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "dropStacks" {
+            let mut found_state: Option<BlockState> = None;
+            let mut found_lvl: Option<usize> = None;
+            let mut found_pos: Option<BlockPos> = None;
+            for arg in args {
+                if let Some(id) = arg.as_obj() {
+                    if let Some(s) = heap.get_native::<BlockState>(id) {
+                        found_state = Some(s.clone());
+                    } else if heap.get_native::<Level>(id).is_some() {
+                        found_lvl = Some(id);
+                    } else if let Some(p) = heap.get_native::<BlockPos>(id) {
+                        found_pos = Some(p.clone());
+                    }
+                }
+            }
+            if let (Some(state), Some(lvl_id), Some(pos)) = (found_state, found_lvl, found_pos) {
+                let drops = get_default_drops(&state.block.id);
+                if let Some(level) = heap.get_native_mut::<Level>(lvl_id) {
+                    for (item_id, count) in drops {
+                        level.dropped_stacks.push((pos.clone(), item_id, count));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Level / ServerLevel
+    if class_name == "net/minecraft/world/level/Level"
+        || class_name == "net/minecraft/server/level/ServerLevel"
+    {
+        if method_name == "isClientSide" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(level) = heap.get_native::<Level>(id) {
+                    return BuiltinResult::Handled(Value::from_bool(level.is_client));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "getBlockState" && args.len() >= 2 {
+            if let (Some(id), Some(pos_id)) = (args[0].as_obj(), args[1].as_obj()) {
+                if let (Some(level), Some(pos)) = (
+                    heap.get_native::<Level>(id),
+                    heap.get_native::<BlockPos>(pos_id),
+                ) {
+                    let state = level.get_block_state(pos);
+                    let sid = heap.alloc_block_state(state);
+                    return BuiltinResult::Handled(Value::Object(Some(sid)));
+                }
+            }
+        } else if method_name == "setBlockAndUpdate" && args.len() >= 3 {
+            if let (Some(id), Some(pos_id), Some(st_id)) =
+                (args[0].as_obj(), args[1].as_obj(), args[2].as_obj())
+            {
+                let state_opt = heap.get_native::<BlockState>(st_id).cloned();
+                let pos_opt = heap.get_native::<BlockPos>(pos_id).cloned();
+                if let (Some(state), Some(pos)) = (state_opt, pos_opt) {
+                    if let Some(level) = heap.get_native_mut::<Level>(id) {
+                        level.set_block_and_update(&pos, state);
+                        return BuiltinResult::Handled(Value::from_bool(true));
+                    }
+                }
+            }
+        } else if method_name == "removeBlock" && args.len() >= 2 {
+            return BuiltinResult::Handled(Value::from_bool(true));
+        }
+    }
+
+    // Player
+    if class_name == "net/minecraft/world/entity/player/Player" {
+        if method_name == "isSpectator" || method_name == "isCrouching" {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "getItemInHand" {
+            let stack_id = heap.alloc_item_stack(ItemStack::empty());
+            return BuiltinResult::Handled(Value::Object(Some(stack_id)));
+        } else if method_name == "level" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(p) = heap.get_native::<Player>(id) {
+                    return BuiltinResult::Handled(Value::Object(Some(p.level_id)));
+                }
+            }
+        } else if method_name == "position" {
+            let pid = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/world/phys/Vec3".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(pid)));
+        } else if method_name == "getAbilities" {
+            let mut fields = HashMap::new();
+            fields.insert("instabuild".into(), Value::from_bool(false));
+            let aid = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/world/entity/player/Abilities".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(aid)));
+        } else if method_name == "getFoodData" {
+            let fid = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/world/food/FoodData".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(fid)));
+        } else if method_name == "getRandom" {
+            let rid = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/util/RandomSource".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(rid)));
+        } else if method_name == "awardStat"
+            || method_name == "playSound"
+            || method_name == "sendSystemMessage"
+            || method_name == "causeFoodExhaustion"
+            || method_name == "giveExperiencePoints"
+        {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // FoodData
+    if class_name == "net/minecraft/world/food/FoodData" && method_name == "getFoodLevel" {
+        return BuiltinResult::Handled(Value::Int(20));
+    }
+
+    // ItemStack
+    if class_name == "net/minecraft/world/item/ItemStack" {
+        if method_name == "getItem" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(stack) = heap.get_native::<ItemStack>(id) {
+                    let iid = heap.alloc_native(stack.item.clone());
+                    return BuiltinResult::Handled(Value::Object(Some(iid)));
+                }
+            }
+        } else if method_name == "isEmpty" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(stack) = heap.get_native::<ItemStack>(id) {
+                    return BuiltinResult::Handled(Value::from_bool(stack.is_empty()));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if method_name == "getCount" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(stack) = heap.get_native::<ItemStack>(id) {
+                    return BuiltinResult::Handled(Value::Int(stack.count));
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        } else if method_name == "setCount" && args.len() >= 2 {
+            let new_count = args[1].as_int();
+            if let Some(id) = args[0].as_obj() {
+                if let Some(stack) = heap.get_native_mut::<ItemStack>(id) {
+                    stack.count = new_count;
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "is" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(stack) = heap.get_native::<ItemStack>(id) {
+                    if let Some(tag_id) = args[1].as_obj() {
+                        if let Some(tag) = heap.get_native::<TagKey>(tag_id) {
+                            if tag.id.contains("hoes") {
+                                return BuiltinResult::Handled(Value::from_bool(stack.is_hoe()));
+                            }
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "hurtAndBreak" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Item
+    if class_name == "net/minecraft/world/item/Item" {
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    // Stats
+    if class_name == "net/minecraft/stats/StatType" && method_name == "get" {
+        let sid = heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/stats/Stat".into(),
+            fields: HashMap::new(),
+        });
+        return BuiltinResult::Handled(Value::Object(Some(sid)));
+    }
+
+    // RightClickHarvestPlatform event hooks
+    if class_name == "io/github/jamalam360/rightclickharvest/RightClickHarvestPlatform" {
+        if method_name == "postBreakEvent" || method_name == "postPlaceEvent" {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        } else if method_name == "postAfterHarvestEvent" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // ServiceLoader
+    if class_name == "java/util/ServiceLoader" {
+        if method_name == "load" {
+            let service_class = args.first().and_then(|v| v.as_obj()).and_then(|id| {
+                if let Some(JavaObject::Class(name)) = heap.get(id) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            });
+            let mut fields = HashMap::new();
+            if let Some(sc) = service_class {
+                let sc_id = heap.alloc_string(sc);
+                fields.insert("serviceClass".into(), Value::Object(Some(sc_id)));
+            }
+            let sl_id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/ServiceLoader".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(sl_id)));
+        } else if method_name == "findFirst" {
+            let service_class = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| {
+                    if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                        fields
+                            .get("serviceClass")
+                            .and_then(|v| v.as_obj())
+                            .and_then(|sid| heap.get_string(sid))
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            let impl_class = match service_class.as_str() {
+                "com/anthonyhilyard/iceberg/services/IReloadListenerRegistrar" => {
+                    "com/anthonyhilyard/iceberg/fabric/services/FabricReloadListenerRegistrar"
+                }
+                "com/anthonyhilyard/iceberg/services/IPlatformHelper" => {
+                    "com/anthonyhilyard/iceberg/fabric/services/FabricPlatformHelper"
+                }
+                "com/anthonyhilyard/iceberg/services/IFontLookup" => {
+                    "com/anthonyhilyard/iceberg/fabric/services/FabricFontLookup"
+                }
+                _ => "java/lang/Object",
+            };
+            let inst_id = heap.alloc(JavaObject::Instance {
+                class_name: impl_class.into(),
+                fields: HashMap::new(),
+            });
+            let mut opt_fields = HashMap::new();
+            opt_fields.insert("value".into(), Value::Object(Some(inst_id)));
+            let opt_id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields: opt_fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(opt_id)));
+        }
+    }
+
+    // Fabric ResourceManagerHelper
+    if class_name == "net/fabricmc/fabric/api/resource/ResourceManagerHelper" {
+        if method_name == "get" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/fabricmc/fabric/api/resource/ResourceManagerHelper".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "registerReloadListener" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Component & MutableComponent
+    if class_name == "net/minecraft/network/chat/Component"
+        || class_name == "net/minecraft/network/chat/MutableComponent"
+    {
+        if method_name == "literal" {
+            let text = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let str_id = heap.alloc_string(text);
+            let mut fields = HashMap::new();
+            fields.insert("text".into(), Value::Object(Some(str_id)));
+            let sibs_id = heap.alloc_list(Vec::new());
+            fields.insert("siblings".into(), Value::Object(Some(sibs_id)));
+            fields.insert("color".into(), Value::Int(0xFFFFFFFF_u32 as i32));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/network/chat/MutableComponent".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "translatable"
+            || method_name == "translatableEscape"
+            || method_name == "translatableWithFallback"
+        {
+            let key = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+
+            let (fallback, arg_start) =
+                if method_name == "translatableWithFallback" && args.len() >= 2 {
+                    let fb = args[1]
+                        .as_obj()
+                        .and_then(|id| heap.get_string(id))
+                        .map(str::to_string);
+                    (fb, 2)
+                } else {
+                    (None, 1)
+                };
+
+            let mut format_args = Vec::new();
+            if args.len() > arg_start {
+                if let Some(arr_id) = args[arg_start].as_obj() {
+                    if let Some(JavaObject::Array { elements, .. }) = heap.get(arr_id) {
+                        for elem in elements {
+                            format_args.push(value_to_string(heap, elem));
+                        }
+                    } else {
+                        for arg in &args[arg_start..] {
+                            format_args.push(value_to_string(heap, arg));
+                        }
+                    }
+                } else {
+                    for arg in &args[arg_start..] {
+                        format_args.push(value_to_string(heap, arg));
+                    }
+                }
+            }
+
+            let template = heap
+                .get_translation(&key)
+                .map(str::to_string)
+                .or(fallback)
+                .unwrap_or_else(|| key.clone());
+
+            let translated = format_translation(&template, &format_args);
+            let str_id = heap.alloc_string(translated);
+            let mut fields = HashMap::new();
+            fields.insert("text".into(), Value::Object(Some(str_id)));
+            let sibs_id = heap.alloc_list(Vec::new());
+            fields.insert("siblings".into(), Value::Object(Some(sibs_id)));
+            fields.insert("color".into(), Value::Int(0xFFFFFFFF_u32 as i32));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/network/chat/MutableComponent".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "getVisualOrderText" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/util/FormattedCharSequence".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "empty" {
+            let str_id = heap.alloc_string("");
+            let mut fields = HashMap::new();
+            fields.insert("text".into(), Value::Object(Some(str_id)));
+            let sibs_id = heap.alloc_list(Vec::new());
+            fields.insert("siblings".into(), Value::Object(Some(sibs_id)));
+            fields.insert("color".into(), Value::Int(0xFFFFFFFF_u32 as i32));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/network/chat/MutableComponent".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "nullToEmpty" {
+            let str_arg = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let str_id = heap.alloc_string(str_arg);
+            let mut fields = HashMap::new();
+            fields.insert("text".into(), Value::Object(Some(str_id)));
+            let sibs_id = heap.alloc_list(Vec::new());
+            fields.insert("siblings".into(), Value::Object(Some(sibs_id)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/network/chat/MutableComponent".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "append" && args.len() >= 2 {
+            let this_id = args[0].as_obj();
+            let other = args[1].clone();
+            if let Some(this_id) = this_id {
+                let other_text = if let Some(oid) = other.as_obj() {
+                    if let Some(s) = heap.get_string(oid) {
+                        Some(s.to_string())
+                    } else if let Some(JavaObject::Instance { fields, .. }) = heap.get(oid) {
+                        fields
+                            .get("text")
+                            .and_then(|v| v.as_obj())
+                            .and_then(|sid| heap.get_string(sid))
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(txt) = other_text {
+                    let cur_str =
+                        if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
+                            fields
+                                .get("text")
+                                .and_then(|v| v.as_obj())
+                                .and_then(|sid| heap.get_string(sid))
+                                .unwrap_or("")
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+                    let combined = format!("{cur_str}{txt}");
+                    let new_str_id = heap.alloc_string(combined);
+                    if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
+                        fields.insert("text".into(), Value::Object(Some(new_str_id)));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(args[0].clone());
+        } else if (method_name == "withStyle" || method_name == "setStyle") && !args.is_empty() {
+            if args.len() >= 2 {
+                if let Some(style_id) = args[1].as_obj() {
+                    let extracted_color =
+                        if let Some(JavaObject::Instance { fields, .. }) = heap.get(style_id) {
+                            fields.get("color").map(|v| v.as_int())
+                        } else {
+                            None
+                        };
+                    if let Some(c) = extracted_color {
+                        if let Some(this_id) = args[0].as_obj() {
+                            if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id)
+                            {
+                                fields.insert("color".into(), Value::Int(c));
+                            }
+                        }
+                    }
+                }
+            }
+            return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "getString" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if heap.get_string(id).is_some() {
+                    return BuiltinResult::Handled(Value::Object(Some(id)));
+                } else if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(Value::Object(Some(sid))) = fields.get("text") {
+                        return BuiltinResult::Handled(Value::Object(Some(*sid)));
+                    }
+                }
+            }
+            let sid = heap.alloc_string("");
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if (method_name == "copy" || method_name == "plainCopy") && !args.is_empty() {
+            return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "getSiblings" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(sibs) = fields.get("siblings") {
+                        return BuiltinResult::Handled(sibs.clone());
+                    }
+                }
+            }
+            let list_id = heap.alloc_list(Vec::new());
+            return BuiltinResult::Handled(Value::Object(Some(list_id)));
+        }
+    }
+
+    // TextColor
+    if class_name == "net/minecraft/network/chat/TextColor" {
+        if method_name == "fromRgb" && !args.is_empty() {
+            let c = args[0].as_int();
+            let mut f = HashMap::new();
+            f.insert("value".into(), Value::Int(c));
+            f.insert("color".into(), Value::Int(c));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: class_name.into(),
+                fields: f,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "fromLegacyFormat" && !args.is_empty() {
+            let color = args[0]
+                .as_obj()
+                .and_then(|id| {
+                    if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                        fields.get("color").map(|v| v.as_int())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0xFFFFFF);
+            let mut f = HashMap::new();
+            f.insert("value".into(), Value::Int(color));
+            f.insert("color".into(), Value::Int(color));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: class_name.into(),
+                fields: f,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "getValue" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(v) = fields.get("value") {
+                        return BuiltinResult::Handled(v.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0xFFFFFF));
+        }
+    }
+
+    // ChatFormatting
+    if class_name == "net/minecraft/ChatFormatting" {
+        if method_name == "getColor" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(c) = fields.get("color") {
+                        return BuiltinResult::Handled(c.clone());
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0xFFFFFF));
+        }
+    }
+
+    // Fabric PlayerBlockBreakEvents
+    if class_name.contains("PlayerBlockBreakEvents") || method_name == "beforeBlockBreak" {
+        if method_name == "beforeBlockBreak" {
+            // boolean beforeBlockBreak(Level, Player, BlockPos, BlockState, BlockEntity)
+            // Return true (1) to indicate the block break is allowed (not cancelled).
+            return BuiltinResult::Handled(Value::Int(1));
+        }
+    }
+
+    // net/minecraft/locale/Language
+    if class_name == "net/minecraft/locale/Language" {
+        if method_name == "getInstance" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/locale/Language".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "has" {
+            let key = args
+                .get(1)
+                .or_else(|| args.first())
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let has = heap.has_translation(key);
+            return BuiltinResult::Handled(Value::from_bool(has));
+        } else if method_name == "getOrDefault" {
+            let key = args
+                .get(1)
+                .or_else(|| args.first())
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let fallback = args
+                .get(2)
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .map(str::to_string)
+                .unwrap_or_else(|| key.clone());
+            let val = heap.get_translation(&key).unwrap_or(&fallback).to_string();
+            let sid = heap.alloc_string(val);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "getVisualOrder" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/util/FormattedCharSequence".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
+    }
+
+    // net/minecraft/client/resources/language/I18n
+    if class_name == "net/minecraft/client/resources/language/I18n" {
+        if method_name == "get" {
+            let key = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let mut format_args = Vec::new();
+            if args.len() > 1 {
+                if let Some(arr_id) = args[1].as_obj() {
+                    if let Some(JavaObject::Array { elements, .. }) = heap.get(arr_id) {
+                        for elem in elements {
+                            format_args.push(value_to_string(heap, elem));
+                        }
+                    } else {
+                        for arg in &args[1..] {
+                            format_args.push(value_to_string(heap, arg));
+                        }
+                    }
+                } else {
+                    for arg in &args[1..] {
+                        format_args.push(value_to_string(heap, arg));
+                    }
+                }
+            }
+            let template = heap.get_translation(&key).unwrap_or(&key).to_string();
+            let val = format_translation(&template, &format_args);
+            let sid = heap.alloc_string(val);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "has" {
+            let key = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let has = heap.has_translation(key);
+            return BuiltinResult::Handled(Value::from_bool(has));
+        }
+    }
+
+    BuiltinResult::NotHandled
+}

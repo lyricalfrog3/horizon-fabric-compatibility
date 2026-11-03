@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hfc-core",
+    "crates/hfc-fabric",
+    "crates/hfc-cache",
+    "crates/hfc-runtime",
+    "crates/hfc-bootstrap",
+    "crates/hfc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+authors = ["Horizon Fabric Compatibility contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+toml = "1.1.6"
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
+horizon-core = { path = "workspace/horizon/crates/horizon-core" }
+horizon-mods = { path = "workspace/horizon/crates/horizon-mods", default-features = false }
+horizon-port-pack = { path = "workspace/horizon/crates/horizon-port-pack" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+collapsible_if = "allow"
+single_match = "allow"
+get_first = "allow"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"

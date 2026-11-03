@@ -1,0 +1,16 @@
+[package]
+name = "hfc-fabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe Fabric jar discovery, fabric.mod.json metadata and dependency analysis"
+
+[dependencies]
+hfc-core = { path = "../hfc-core" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

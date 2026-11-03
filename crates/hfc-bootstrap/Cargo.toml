@@ -1,0 +1,24 @@
+[package]
+name = "hfc-bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pre-launch discovery, conversion, install and reporting for Horizon Fabric Compatibility"
+
+[dependencies]
+hfc-core = { path = "../hfc-core" }
+hfc-fabric = { path = "../hfc-fabric" }
+hfc-cache = { path = "../hfc-cache" }
+horizon-core = { workspace = true }
+horizon-mods = { workspace = true }
+horizon-port-pack = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+zip.workspace = true
+horizon-mods.workspace = true

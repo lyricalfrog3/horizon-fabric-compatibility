@@ -1,0 +1,33 @@
+# Rust build output
+/target/
+**/target/
+
+# Nested Git checkouts (each has its own history)
+/workspace/
+/research/horizon-mixins/
+
+# Local game and runtime state
+/.horizon-cache/
+/.freebuff/
+/.cloud-attachments/
+/command_history.txt
+/horizon-graphics.txt
+/horizon-mods.txt
+/horizon_official_server.txt
+/horizon-player.txt
+/options.txt
+/servers.dat
+/saves/
+/logs/
+/crash-reports/
+/screenshots/
+/horizon-mods/
+
+# Third-party Fabric jars and archives for local runtime tests
+/test-mods/*
+!/test-mods/README.md
+
+# Editor and OS noise
+.DS_Store
+*.hprof
+*.jfr

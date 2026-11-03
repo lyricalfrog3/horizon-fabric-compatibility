@@ -21,6 +21,11 @@ in the repository. See [fabric-runtime.md](architecture/fabric-runtime.md).
 | Fabric runtime | entrypoint execution, RCH, tooltip dispatch, real JDK/Minecraft bytecode | `crates/hfc-runtime/tests` | implemented; needs local jars/install |
 | Behavioral parity | carried content matches the original mod's behaviour | dev-only oracle | **not implemented** |
 
+Compatibility tests may use a pinned mod to reproduce a failure, but the code under test must
+be the general path: the opcode, Fabric API event, Minecraft builtin, config/resource format
+or host boundary that the mod uses. A test that passes only because the runtime checks that
+mod's id or class name is not coverage and must not be added.
+
 ## Current inventory
 
 `cargo test --workspace` (HFC crates plus the path dependencies they compile):

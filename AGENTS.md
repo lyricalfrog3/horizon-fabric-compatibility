@@ -17,6 +17,17 @@ the runtime. Read [docs/testing.md](docs/testing.md) before adding tests.
 - **Never fake compatibility.** A mod whose entrypoint returns without error is not "working".
   A listener that runs but returns default values is partial at best. Document what is actually
   rendered, dispatched or stored.
+- **No mod-specific compatibility code.** When a mod exposes a missing general path, fix the
+  shared path: an opcode, a Fabric API event, a Minecraft class/method builtin, a config or
+  resource format, or a host boundary. Do not branch on a mod id, a mod's package or class
+  name, a specific config field, a jar filename or a version. The same code must work for any
+  mod that uses that API. Tests may load one mod to reproduce a bug, but the fix belongs in
+  the general path.
+  Library adapters for APIs shared by many mods (for example JamLib events, Iceberg tooltip
+  events) are allowed; adapters for one mod's own classes are not. Existing per-mod shims
+  (`Config$HungerLevel`, `Config$ExperienceType`, `RightClickHarvestPlatform`,
+  `CropBlockAccessor`, Mod Menu's `HttpUtil`) are debt: generalize them when touching that
+  path, and do not add another one.
 - **Do not weaken checks to make a test pass.** No skipped assertions, swallowed interpreter
   errors, silent fallbacks or fabricated Minecraft classes in tests that claim real-classpath
   coverage.

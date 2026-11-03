@@ -130,15 +130,21 @@ clearly when the installation is absent; it must not silently pass with fabricat
 
 ## Adding a builtin or event
 
-1. Prefer executing the mod's real bytecode. Add a builtin only for a host boundary (I/O,
+1. **Never add per-mod code.** Fix the shared path a mod exposes: an opcode, a Fabric API
+   event, a Minecraft class/method builtin, a config/resource format, or a host boundary.
+   Do not check a mod id, a mod's package/class name, a config field, a jar name or a version.
+   A test may load one mod to reproduce a bug; the implementation must remain universal.
+   Library adapters for APIs shared by many mods are allowed, but adapters for one mod's own
+   classes are not. Existing per-mod shims are debt and must be generalized when touched.
+2. Prefer executing the mod's real bytecode. Add a builtin only for a host boundary (I/O,
    registry data, rendering) or a class the runtime intentionally replaces.
-2. If a class has synthetic static fields, add it to `has_synthetic_statics` and to
+3. If a class has synthetic static fields, add it to `has_synthetic_statics` and to
    `create_static_field_val`; otherwise the first `Getstatic` rebuilds the real registry.
-3. Dispatch an event only after its listener signature and result semantics are understood.
+4. Dispatch an event only after its listener signature and result semantics are understood.
    A callback that runs but returns defaults is not compatibility; document it as partial.
-4. Add a focused test with the real mod jar and, when possible, a live-client check through
+5. Add a focused test with the real mod jar and, when possible, a live-client check through
    `horizon-ctl`.
-5. Record measured costs here when changing `ENTRYPOINT_BUDGET`.
+6. Record measured costs here when changing `ENTRYPOINT_BUDGET`.
 
 ## Repository note
 

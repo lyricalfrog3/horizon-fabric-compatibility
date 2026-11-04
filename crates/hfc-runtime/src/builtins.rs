@@ -926,10 +926,6 @@ pub fn dispatch_builtin(
         }
     }
 
-    if let Some(result) = crate::shims::modmenu_http_util(heap, class_name, method_name) {
-        return result;
-    }
-
     if class_name.starts_with("java/net/http/HttpResponse") {
         if method_name == "statusCode" {
             if let Some(id) = args.get(0).and_then(|v| v.as_obj()) {

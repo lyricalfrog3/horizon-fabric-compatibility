@@ -570,3 +570,38 @@ fn a_jars_declared_identity_is_readable_without_loading_it() {
     assert!(!summary.name.is_empty() && !summary.version.is_empty());
     assert!(FabricBridge::jar_summary(jar.with_extension("missing")).is_none());
 }
+
+#[test]
+fn a_mods_own_http_helper_runs_against_the_offline_boundary() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+    // The mod's real `HttpUtil.request` bytecode builds the request and calls the
+    // JDK's `HttpClient.send`; the host has no network, so that one general
+    // boundary answers 404. Nothing here is specific to the mod's class.
+    let builder = bridge
+        .interp
+        .execute_method(
+            "java/net/http/HttpRequest",
+            "newBuilder",
+            "()Ljava/net/http/HttpRequest$Builder;",
+            &[],
+        )
+        .expect("the JDK request builder runs");
+    let response = bridge
+        .interp
+        .execute_method(
+            "com/terraformersmc/modmenu/util/HttpUtil",
+            "request",
+            "(Ljava/net/http/HttpRequest$Builder;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/net/http/HttpResponse;",
+            &[builder, Value::NULL],
+        )
+        .expect("the mod's request helper runs");
+    let status = match response.as_obj().and_then(|id| bridge.interp.heap.get(id)) {
+        Some(JavaObject::Instance { fields, .. }) => fields.get("statusCode").map(Value::as_int),
+        _ => None,
+    };
+    assert_eq!(status, Some(404));
+}

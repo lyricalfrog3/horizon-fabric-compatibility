@@ -8,8 +8,6 @@
 //! place so it is easy to find and delete, and the call sites in `builtins.rs`
 //! and `interp.rs` keep their original order. Do not add another one.
 //!
-//! * Mod Menu's `HttpUtil` answers every request with a 404, because the host
-//!   has no network boundary yet. A general HTTP boundary replaces it.
 //! * Right Click Harvest's config (read through JamLib's `ConfigManager`), its
 //!   `Config$HungerLevel` / `Config$ExperienceType` values, its platform event
 //!   hooks and its `CropBlockAccessor` mixin interface. Running the mod's real
@@ -19,28 +17,6 @@ use crate::builtins::BuiltinResult;
 use crate::heap::Heap;
 use crate::value::{JavaObject, Value};
 use std::collections::HashMap;
-
-/// Mod Menu `HttpUtil.request`: no network, so a 404 with an empty JSON body.
-pub(crate) fn modmenu_http_util(
-    heap: &mut Heap,
-    class_name: &str,
-    method_name: &str,
-) -> Option<BuiltinResult> {
-    if class_name == "com/terraformersmc/modmenu/util/HttpUtil" {
-        if method_name == "request" {
-            let body_id = heap.alloc_string("{}");
-            let mut fields = HashMap::new();
-            fields.insert("statusCode".to_string(), Value::Int(404));
-            fields.insert("body".to_string(), Value::Object(Some(body_id)));
-            let rid = heap.alloc(JavaObject::Instance {
-                class_name: "java/net/http/HttpResponse".to_string(),
-                fields,
-            });
-            return Some(BuiltinResult::Handled(Value::Object(Some(rid))));
-        }
-    }
-    None
-}
 
 /// JamLib `ConfigManager` as Right Click Harvest uses it: a config object with
 /// the mod's defaults, never read from or written to disk.

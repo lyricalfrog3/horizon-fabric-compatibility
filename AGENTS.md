@@ -26,8 +26,8 @@ the runtime. Read [docs/testing.md](docs/testing.md) before adding tests.
   Library adapters for APIs shared by many mods (for example JamLib events, Iceberg tooltip
   events) are allowed; adapters for one mod's own classes are not. Existing per-mod shims
   (`Config$HungerLevel`, `Config$ExperienceType`, `RightClickHarvestPlatform`,
-  `CropBlockAccessor`, Mod Menu's `HttpUtil`) are debt: generalize them when touching that
-  path, and do not add another one.
+  `CropBlockAccessor`, all in `crates/hfc-runtime/src/shims.rs`) are debt: generalize them
+  when touching that path, and do not add another one.
 - **Do not weaken checks to make a test pass.** No skipped assertions, swallowed interpreter
   errors, silent fallbacks or fabricated Minecraft classes in tests that claim real-classpath
   coverage.

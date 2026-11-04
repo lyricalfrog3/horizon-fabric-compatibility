@@ -266,6 +266,34 @@ lives:
 Known gaps: no durability, hunger, drops, particles or sound (`Block.getId`, `levelEvent` are
 unresolved no-ops), no real threads, and a mod's network handshake (`NetworkRouter`) never runs.
 
+## Reflection and config files
+
+Mods that write a config file usually do it by reflecting over a config class
+(JamLib/Jankson for json5, Iceberg/Night Config for TOML). The loader's class
+metadata drives this in `reflect.rs`, ahead of the builtins:
+
+- `Class.getFields/getDeclaredFields/getField/getDeclaredField`, `Class.getMethods/
+  getDeclaredMethods/getMethod/getDeclaredMethod`, `getEnumConstants`, and real
+  `isAssignableFrom`/`isInstance` over the loaded hierarchy.
+- `Field` (`get`, `set`, `getType`, `getModifiers`, `getAnnotation`, ...) and `Method`
+  (`invoke`, `getParameterTypes`, annotations, ...). Field order is class-file order.
+  Annotation instances answer their element methods from the class-file values.
+- A `boolean` read through reflection is a `java/lang/Boolean` instance, since the
+  value model has no boxed boolean (an `Int` would serialize as a number). Plain
+  `Int/Long/Float/Double` values are instances of their wrapper for `instanceof`
+  and `getClass`.
+- `ServiceLoader` reads `META-INF/services/<service>` from every loaded jar and
+  constructs the providers; there is no per-service table.
+- `String.replaceAll/replaceFirst/split` use the `regex` crate with Java's `\R`
+  translated; `System.lineSeparator` is `"\n"`.
+
+Verified: `tests/config_files.rs` loads JamLib and Right Click Harvest and compares
+the written `config/rightclickharvest.json5`, comments included, with the file the real
+game writes. Known limits: `getMethod` of a missing method returns null instead of
+throwing `NoSuchMethodException`; `List.subList` is a copy, not a view; a config
+file that already exists is read back through the same reflection path
+(`Field.set` with the parsed value), which is not covered by a test yet.
+
 ## Tests
 
 Runtime tests use third-party jars from `test-mods/` and, for classpath tests, a local

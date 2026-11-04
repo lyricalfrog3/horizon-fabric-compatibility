@@ -258,6 +258,8 @@ pub struct MethodInfo {
     pub name: String,
     pub descriptor: String,
     pub is_static: bool,
+    /// The class-file access flags (`ACC_PUBLIC` is 0x1).
+    pub access: u16,
     pub code: Option<Arc<CodeInfo>>,
     /// Annotations on the method, including Mixin's `@Inject`.
     pub annotations: Vec<AnnotationInfo>,
@@ -439,6 +441,11 @@ pub struct FieldInfo {
     pub name: String,
     pub descriptor: String,
     pub is_static: bool,
+    /// The class-file access flags (`ACC_PUBLIC` is 0x1).
+    pub access: u16,
+    /// Position in the class file, which is declaration order.
+    pub index: usize,
+    pub annotations: Vec<AnnotationInfo>,
 }
 
 /// Information about an invokedynamic bootstrap method.
@@ -678,7 +685,7 @@ impl Class {
 
         let mut fields = HashMap::new();
         let mut static_fields = HashMap::new();
-        for f in &parsed.fields {
+        for (index, f) in parsed.fields.iter().enumerate() {
             let is_static = f.access_flags.contains(cafebabe::FieldAccessFlags::STATIC);
             fields.insert(
                 f.name.to_string(),
@@ -686,6 +693,9 @@ impl Class {
                     name: f.name.to_string(),
                     descriptor: f.descriptor.to_string(),
                     is_static,
+                    access: f.access_flags.bits(),
+                    index,
+                    annotations: annotation_attributes(&f.attributes),
                 },
             );
             if is_static {
@@ -776,6 +786,7 @@ impl Class {
                     name: m.name.to_string(),
                     descriptor: m.descriptor.to_string(),
                     is_static,
+                    access: m.access_flags.bits(),
                     code,
                     annotations: annotation_attributes(&m.attributes),
                     parameter_annotations: parameter_annotation_attributes(&m.attributes),

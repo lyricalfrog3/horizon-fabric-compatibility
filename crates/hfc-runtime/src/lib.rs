@@ -11,6 +11,7 @@ pub mod loader;
 pub mod minecraft;
 pub mod mixin;
 pub mod num_builtins;
+pub mod reflect;
 pub mod registry;
 pub mod text_io;
 pub mod value;

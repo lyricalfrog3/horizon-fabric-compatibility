@@ -216,6 +216,28 @@ impl Interpreter {
 
     /// Check if a value is an instance of the target type.
     pub fn is_instance_of(&mut self, obj_val: &Value, target_type: &str) -> bool {
+        // A boxed number is a plain value; it is an instance of its wrapper.
+        if !matches!(obj_val, Value::Object(_)) {
+            return match obj_val {
+                Value::Int(_) => matches!(
+                    target_type,
+                    "java/lang/Integer" | "java/lang/Number" | "java/lang/Comparable"
+                ),
+                Value::Long(_) => matches!(
+                    target_type,
+                    "java/lang/Long" | "java/lang/Number" | "java/lang/Comparable"
+                ),
+                Value::Float(_) => matches!(
+                    target_type,
+                    "java/lang/Float" | "java/lang/Number" | "java/lang/Comparable"
+                ),
+                Value::Double(_) => matches!(
+                    target_type,
+                    "java/lang/Double" | "java/lang/Number" | "java/lang/Comparable"
+                ),
+                _ => false,
+            } || target_type == "java/lang/Object";
+        }
         let Some(id) = obj_val.as_obj() else {
             return false;
         };
@@ -415,7 +437,7 @@ impl Interpreter {
     /// A fresh, uninitialized instance of `cls`, as `new` produces before the
     /// constructor runs.
     #[inline(never)]
-    fn alloc_uninitialized(&mut self, cls: &str) -> usize {
+    pub(crate) fn alloc_uninitialized(&mut self, cls: &str) -> usize {
         match cls {
             "java/util/ArrayList" | "java/util/LinkedList" => {
                 self.heap.alloc(JavaObject::List(Vec::new()))
@@ -602,10 +624,24 @@ impl Interpreter {
                         for a in &args[1..] {
                             all_args.push(a.clone());
                         }
+                        // A constructor reference (`Foo::new`) makes the object
+                        // the constructor then initializes.
+                        if t_method == "<init>" {
+                            self.ensure_initialized(&t_class)?;
+                            let id = self.alloc_uninitialized(&t_class);
+                            let this = Value::Object(Some(id));
+                            all_args.insert(0, this.clone());
+                            self.execute_method(&t_class, "<init>", &t_desc, &all_args)?;
+                            return Ok(this);
+                        }
                         return self.execute_method(&t_class, &t_method, &t_desc, &all_args);
                     }
                 }
             }
+        }
+
+        if let Some(value) = self.reflect_call(class_name, method_name, args) {
+            return Ok(value);
         }
 
         // `Event.invoker()` of an event made by `EventFactory.createArrayBacked`
@@ -811,6 +847,35 @@ impl Interpreter {
                         return Ok(Value::Object(Some(
                             self.heap.alloc(JavaObject::Stream(mapped)),
                         )));
+                    }
+                    "reduce" if args.len() == 2 || args.len() == 3 => {
+                        // `reduce(op)` is an Optional; `reduce(identity, op)` the value.
+                        let (op, mut acc, rest) = if args.len() == 2 {
+                            let mut it = items.into_iter();
+                            (args[1].clone(), it.next(), it.collect::<Vec<_>>())
+                        } else {
+                            (args[2].clone(), Some(args[1].clone()), items)
+                        };
+                        for item in rest {
+                            let current = acc.take().unwrap_or(Value::NULL);
+                            acc = Some(self.execute_method(
+                                "java/util/function/BinaryOperator",
+                                "apply",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[op.clone(), current, item],
+                            )?);
+                        }
+                        if args.len() == 3 {
+                            return Ok(acc.unwrap_or(Value::NULL));
+                        }
+                        let mut fields = HashMap::new();
+                        if let Some(value) = acc {
+                            fields.insert("value".to_string(), value);
+                        }
+                        return Ok(Value::Object(Some(self.heap.alloc(JavaObject::Instance {
+                            class_name: "java/util/Optional".into(),
+                            fields,
+                        }))));
                     }
                     "sorted" => {
                         let comparator = args.get(1).cloned().unwrap_or(Value::NULL);

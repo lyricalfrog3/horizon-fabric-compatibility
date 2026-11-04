@@ -254,6 +254,36 @@ impl ClassLoader {
         Ok(())
     }
 
+    /// The text of every `path` entry in the registered jars and their nested
+    /// jars, in registration order (a `META-INF/services/...` file, for one).
+    pub fn text_resources(&mut self, path: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut read = |archive_entry: Result<Vec<u8>>| {
+            if let Ok(bytes) = archive_entry {
+                out.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        };
+        let limit = self.limits.max_metadata_bytes;
+        let entry_bytes = |file: &mut dyn Read| -> Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            file.take(limit)
+                .read_to_end(&mut bytes)
+                .map_err(|e| Error::new("loader", e.to_string()))?;
+            Ok(bytes)
+        };
+        for jar in &mut self.jars {
+            if let Ok(mut file) = jar.archive.by_name(path) {
+                read(entry_bytes(&mut file));
+            }
+        }
+        for nested in &mut self.nested_archives {
+            if let Ok(mut file) = nested.archive.by_name(path) {
+                read(entry_bytes(&mut file));
+            }
+        }
+        out
+    }
+
     /// Whether a class exists in a registered JAR, nested JAR, or JDK image.
     /// Unlike `contains_class`, this never parses it.
     pub fn has_class(&self, name: &str) -> bool {

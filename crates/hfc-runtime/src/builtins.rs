@@ -61,6 +61,11 @@ pub(crate) fn text_of_value(heap: &Heap, val: &Value) -> String {
                     .map(|inner| text_of_value(heap, inner))
                     .unwrap_or_default();
             }
+            if class_name == "java/lang/Boolean" {
+                if let Some(inner) = fields.get("value") {
+                    return if inner.as_bool() { "true" } else { "false" }.to_string();
+                }
+            }
             for key in ["text", "value", "string", "contents"] {
                 if let Some(inner) = fields.get(key) {
                     if !inner.is_null() {
@@ -986,10 +991,12 @@ pub fn dispatch_builtin(
     // own bytecode instead, otherwise e.g. AbstractSelectionList$TrackedList.size()
     // would be answered with the native list size (0) and the list would render empty.
     if virtual_dispatch
-        && args
-            .first()
-            .and_then(|v| v.as_obj())
-            .is_some_and(|id| matches!(heap.get(id), Some(JavaObject::Instance { .. })))
+        && args.first().and_then(|v| v.as_obj()).is_some_and(|id| {
+            // The runtime's own map entries are Instances of the interface
+            // itself and have no bytecode to run.
+            matches!(heap.get(id), Some(JavaObject::Instance { class_name, .. })
+                    if class_name != "java/util/Map$Entry")
+        })
         && matches!(
             class_name,
             "java/util/List"
@@ -1117,6 +1124,18 @@ pub fn dispatch_builtin(
         if method_name == "<init>" {
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "getClass" && !args.is_empty() {
+            // A boxed number is a plain value in the heap-less representation.
+            let boxed = match &args[0] {
+                Value::Int(_) => Some("java/lang/Integer"),
+                Value::Long(_) => Some("java/lang/Long"),
+                Value::Float(_) => Some("java/lang/Float"),
+                Value::Double(_) => Some("java/lang/Double"),
+                _ => None,
+            };
+            if let Some(boxed) = boxed {
+                let cid = heap.alloc_class(boxed);
+                return BuiltinResult::Handled(Value::Object(Some(cid)));
+            }
             if let Some(id) = args[0].as_obj() {
                 let cls_name = heap
                     .get(id)
@@ -1600,6 +1619,9 @@ pub fn dispatch_builtin(
     if class_name == "java/lang/System" {
         if method_name == "registerNatives" {
             return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "lineSeparator" {
+            let id = heap.alloc_string("\n");
+            return BuiltinResult::Handled(Value::Object(Some(id)));
         } else if method_name == "arraycopy" && args.len() >= 5 {
             let src = args[0].as_obj();
             let dest = args[2].as_obj();
@@ -1813,6 +1835,35 @@ pub fn dispatch_builtin(
     }
 
     if class_name == "java/lang/Boolean" {
+        // A `Boolean` made by reflection holds its value in a field.
+        if let Some(JavaObject::Instance { fields, .. }) = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| heap.get(id))
+        {
+            if let Some(inner) = fields.get("value").map(|v| v.as_bool()) {
+                match method_name {
+                    "booleanValue" => return BuiltinResult::Handled(Value::from_bool(inner)),
+                    "toString" if args.len() == 1 => {
+                        let sid = heap.alloc_string(if inner { "true" } else { "false" });
+                        return BuiltinResult::Handled(Value::Object(Some(sid)));
+                    }
+                    "hashCode" => {
+                        return BuiltinResult::Handled(Value::Int(if inner { 1231 } else { 1237 }));
+                    }
+                    "equals" if args.len() == 2 => {
+                        let other = match args[1].as_obj().and_then(|id| heap.get(id)) {
+                            Some(JavaObject::Instance { fields, .. }) => {
+                                fields.get("value").map(|v| v.as_bool())
+                            }
+                            _ => None,
+                        };
+                        return BuiltinResult::Handled(Value::from_bool(other == Some(inner)));
+                    }
+                    _ => {}
+                }
+            }
+        }
         if method_name == "toString" && descriptor.starts_with("(Z)") && !args.is_empty() {
             let sid = heap.alloc_string(if args[0].as_int() != 0 {
                 "true"
@@ -2524,6 +2575,15 @@ pub fn dispatch_builtin(
                     });
                     return BuiltinResult::Handled(Value::Object(Some(iter_id)));
                 }
+            }
+        } else if method_name == "subList" && args.len() == 3 {
+            // A copy: writes through the sublist do not reach the parent.
+            if let Some(JavaObject::List(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
+                let from = (args[1].as_int().max(0) as usize).min(items.len());
+                let to = (args[2].as_int().max(0) as usize).clamp(from, items.len());
+                let part = items[from..to].to_vec();
+                let lid = heap.alloc_list(part);
+                return BuiltinResult::Handled(Value::Object(Some(lid)));
             }
         } else if method_name == "toArray" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -5321,68 +5381,6 @@ pub fn dispatch_builtin(
             fields: HashMap::new(),
         });
         return BuiltinResult::Handled(Value::Object(Some(sid)));
-    }
-
-    // ServiceLoader
-    if class_name == "java/util/ServiceLoader" {
-        if method_name == "load" {
-            let service_class = args.first().and_then(|v| v.as_obj()).and_then(|id| {
-                if let Some(JavaObject::Class(name)) = heap.get(id) {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            });
-            let mut fields = HashMap::new();
-            if let Some(sc) = service_class {
-                let sc_id = heap.alloc_string(sc);
-                fields.insert("serviceClass".into(), Value::Object(Some(sc_id)));
-            }
-            let sl_id = heap.alloc(JavaObject::Instance {
-                class_name: "java/util/ServiceLoader".into(),
-                fields,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(sl_id)));
-        } else if method_name == "findFirst" {
-            let service_class = args
-                .first()
-                .and_then(|v| v.as_obj())
-                .and_then(|id| {
-                    if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
-                        fields
-                            .get("serviceClass")
-                            .and_then(|v| v.as_obj())
-                            .and_then(|sid| heap.get_string(sid))
-                            .map(str::to_string)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-            let impl_class = match service_class.as_str() {
-                "com/anthonyhilyard/iceberg/services/IReloadListenerRegistrar" => {
-                    "com/anthonyhilyard/iceberg/fabric/services/FabricReloadListenerRegistrar"
-                }
-                "com/anthonyhilyard/iceberg/services/IPlatformHelper" => {
-                    "com/anthonyhilyard/iceberg/fabric/services/FabricPlatformHelper"
-                }
-                "com/anthonyhilyard/iceberg/services/IFontLookup" => {
-                    "com/anthonyhilyard/iceberg/fabric/services/FabricFontLookup"
-                }
-                _ => "java/lang/Object",
-            };
-            let inst_id = heap.alloc(JavaObject::Instance {
-                class_name: impl_class.into(),
-                fields: HashMap::new(),
-            });
-            let mut opt_fields = HashMap::new();
-            opt_fields.insert("value".into(), Value::Object(Some(inst_id)));
-            let opt_id = heap.alloc(JavaObject::Instance {
-                class_name: "java/util/Optional".into(),
-                fields: opt_fields,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(opt_id)));
-        }
     }
 
     // Fabric ResourceManagerHelper

@@ -192,6 +192,35 @@ pub fn text_method(
                 string_of(heap, &args[1]).is_some_and(|b| a.to_lowercase() == b.to_lowercase());
             return handled(Value::from_bool(equal));
         }
+        ("java/lang/String", "split") if args.len() >= 2 => {
+            let text = string_of(heap, &args[0])?;
+            let pattern = java_pattern(&string_of(heap, &args[1])?);
+            let limit = args.get(2).map(|v| v.as_int()).unwrap_or(0);
+            let parts = java_split(&text, &pattern, limit);
+            let elements = parts
+                .into_iter()
+                .map(|part| alloc_str(heap, part))
+                .collect();
+            let id = heap.alloc(JavaObject::Array {
+                elem_type: "java/lang/String".into(),
+                elements,
+            });
+            return handled(Value::Object(Some(id)));
+        }
+        ("java/lang/String", "replaceAll" | "replaceFirst") if args.len() >= 3 => {
+            let text = string_of(heap, &args[0])?;
+            let pattern = java_pattern(&string_of(heap, &args[1])?);
+            let replacement = java_replacement(&string_of(heap, &args[2])?);
+            // An invalid pattern would throw PatternSyntaxException; the text stays as it is.
+            let out = match regex::Regex::new(&pattern) {
+                Ok(re) if method_name == "replaceAll" => {
+                    re.replace_all(&text, replacement.as_str()).into_owned()
+                }
+                Ok(re) => re.replace(&text, replacement.as_str()).into_owned(),
+                Err(_) => text,
+            };
+            return handled(alloc_str(heap, out));
+        }
         ("java/lang/String", "toCharArray") => {
             let text = string_of(heap, args.first()?)?;
             let id = heap.alloc(JavaObject::Array {
@@ -402,4 +431,73 @@ pub fn text_method(
         }
     }
     None
+}
+
+/// A Java `Matcher.replaceAll` replacement as a `regex` crate one: `$1` and
+/// `${name}` keep working, `\x` is a literal `x`, and a literal `$` is `$$`.
+fn java_replacement(java: &str) -> String {
+    let mut out = String::with_capacity(java.len());
+    let mut chars = java.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('$') => out.push_str("$$"),
+                Some(other) => out.push(other),
+                None => {}
+            },
+            '$' if matches!(chars.peek(), Some(n) if n.is_ascii_digit()) => {
+                // `$12` in Java is group 1 then "2" when 12 groups do not exist; the
+                // crate reads the longest name, so brace the number.
+                let mut digits = String::new();
+                while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                    digits.push(*d);
+                    chars.next();
+                }
+                out.push_str(&format!("${{{digits}}}"));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A Java regex as a `regex` crate one. `\R` (any line break) is Java-only.
+fn java_pattern(java: &str) -> String {
+    java.replace(
+        "\\R",
+        "(?:\\r\\n|[\\n\\x0B\\x0C\\r\\x{85}\\x{2028}\\x{2029}])",
+    )
+}
+
+/// `String.split(regex, limit)`: a leading empty piece from a zero-width match
+/// is dropped, and at limit 0 trailing empty pieces are too.
+fn java_split(text: &str, pattern: &str, limit: i32) -> Vec<String> {
+    let Ok(re) = regex::Regex::new(pattern) else {
+        return vec![text.to_string()];
+    };
+    let mut parts = Vec::new();
+    let mut last = 0;
+    for m in re.find_iter(text) {
+        if limit > 0 && parts.len() as i32 == limit - 1 {
+            break;
+        }
+        if m.end() == 0 {
+            continue;
+        }
+        if m.start() == m.end() && m.start() >= text.len() {
+            continue;
+        }
+        parts.push(text[last..m.start()].to_string());
+        last = m.end();
+    }
+    if parts.is_empty() {
+        return vec![text.to_string()];
+    }
+    parts.push(text[last..].to_string());
+    if limit == 0 {
+        while parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+            parts.pop();
+        }
+    }
+    parts
 }

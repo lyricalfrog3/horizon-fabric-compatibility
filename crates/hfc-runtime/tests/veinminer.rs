@@ -3,7 +3,8 @@
 //! The mod's own bytecode reads its JSON config, resolves block tags from the
 //! game's registry data, searches for connected ore with a Kotlin coroutine
 //! sequence and breaks each block through `ServerPlayerGameMode.destroyBlock`.
-//! The test host is a hash map of blocks. It needs the jars in
+//! The enchantment companion mod is not installed, so the mod does not ask for
+//! an enchanted tool. The test host is a hash map of blocks. It needs the jars in
 //! `~/horizon-fabric-test/game/horizon-mods` and a Horizon install with
 //! `registries.json`; without them the test skips.
 
@@ -113,7 +114,7 @@ fn breaking_a_coal_vein_breaks_the_connected_ore() {
     let Some(mut bridge) = started_bridge() else {
         return;
     };
-    let mut world = ore_row("minecraft:diamond_pickaxe", true);
+    let mut world = ore_row("minecraft:diamond_pickaxe", false);
     let flow = bridge.block_break_before(&mut world, [0, 10, 0], true, 8);
     assert_eq!(flow, Flow::Continue);
     let mut broken = world.broken.clone();
@@ -127,22 +128,11 @@ fn breaking_a_coal_vein_breaks_the_connected_ore() {
 }
 
 #[test]
-fn a_tool_without_the_enchantment_breaks_only_its_block() {
-    let Some(mut bridge) = started_bridge() else {
-        return;
-    };
-    let mut world = ore_row("minecraft:diamond_pickaxe", false);
-    let flow = bridge.block_break_before(&mut world, [0, 10, 0], true, 8);
-    assert_eq!(flow, Flow::Continue);
-    assert!(world.broken.is_empty(), "broke {:?}", world.broken);
-}
-
-#[test]
 fn a_hand_does_not_vein_mine_ore() {
     let Some(mut bridge) = started_bridge() else {
         return;
     };
-    let mut world = ore_row("minecraft:air", true);
+    let mut world = ore_row("minecraft:air", false);
     bridge.block_break_before(&mut world, [0, 10, 0], true, 8);
     assert!(world.broken.is_empty(), "broke {:?}", world.broken);
 }

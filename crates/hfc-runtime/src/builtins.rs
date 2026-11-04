@@ -3531,9 +3531,12 @@ pub fn dispatch_builtin(
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("")
                 .to_string();
-            let cid = fabric_mod_container(heap, &mod_id);
+            // A mod that is not installed has no container: an empty Optional.
             let mut opt_fields = HashMap::new();
-            opt_fields.insert("value".into(), Value::Object(Some(cid)));
+            if heap.is_mod_loaded(&mod_id) {
+                let cid = fabric_mod_container(heap, &mod_id);
+                opt_fields.insert("value".into(), Value::Object(Some(cid)));
+            }
             let opt_id = heap.alloc(JavaObject::Instance {
                 class_name: "java/util/Optional".into(),
                 fields: opt_fields,

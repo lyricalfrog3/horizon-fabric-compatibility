@@ -150,12 +150,21 @@ Jankson and `Path.getParent` are unresolved and return defaults, so every mod ru
 defaults. Unresolved calls returning defaults is also why a test can pass without a feature
 working; check `Interpreter::missing` (set `trace_missing`) before claiming a path runs.
 
-Known gaps found by running Veinminer (Kotlin) against the real classpath: the interpreter has
-no Java exceptions (`athrow` ends the method, an out-of-range array read yields null), so a null
-that would throw in a JVM instead loops or flows on; it has no real threads or atomic field
-updaters, so Kotlin coroutine dispatchers do not run; and a static call whose first argument is a
-lambda runs that lambda (see the comment in `execute_method_inner`). Veinminer's `onInitialize`
-therefore still exhausts its budget.
+Exceptions are frame-local. The Code attribute's exception table is read, and `athrow`,
+array index/null errors and integer division by zero run a handler of the *same method* that
+covers them (`catch_locally`). An exception nothing in that method catches does not unwind into
+the caller: the method ends, or the opcode takes its old lenient result. Full unwinding was tried
+and reverted: the real JDK, Netty, joml and Minecraft code a mod pulls in throws dozens of
+exceptions the runtime otherwise answers with defaults (`Pattern.compile`,
+`Class.getDeclaredMethod`, `StackWalker`, Jankson in JamLib's config save, ...), and unwinding
+them aborted static initializers, including Right Click Harvest's config. Those need real host
+boundaries first; each is a place where the runtime is still wrong, not only silent.
+
+Other known gaps found by running Veinminer (Kotlin): a null that would throw in a JVM still
+loops (Kotlin's null-parameter message walks an empty stack trace), there are no real threads or
+atomic field updaters so Kotlin coroutine dispatchers do not run, and a static call whose first
+argument is a lambda runs that lambda (see the comment in `execute_method_inner`). Veinminer's
+`onInitialize` therefore still exhausts its budget.
 
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 

@@ -236,6 +236,20 @@ pub struct CodeInfo {
     pub max_stack: u16,
     pub max_locals: u16,
     pub opcodes: Vec<(usize, Opcode)>,
+    /// The Code attribute's exception table, in declaration order (the first
+    /// matching entry wins).
+    pub handlers: Vec<ExceptionHandler>,
+}
+
+/// One `exception_table` entry. Offsets are bytecode byte offsets; the range
+/// is `[start, end)`.
+#[derive(Debug, Clone)]
+pub struct ExceptionHandler {
+    pub start: usize,
+    pub end: usize,
+    pub handler: usize,
+    /// The caught class, or `None` for a catch-all (`finally`).
+    pub catch_type: Option<String>,
 }
 
 /// Information about a class method.
@@ -743,6 +757,16 @@ impl Class {
                         max_stack: raw_code.max_stack,
                         max_locals: raw_code.max_locals,
                         opcodes,
+                        handlers: raw_code
+                            .exception_table
+                            .iter()
+                            .map(|entry| ExceptionHandler {
+                                start: entry.start_pc as usize,
+                                end: entry.end_pc as usize,
+                                handler: entry.handler_pc as usize,
+                                catch_type: entry.catch_type.as_ref().map(|t| t.to_string()),
+                            })
+                            .collect(),
                     }));
                 }
             }

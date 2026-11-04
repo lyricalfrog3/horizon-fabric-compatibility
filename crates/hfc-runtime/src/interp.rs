@@ -156,7 +156,13 @@ impl Interpreter {
                     .methods
                     .contains_key(&("<clinit>".into(), "()V".into()))
                 {
-                    let _ = self.execute_special_method(class_name, "<clinit>", "()V", &[]);
+                    // A throwing initializer leaves the class half-initialized (a JVM
+                    // would raise ExceptionInInitializerError on the next use); say so.
+                    if let Err(error) =
+                        self.execute_special_method(class_name, "<clinit>", "()V", &[])
+                    {
+                        log::warn!("static initializer of {class_name} failed: {error}");
+                    }
                 }
             }
         }
@@ -991,7 +997,107 @@ impl Interpreter {
         }
 
         let mut stack: Vec<Value> = Vec::with_capacity(code.max_stack as usize);
-        let mut pc = 0;
+        let mut pc = 0usize;
+        self.run_code(
+            this_class,
+            method_name,
+            descriptor,
+            bootstrap_methods,
+            code,
+            &mut locals,
+            &mut stack,
+            &mut pc,
+        )
+    }
+
+    /// The handler (byte offset) of the first exception-table entry covering
+    /// `thrown_at` that catches `exception`.
+    fn find_handler(
+        &mut self,
+        code: &CodeInfo,
+        thrown_at: usize,
+        exception: &Value,
+    ) -> Option<usize> {
+        for entry in &code.handlers {
+            if thrown_at < entry.start || thrown_at >= entry.end {
+                continue;
+            }
+            match &entry.catch_type {
+                None => return Some(entry.handler),
+                Some(class) => {
+                    let _ = self.loader.get_or_load(class);
+                    if self.is_instance_of(exception, class) {
+                        return Some(entry.handler);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// An exception raised at `byte_offset`: when this method has a handler
+    /// for it, the pc to continue at, with the stack holding the exception.
+    ///
+    /// Handlers are frame-local. An exception nothing in the same method
+    /// catches does not unwind into the caller: the real JDK, Netty and
+    /// Minecraft code a mod pulls in throws many exceptions the runtime
+    /// answers elsewhere with defaults, and unwinding them all would abort
+    /// those classes' initializers. Callers then take the old lenient path.
+    fn catch_locally(
+        &mut self,
+        code: &CodeInfo,
+        byte_offset: usize,
+        exception: Value,
+        stack: &mut Vec<Value>,
+    ) -> Option<usize> {
+        let handler = self.find_handler(code, byte_offset, &exception)?;
+        stack.clear();
+        stack.push(exception);
+        Some(find_target_pc(&code.opcodes, handler, 0))
+    }
+
+    /// Allocate an exception of `class`, but only when a handler of this method
+    /// covers `byte_offset`; see [`Self::catch_locally`].
+    fn raise_if_caught(
+        &mut self,
+        code: &CodeInfo,
+        byte_offset: usize,
+        class: &str,
+        message: &str,
+        stack: &mut Vec<Value>,
+    ) -> Option<usize> {
+        if !code
+            .handlers
+            .iter()
+            .any(|entry| byte_offset >= entry.start && byte_offset < entry.end)
+        {
+            return None;
+        }
+        let mut fields = HashMap::new();
+        let text = self.heap.alloc_string(message);
+        fields.insert("message".to_string(), Value::Object(Some(text)));
+        let id = self.heap.alloc(JavaObject::Instance {
+            class_name: class.to_string(),
+            fields,
+        });
+        self.catch_locally(code, byte_offset, Value::Object(Some(id)), stack)
+    }
+
+    /// Run `code` from `*pc_slot` until it returns or throws. `*pc_slot` always
+    /// holds the index of the opcode being executed, so a caller can find the
+    /// handler for an exception that escapes.
+    fn run_code(
+        &mut self,
+        this_class: &str,
+        method_name: &str,
+        descriptor: &str,
+        bootstrap_methods: &[BootstrapMethodInfo],
+        code: &CodeInfo,
+        locals: &mut Vec<Value>,
+        stack: &mut Vec<Value>,
+        pc_slot: &mut usize,
+    ) -> Result<Value> {
+        let mut pc = *pc_slot;
         let opcodes = &code.opcodes;
         while pc < opcodes.len() {
             if let Some(budget) = &mut self.step_budget {
@@ -1016,6 +1122,7 @@ impl Interpreter {
                 }
                 *budget -= 1;
             }
+            *pc_slot = pc;
             let (byte_offset, ref op) = opcodes[pc];
             pc += 1;
 
@@ -1141,12 +1248,40 @@ impl Interpreter {
                 Opcode::Idiv => {
                     let b = stack.pop().unwrap_or(Value::Int(1)).as_int();
                     let a = stack.pop().unwrap_or(Value::Int(0)).as_int();
-                    stack.push(Value::Int(if b == 0 { 0 } else { a / b }));
+                    if b == 0 {
+                        if let Some(target) = self.raise_if_caught(
+                            code,
+                            byte_offset,
+                            "java/lang/ArithmeticException",
+                            "/ by zero",
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        stack.push(Value::Int(0));
+                    } else {
+                        stack.push(Value::Int(a.wrapping_div(b)));
+                    }
                 }
                 Opcode::Irem => {
                     let b = stack.pop().unwrap_or(Value::Int(1)).as_int();
                     let a = stack.pop().unwrap_or(Value::Int(0)).as_int();
-                    stack.push(Value::Int(if b == 0 { 0 } else { a % b }));
+                    if b == 0 {
+                        if let Some(target) = self.raise_if_caught(
+                            code,
+                            byte_offset,
+                            "java/lang/ArithmeticException",
+                            "/ by zero",
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        stack.push(Value::Int(0));
+                    } else {
+                        stack.push(Value::Int(a.wrapping_rem(b)));
+                    }
                 }
                 Opcode::Ineg => {
                     let a = stack.pop().unwrap_or(Value::Int(0)).as_int();
@@ -1258,12 +1393,40 @@ impl Interpreter {
                 Opcode::Ldiv => {
                     let b = stack.pop().unwrap_or(Value::Long(1)).as_long();
                     let a = stack.pop().unwrap_or(Value::Long(0)).as_long();
-                    stack.push(Value::Long(if b == 0 { 0 } else { a.wrapping_div(b) }));
+                    if b == 0 {
+                        if let Some(target) = self.raise_if_caught(
+                            code,
+                            byte_offset,
+                            "java/lang/ArithmeticException",
+                            "/ by zero",
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        stack.push(Value::Long(0));
+                    } else {
+                        stack.push(Value::Long(a.wrapping_div(b)));
+                    }
                 }
                 Opcode::Lrem => {
                     let b = stack.pop().unwrap_or(Value::Long(1)).as_long();
                     let a = stack.pop().unwrap_or(Value::Long(0)).as_long();
-                    stack.push(Value::Long(if b == 0 { 0 } else { a.wrapping_rem(b) }));
+                    if b == 0 {
+                        if let Some(target) = self.raise_if_caught(
+                            code,
+                            byte_offset,
+                            "java/lang/ArithmeticException",
+                            "/ by zero",
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        stack.push(Value::Long(0));
+                    } else {
+                        stack.push(Value::Long(a.wrapping_rem(b)));
+                    }
                 }
                 Opcode::Lneg => {
                     let a = stack.pop().unwrap_or(Value::Long(0)).as_long();
@@ -1676,18 +1839,39 @@ impl Interpreter {
                 | Opcode::Laload
                 | Opcode::Faload
                 | Opcode::Daload => {
-                    let idx = stack.pop().unwrap_or(Value::Int(0)).as_int().max(0) as usize;
+                    let idx = stack.pop().unwrap_or(Value::Int(0)).as_int();
                     let arr_ref = stack.pop().unwrap_or(Value::NULL);
-                    let val = if let Some(id) = arr_ref.as_obj() {
-                        if let Some(JavaObject::Array { elements, .. }) = self.heap.get(id) {
-                            elements.get(idx).cloned().unwrap_or(Value::NULL)
-                        } else {
-                            Value::NULL
-                        }
-                    } else {
-                        Value::NULL
+                    let (found, length) = match arr_ref.as_obj().and_then(|id| self.heap.get(id)) {
+                        Some(JavaObject::Array { elements, .. }) => (
+                            usize::try_from(idx)
+                                .ok()
+                                .and_then(|i| elements.get(i))
+                                .cloned(),
+                            Some(elements.len()),
+                        ),
+                        _ => (None, None),
                     };
-                    stack.push(val);
+                    if let Some(value) = found {
+                        stack.push(value);
+                    } else {
+                        let (class, message) = match length {
+                            Some(length) => (
+                                "java/lang/ArrayIndexOutOfBoundsException",
+                                format!("Index {idx} out of bounds for length {length}"),
+                            ),
+                            None => (
+                                "java/lang/NullPointerException",
+                                "Cannot load from array because it is null".to_string(),
+                            ),
+                        };
+                        if let Some(target) =
+                            self.raise_if_caught(code, byte_offset, class, &message, stack)
+                        {
+                            pc = target;
+                            continue;
+                        }
+                        stack.push(Value::NULL);
+                    }
                 }
                 Opcode::Aastore
                 | Opcode::Bastore
@@ -1698,13 +1882,37 @@ impl Interpreter {
                 | Opcode::Fastore
                 | Opcode::Dastore => {
                     let val = stack.pop().unwrap_or(Value::NULL);
-                    let idx = stack.pop().unwrap_or(Value::Int(0)).as_int().max(0) as usize;
+                    let idx = stack.pop().unwrap_or(Value::Int(0)).as_int();
                     let arr_ref = stack.pop().unwrap_or(Value::NULL);
+                    let mut failure = Some((
+                        "java/lang/NullPointerException",
+                        "Cannot store to array because it is null".to_string(),
+                    ));
                     if let Some(id) = arr_ref.as_obj() {
                         if let Some(JavaObject::Array { elements, .. }) = self.heap.get_mut(id) {
-                            if idx < elements.len() {
-                                elements[idx] = val;
+                            match usize::try_from(idx).ok().filter(|i| *i < elements.len()) {
+                                Some(i) => {
+                                    elements[i] = val;
+                                    failure = None;
+                                }
+                                None => {
+                                    failure = Some((
+                                        "java/lang/ArrayIndexOutOfBoundsException",
+                                        format!(
+                                            "Index {idx} out of bounds for length {}",
+                                            elements.len()
+                                        ),
+                                    ));
+                                }
                             }
+                        }
+                    }
+                    if let Some((class, message)) = failure {
+                        if let Some(target) =
+                            self.raise_if_caught(code, byte_offset, class, &message, stack)
+                        {
+                            pc = target;
+                            continue;
                         }
                     }
                 }
@@ -1877,7 +2085,12 @@ impl Interpreter {
                 }
 
                 Opcode::Athrow => {
-                    // Rethrow or return NULL
+                    let exception = stack.pop().unwrap_or(Value::NULL);
+                    if let Some(target) = self.catch_locally(code, byte_offset, exception, stack) {
+                        pc = target;
+                        continue;
+                    }
+                    // Not caught in this method: end it, as before exceptions existed.
                     return Ok(Value::NULL);
                 }
             }
@@ -2195,5 +2408,84 @@ fn class_descriptor(name: &str) -> String {
         "double" => "D".into(),
         _ if name.starts_with('[') => name.to_string(),
         _ => format!("L{name};"),
+    }
+}
+
+#[cfg(test)]
+mod exception_tests {
+    use super::*;
+    use crate::class::ExceptionHandler;
+
+    fn run(opcodes: Vec<Opcode>, handlers: Vec<ExceptionHandler>) -> Value {
+        let code = CodeInfo {
+            max_stack: 4,
+            max_locals: 0,
+            opcodes: opcodes.into_iter().enumerate().collect(),
+            handlers,
+        };
+        Interpreter::new()
+            .interpret_code("T", "m", "()I", &[], &code, &[])
+            .expect("the method runs")
+    }
+
+    fn catching(class: Option<&str>) -> Vec<ExceptionHandler> {
+        vec![ExceptionHandler {
+            start: 0,
+            end: 3,
+            handler: 4,
+            catch_type: class.map(str::to_string),
+        }]
+    }
+
+    fn divide_by_zero() -> Vec<Opcode> {
+        vec![
+            Opcode::Iconst(7),
+            Opcode::Iconst(0),
+            Opcode::Idiv,
+            Opcode::Ireturn,
+            Opcode::Pop,
+            Opcode::Iconst(-5),
+            Opcode::Ireturn,
+        ]
+    }
+
+    #[test]
+    fn a_handler_of_the_method_catches_division_by_zero() {
+        let result = run(
+            divide_by_zero(),
+            catching(Some("java/lang/ArithmeticException")),
+        );
+        assert_eq!(result.as_int(), -5);
+    }
+
+    #[test]
+    fn a_handler_for_another_class_does_not_catch_it() {
+        let result = run(
+            divide_by_zero(),
+            catching(Some("java/lang/IllegalStateException")),
+        );
+        assert_eq!(result.as_int(), 0, "falls through to the lenient result");
+    }
+
+    #[test]
+    fn a_catch_all_handler_catches_athrow() {
+        let result = run(
+            vec![
+                Opcode::Iconst(1),
+                Opcode::Pop,
+                Opcode::AconstNull,
+                Opcode::Athrow,
+                Opcode::Pop,
+                Opcode::Iconst(9),
+                Opcode::Ireturn,
+            ],
+            vec![ExceptionHandler {
+                start: 0,
+                end: 4,
+                handler: 4,
+                catch_type: None,
+            }],
+        );
+        assert_eq!(result.as_int(), 9);
     }
 }

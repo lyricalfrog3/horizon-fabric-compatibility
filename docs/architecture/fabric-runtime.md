@@ -129,9 +129,12 @@ native menu, and Done/Escape returns to it. The pinned tests assert both menus p
 This is **not general Mixin support**. The vanilla layout method itself is not executed, so the
 callback runs with synthesized locals and the widget is host-placed; `@ModifyArg`,
 `@ModifyVariable`, `@Redirect`, `@WrapOperation`, MixinExtras expressions, accessors/invokers
-and all gameplay/draw-code transforms are not applied. Menu buttons whose sprite assets are not
-in the HUD atlas (Mod Menu's own icon) render as labelled placeholder tiles until a mod GUI
-sprite atlas exists.
+and all gameplay/draw-code transforms are not applied. Menu buttons whose sprites are not in the HUD atlas (Mod Menu's own icon) are resolved by
+`FabricBridge::gui_texture`: a `namespace:path` sprite is read from
+`assets/<namespace>/textures/gui/sprites/<path>.png` in the loaded mods' jars, decoded by the host
+and placed in the atlas's run-time region, the same way registered icons are. Title/pause widgets
+and Fabric screens share that upload. Nine-slice `.mcmeta` scaling is not read; such a sprite is
+stretched. An identifier no jar provides still renders as a labelled placeholder tile.
 
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 
@@ -159,6 +162,15 @@ The rendering is partial, and the runtime does not claim Mod Menu is fully worki
 - **Only the Fabric screen host exists.** There is no general widget/layout engine; the real
   Minecraft `Screen`, `AbstractSelectionList` and widget bytecode runs, and the host replays
   the recorded calls.
+
+### Turning a mod off
+
+Options > Mods lists every loaded Fabric jar as on until `horizon-mods.txt` says `mod.<id>:false`.
+At startup the host reads that file and skips any jar whose `fabric.mod.json` id is switched off
+(`FabricBridge::jar_summary` reads the id without loading the jar), so none of its entrypoints, key
+mappings or menu widgets exist. Skipped jars are still listed so they can be turned back on. The
+file is read once, so a change applies at the next launch. Dependencies are not checked: turning
+off a library such as Fabric API leaves the mods that need it to fail.
 
 ### Legendary Tooltips
 

@@ -520,3 +520,53 @@ fn the_mod_list_search_box_accepts_focus_and_filters_the_list() {
         "the Done button did not close the mod screen"
     );
 }
+
+#[test]
+fn mod_gui_sprites_resolve_from_the_mods_own_jar() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+
+    // The widget blits `modmenu:mods/enabled` through `blitSprite`; the image
+    // is the mod's own `assets/modmenu/textures/gui/sprites/mods/enabled.png`.
+    assert!(
+        !bridge
+            .prepare_menu_contributions(MenuKind::Title, 427, 240)
+            .is_empty()
+    );
+    let draws = bridge.menu_widget_draw(MenuKind::Title, 427, 240, 0, 0, 0);
+    let sprite = draws
+        .iter()
+        .find_map(|draw| match draw {
+            GuiDraw::Blit { texture, .. } if texture.starts_with("modmenu:") => {
+                Some(texture.clone())
+            }
+            _ => None,
+        })
+        .expect("the title widget blitted no mod sprite");
+    let image = bridge
+        .gui_texture(&sprite)
+        .unwrap_or_else(|| panic!("{sprite} did not resolve from the mod jar"));
+    assert!(image.png.starts_with(b"\x89PNG"));
+    assert!(image.width > 0 && image.height > 0);
+
+    // Vanilla identifiers belong to the host atlas, and unknown ones stay
+    // unresolved instead of inventing an image.
+    assert!(bridge.gui_texture("minecraft:widget/button").is_none());
+    assert!(bridge.gui_texture("modmenu:no/such_sprite").is_none());
+}
+
+#[test]
+fn a_jars_declared_identity_is_readable_without_loading_it() {
+    let jar = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-mods/modmenu-21.0.0.jar");
+    if !jar.is_file() {
+        eprintln!("skipping: missing pinned fixture {}", jar.display());
+        return;
+    }
+    let summary = FabricBridge::jar_summary(&jar).expect("the jar declares a mod");
+    assert_eq!(summary.id, "modmenu");
+    assert!(!summary.name.is_empty() && !summary.version.is_empty());
+    assert!(FabricBridge::jar_summary(jar.with_extension("missing")).is_none());
+}

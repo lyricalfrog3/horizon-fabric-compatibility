@@ -37,8 +37,8 @@ mod's id or class name is not coverage and must not be added.
 | `hfc-cache` (keying, commit, recovery, prune, stats) | 6 |
 | `hfc-bootstrap` unit (config, state, report, install, ids, carry verification) | 12 |
 | `hfc-bootstrap` end to end | 5 |
-| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, Mod Menu screen) | 13 |
-| **HFC total** | **57** |
+| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, Mod Menu screen) | 14 |
+| **HFC total** | **58** |
 | Launcher `fabric_compat` (`cargo test --lib fabric_compat`) | 3 |
 
 `cargo test --workspace` also runs the tests of the path-dependency crates under
@@ -46,8 +46,9 @@ mod's id or class name is not coverage and must not be added.
 
 The runtime suite also opens Mod Menu's own `ModsScreen` through its registered Fabric key
 mapping, replays more than 100 `GuiGraphicsExtractor` draws, checks rendered labels, and
-closes the screen with Escape. That test skips when the pinned jars or a Minecraft install
-are absent.
+closes the screen with Escape. A companion test clicks the search box, types a query, and
+verifies that the mod list filters down. Those tests skip when the pinned jars or a Minecraft
+install are absent.
 
 The end-to-end tests cover:
 

@@ -8,8 +8,8 @@ own end-to-end tests do not cover every content type.
 The matrix covers the HFC installer and its carried content. It does **not** cover the
 experimental in-client interpreter in `crates/hfc-runtime`; that runtime has its own
 [design note](architecture/fabric-runtime.md) and its own limits (no Mixins, no general
-Fabric API, and only a partial replayed GUI: Mod Menu's list opens, but icons, scissor
-clipping and some description text are missing).
+Fabric API, and only a partial replayed GUI: Mod Menu's list opens and filters, but mod icons
+are placeholder tiles, scissor clipping is not replayed, and some description text is missing).
 
 ## Player-facing result
 

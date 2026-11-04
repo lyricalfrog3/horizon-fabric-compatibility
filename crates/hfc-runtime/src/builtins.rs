@@ -54,7 +54,13 @@ fn text_of_value(heap: &Heap, val: &Value) -> String {
         if let Some(s) = heap.get_string(id) {
             return s.to_string();
         }
-        if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+        if let Some(JavaObject::Instance { class_name, fields }) = heap.get(id) {
+            if class_name == "net/minecraft/util/FormattedCharSequence" {
+                return fields
+                    .get("text")
+                    .map(|inner| text_of_value(heap, inner))
+                    .unwrap_or_default();
+            }
             for key in ["text", "value", "string", "contents"] {
                 if let Some(inner) = fields.get(key) {
                     if !inner.is_null() {
@@ -132,7 +138,7 @@ fn identifier_argument(heap: &Heap, args: &[Value], from: usize) -> String {
     String::new()
 }
 
-fn value_to_string(heap: &Heap, val: &Value) -> String {
+pub(crate) fn value_to_string(heap: &Heap, val: &Value) -> String {
     match val {
         Value::Int(i) => i.to_string(),
         Value::Long(l) => l.to_string(),
@@ -141,10 +147,39 @@ fn value_to_string(heap: &Heap, val: &Value) -> String {
         Value::Object(Some(id)) => {
             if let Some(s) = heap.get_string(*id) {
                 s.to_string()
-            } else if let Some(JavaObject::Instance { fields, .. }) = heap.get(*id) {
-                if let Some(Value::Object(Some(sid))) = fields.get("text") {
-                    if let Some(s) = heap.get_string(*sid) {
-                        return s.to_string();
+            } else if let Some(JavaObject::Instance { class_name, fields }) = heap.get(*id) {
+                if class_name == "net/minecraft/util/FormattedCharSequence" {
+                    return fields
+                        .get("text")
+                        .map(|inner| text_of_value(heap, inner))
+                        .unwrap_or_default();
+                }
+                for key in [
+                    "text",
+                    "contents",
+                    "string",
+                    "value",
+                    "friendlyString",
+                    "name",
+                ] {
+                    if let Some(inner) = fields.get(key) {
+                        if !inner.is_null() {
+                            let text = text_of_value(heap, inner);
+                            if !text.is_empty() && !text.starts_with("[Object ") {
+                                return text;
+                            }
+                        }
+                    }
+                }
+                for key in ["parts", "siblings", "list", "items"] {
+                    if let Some(parts) = fields.get(key).and_then(|v| v.as_obj()) {
+                        if let Some(JavaObject::List(parts)) = heap.get(parts) {
+                            let joined: String =
+                                parts.iter().map(|p| text_of_value(heap, p)).collect();
+                            if !joined.is_empty() {
+                                return joined;
+                            }
+                        }
                     }
                 }
                 format!("[Object {id}]")
@@ -256,6 +291,27 @@ pub fn dispatch_builtin(
         return BuiltinResult::NotHandled;
     }
 
+    // A formatted-text implementation may be reached through an interface
+    // other than `Component` (StrictText, a mod mixin, or a real
+    // FormattedText subclass). Keep the conversion in one place so wrapped
+    // labels keep their text instead of falling through to a real JDK/Minecraft
+    // method whose fields the runtime does not carry.
+    if method_name == "getVisualOrderText" && !args.is_empty() {
+        let text = if args[0].is_null() {
+            String::new()
+        } else {
+            text_of_value(heap, &args[0])
+        };
+        let sid = heap.alloc_string(text);
+        let mut fields = HashMap::new();
+        fields.insert("text".into(), Value::Object(Some(sid)));
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/util/FormattedCharSequence".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
     // -------------------------------------------------------------
     // 1. java/lang/Object
     // -------------------------------------------------------------
@@ -272,7 +328,17 @@ pub fn dispatch_builtin(
                 return BuiltinResult::Handled(Value::Object(Some(cid)));
             }
         } else if method_name == "toString" && !args.is_empty() {
-            let str_id = heap.alloc_string(format!("[Object {:?}]", args[0]));
+            // Mods call toString on formatted text, metadata and style objects.
+            // Returning the runtime's internal object id leaks `[Object 123]`
+            // into the UI, so use the text fields an object actually carries and
+            // leave genuinely opaque objects empty rather than printing an id.
+            let text = text_of_value(heap, &args[0]);
+            let text = if text.starts_with("[Object ") {
+                String::new()
+            } else {
+                text
+            };
+            let str_id = heap.alloc_string(text);
             return BuiltinResult::Handled(Value::Object(Some(str_id)));
         } else if method_name == "hashCode" {
             return BuiltinResult::Handled(Value::Int(
@@ -293,6 +359,14 @@ pub fn dispatch_builtin(
             }
             return BuiltinResult::Handled(Value::from_bool(false));
         }
+    }
+
+    // Records (`ComponentPath$Leaf`, `ComponentPath$Path` in the focus path)
+    // only chain to `Object.<init>` in their constructor; the field writes are
+    // in the record's own bytecode. Treat the JDK superclass constructor as the
+    // no-op it is instead of failing before `applyFocus` can run.
+    if class_name == "java/lang/Record" && method_name == "<init>" {
+        return BuiltinResult::Handled(Value::NULL);
     }
 
     // -------------------------------------------------------------
@@ -737,6 +811,69 @@ pub fn dispatch_builtin(
     if class_name == "java/lang/System" {
         if method_name == "registerNatives" {
             return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "arraycopy" && args.len() >= 5 {
+            let src = args[0].as_obj();
+            let dest = args[2].as_obj();
+            let src_pos = args[1].as_int().max(0) as usize;
+            let dest_pos = args[3].as_int().max(0) as usize;
+            let len = args[4].as_int().max(0) as usize;
+            let source: Vec<Value> = match src.and_then(|id| heap.get(id)) {
+                Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                Some(JavaObject::List(items)) | Some(JavaObject::Set(items)) => items.clone(),
+                _ => Vec::new(),
+            };
+            if let Some(dest_id) = dest {
+                match heap.get_mut(dest_id) {
+                    Some(JavaObject::Array { elements, .. }) => {
+                        for (offset, value) in
+                            source.iter().skip(src_pos).take(len).cloned().enumerate()
+                        {
+                            let at = dest_pos + offset;
+                            if at < elements.len() {
+                                elements[at] = value;
+                            }
+                        }
+                    }
+                    Some(JavaObject::List(items)) | Some(JavaObject::Set(items)) => {
+                        for (offset, value) in
+                            source.iter().skip(src_pos).take(len).cloned().enumerate()
+                        {
+                            let at = dest_pos + offset;
+                            if at < items.len() {
+                                items[at] = value;
+                            } else {
+                                items.push(value);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getProperty" && !args.is_empty() {
+            let key = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let value: Option<String> = match key {
+                "java.version" => Some("25".to_string()),
+                "java.vendor" => Some("Horizon Fabric Runtime".to_string()),
+                "java.vm.name" => Some("Horizon Fabric Runtime".to_string()),
+                "os.name" => Some("Linux".to_string()),
+                "os.arch" => Some(std::env::consts::ARCH.to_string()),
+                "line.separator" => Some("\n".to_string()),
+                "file.separator" => Some("/".to_string()),
+                "user.home" => std::env::var("HOME").ok(),
+                _ => None,
+            };
+            if let Some(value) = value {
+                let sid = heap.alloc_string(value);
+                return BuiltinResult::Handled(Value::Object(Some(sid)));
+            }
+            if args.len() >= 2 {
+                return BuiltinResult::Handled(args[1].clone());
+            }
+            return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "currentTimeMillis" {
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -906,6 +1043,34 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 4. java/lang/String & StringBuilder
     // -------------------------------------------------------------
+    // java/text/NumberFormat is reached from `NumberFormat.getInstance()` in mod
+    // code that formats counts for translated labels. The JDK implementation
+    // depends on locale providers the runtime does not carry, so answer the two
+    // operations those labels need.
+    if class_name == "java/text/NumberFormat" || class_name == "java/text/DecimalFormat" {
+        if method_name == "getInstance" || method_name == "getNumberInstance" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/text/NumberFormat".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "format" && args.len() >= 2 {
+            let value = &args[1];
+            let text = match value {
+                Value::Int(i) => i.to_string(),
+                Value::Long(l) => l.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Double(d) => d.to_string(),
+                Value::Object(Some(id)) => {
+                    heap.get_string(*id).map(str::to_string).unwrap_or_default()
+                }
+                Value::Object(None) => String::new(),
+            };
+            let sid = heap.alloc_string(text);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
     if class_name == "java/lang/StringBuilder" {
         if method_name == "<init>" {
             let initial = if args.len() > 1 {
@@ -925,13 +1090,23 @@ pub fn dispatch_builtin(
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "append" {
             let appended = if args.len() > 1 {
-                match &args[1] {
-                    Value::Int(i) => i.to_string(),
-                    Value::Long(l) => l.to_string(),
-                    Value::Float(f) => f.to_string(),
-                    Value::Double(d) => d.to_string(),
-                    Value::Object(Some(id)) => heap.get_string(*id).unwrap_or("[obj]").to_string(),
-                    Value::Object(None) => "null".to_string(),
+                // `append(C)` receives the UTF-16 code unit as an int. Appending
+                // its number instead turns `StringBuilder.append('.')` into the
+                // text "46", which silently corrupts keys Mod Menu builds at
+                // runtime (for example its numeric translation fallbacks).
+                if descriptor == "(C)Ljava/lang/StringBuilder;" {
+                    char::from_u32(args[1].as_int() as u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                } else {
+                    match &args[1] {
+                        Value::Int(i) => i.to_string(),
+                        Value::Long(l) => l.to_string(),
+                        Value::Float(f) => f.to_string(),
+                        Value::Double(d) => d.to_string(),
+                        Value::Object(Some(_)) => text_of_value(heap, &args[1]),
+                        Value::Object(None) => "null".to_string(),
+                    }
                 }
             } else {
                 String::new()
@@ -939,6 +1114,103 @@ pub fn dispatch_builtin(
             if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
                 if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
                     s.push_str(&appended);
+                }
+                return BuiltinResult::Handled(Value::Object(Some(this_id)));
+            }
+        } else if method_name == "replace" && args.len() >= 4 {
+            // `EditBox.insertText` rewrites the field through
+            // `StringBuilder.replace`. Falling through to the JDK class leaves
+            // the runtime string unchanged, so typing appears to do nothing.
+            if let Some(this_id) = args[0].as_obj() {
+                let text = args[3]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
+                    let mut chars: Vec<char> = s.chars().collect();
+                    let start = args[1].as_int().max(0) as usize;
+                    let end = args[2].as_int().max(0) as usize;
+                    let start = start.min(chars.len());
+                    let end = end.min(chars.len()).max(start);
+                    chars.splice(start..end, text.chars());
+                    *s = chars.into_iter().collect();
+                }
+                return BuiltinResult::Handled(Value::Object(Some(this_id)));
+            }
+        } else if method_name == "insert" && args.len() >= 3 {
+            if let Some(this_id) = args[0].as_obj() {
+                let text = if descriptor.starts_with("(ILjava/lang/String;)") {
+                    args[2]
+                        .as_obj()
+                        .and_then(|id| heap.get_string(id))
+                        .map(str::to_string)
+                } else {
+                    Some(value_to_string(heap, &args[2]))
+                };
+                if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
+                    let mut chars: Vec<char> = s.chars().collect();
+                    let at = (args[1].as_int().max(0) as usize).min(chars.len());
+                    if let Some(text) = text {
+                        chars.splice(at..at, text.chars());
+                    }
+                    *s = chars.into_iter().collect();
+                }
+                return BuiltinResult::Handled(Value::Object(Some(this_id)));
+            }
+        } else if (method_name == "delete" && args.len() >= 3)
+            || (method_name == "deleteCharAt" && args.len() >= 2)
+        {
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
+                    let mut chars: Vec<char> = s.chars().collect();
+                    let (start, end) = if method_name == "deleteCharAt" {
+                        let at = args[1].as_int().max(0) as usize;
+                        (at, at.saturating_add(1))
+                    } else {
+                        let a = args[1].as_int().max(0) as usize;
+                        let b = args[2].as_int().max(0) as usize;
+                        (a, b)
+                    };
+                    let start = start.min(chars.len());
+                    let end = end.min(chars.len()).max(start);
+                    chars.drain(start..end);
+                    *s = chars.into_iter().collect();
+                }
+                return BuiltinResult::Handled(Value::Object(Some(this_id)));
+            }
+        } else if method_name == "setLength" && args.len() >= 2 {
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
+                    let len = args[1].as_int().max(0) as usize;
+                    let mut chars: Vec<char> = s.chars().collect();
+                    chars.resize(len, '\0');
+                    *s = chars.into_iter().collect();
+                }
+                return BuiltinResult::Handled(Value::NULL);
+            }
+        } else if method_name == "charAt" && args.len() >= 2 {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::String(s)) = heap.get(id) {
+                    let ch = s
+                        .chars()
+                        .nth(args[1].as_int().max(0) as usize)
+                        .unwrap_or('\0');
+                    return BuiltinResult::Handled(Value::Int(ch as i32));
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        } else if method_name == "length" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::String(s)) = heap.get(id) {
+                    return BuiltinResult::Handled(Value::Int(s.chars().count() as i32));
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(0));
+        } else if method_name == "reverse" && !args.is_empty() {
+            if let Some(this_id) = args[0].as_obj() {
+                if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
+                    *s = s.chars().rev().collect();
                 }
                 return BuiltinResult::Handled(Value::Object(Some(this_id)));
             }
@@ -1018,6 +1290,44 @@ pub fn dispatch_builtin(
                 .unwrap_or("");
             let sid = heap.alloc_string(s.to_uppercase());
             return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if (method_name == "trim" || method_name == "strip") && !args.is_empty() {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let sid = heap.alloc_string(s);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "substring" && args.len() >= 2 {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let chars: Vec<char> = s.chars().collect();
+            let start = args[1].as_int().max(0) as usize;
+            let end = args
+                .get(2)
+                .map(|v| v.as_int().max(0) as usize)
+                .unwrap_or(chars.len())
+                .min(chars.len());
+            let out: String = chars
+                .get(start.min(chars.len())..end.max(start.min(chars.len())))
+                .unwrap_or_default()
+                .iter()
+                .collect();
+            let sid = heap.alloc_string(out);
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "charAt" && args.len() >= 2 {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let ch = s
+                .chars()
+                .nth(args[1].as_int().max(0) as usize)
+                .unwrap_or('\0');
+            return BuiltinResult::Handled(Value::Int(ch as i32));
         } else if method_name == "contains" && args.len() >= 2 {
             let s1 = args[0]
                 .as_obj()
@@ -1271,6 +1581,34 @@ pub fn dispatch_builtin(
                     return BuiltinResult::Handled(Value::from_bool(true));
                 }
             }
+        } else if method_name == "remove" && args.len() >= 2 {
+            // `List.remove(int)` removes by index; the `Object` overload removes
+            // the first equal element. Screens rebuild filtered lists with the
+            // index form, and without it the removal silently does nothing.
+            let indexed = descriptor.starts_with("(I)");
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::List(items)) = heap.get_mut(id) {
+                    if indexed {
+                        let idx = args[1].as_int().max(0) as usize;
+                        let removed = if idx < items.len() {
+                            items.remove(idx)
+                        } else {
+                            Value::NULL
+                        };
+                        return BuiltinResult::Handled(removed);
+                    }
+                    if let Some(pos) = items.iter().position(|item| item == &args[1]) {
+                        items.remove(pos);
+                        return BuiltinResult::Handled(Value::from_bool(true));
+                    }
+                    return BuiltinResult::Handled(Value::from_bool(false));
+                }
+            }
+            return BuiltinResult::Handled(if indexed {
+                Value::NULL
+            } else {
+                Value::from_bool(false)
+            });
         } else if method_name == "addAll" && args.len() >= 2 {
             let added = collection_items(heap, &args[1]);
             if let Some(id) = args[0].as_obj() {
@@ -2307,7 +2645,14 @@ pub fn dispatch_builtin(
                 fields: vf,
             });
             return BuiltinResult::Handled(Value::Object(Some(vid)));
-        } else if method_name == "getDescription" {
+        } else if method_name == "getDescription" && !args.is_empty() {
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    if let Some(description) = fields.get("description") {
+                        return BuiltinResult::Handled(description.clone());
+                    }
+                }
+            }
             let sid = heap.alloc_string("");
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         } else if method_name == "getProvides"
@@ -2856,6 +3201,35 @@ pub fn dispatch_builtin(
         }
     }
 
+    // StringSplitter: wrapped text is returned as plain strings. The real
+    // implementation builds LineComponent objects whose final fields are not
+    // populated by the runtime, which turns every wrapped label into `null`.
+    if class_name == "net/minecraft/client/StringSplitter" {
+        if method_name == "splitLines" && args.len() >= 3 {
+            let text = text_of_value(heap, &args[1]);
+            let max = args[2].as_int().max(1);
+            let mut lines = Vec::new();
+            let mut current = String::new();
+            for word in text.split_inclusive(' ') {
+                if !current.is_empty() && text_width(&(current.clone() + word)) > max {
+                    lines.push(heap.alloc_string(current.trim_end().to_string()));
+                    current.clear();
+                }
+                current.push_str(word);
+            }
+            if !current.is_empty() {
+                lines.push(heap.alloc_string(current.trim_end().to_string()));
+            }
+            let list = heap.alloc_list(
+                lines
+                    .into_iter()
+                    .map(|id| Value::Object(Some(id)))
+                    .collect(),
+            );
+            return BuiltinResult::Handled(Value::Object(Some(list)));
+        }
+    }
+
     // Font: metrics used by screens for layout. GuiGraphicsExtractor carries
     // the actual string, so measurement only needs a stable approximation.
     if class_name == "net/minecraft/client/gui/Font" {
@@ -2906,9 +3280,55 @@ pub fn dispatch_builtin(
         }
     }
 
+    // Widgets draw their labels through an `ActiveTextCollector` returned by
+    // `GuiGraphicsExtractor.textRenderer()`. The collector is the graphics
+    // object itself here, so accepting text appends to the same display list.
+    if class_name == "net/minecraft/client/gui/ActiveTextCollector" {
+        let text_value = if descriptor.starts_with("(Lnet/minecraft/client/gui/TextAlignment;") {
+            args.get(5)
+        } else {
+            args.get(1)
+        };
+        let text = text_value
+            .map(|v| text_of_value(heap, v))
+            .unwrap_or_default();
+        let (x, y) = match method_name {
+            "acceptScrollingWithDefaultCenter" if args.len() >= 6 => {
+                let (x0, x1, y0, y1) = (
+                    args[2].as_int(),
+                    args[3].as_int(),
+                    args[4].as_int(),
+                    args[5].as_int(),
+                );
+                (
+                    x0 + (x1 - x0 - text_width(&text)) / 2,
+                    y0 + (y1 - y0 - 8) / 2,
+                )
+            }
+            "acceptScrolling" if args.len() >= 6 => (args[2].as_int(), args[4].as_int()),
+            "accept" if args.len() >= 6 => (args[2].as_int(), args[3].as_int()),
+            "accept" if args.len() >= 4 => (args[1].as_int(), args[2].as_int()),
+            _ => (0, 0),
+        };
+        if let Some(graphics) = args.first().and_then(|v| v.as_obj()) {
+            if let Some(g) = heap.get_native_mut::<GuiGraphics>(graphics) {
+                g.draws.push(GuiDraw::Text {
+                    text,
+                    x,
+                    y,
+                    color: 0xFFFF_FFFFu32 as i32,
+                });
+            }
+        }
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
     // GuiGraphicsExtractor display-list recording. The host replays this list;
     // the runtime never touches the GPU.
     if class_name == "net/minecraft/client/gui/GuiGraphicsExtractor" {
+        if method_name == "textRenderer" || method_name == "textRendererForWidget" {
+            return BuiltinResult::Handled(args[0].clone());
+        }
         let mut draw = None;
         if method_name == "fill" && args.len() >= 6 {
             draw = Some(GuiDraw::Fill {
@@ -2940,7 +3360,10 @@ pub fn dispatch_builtin(
                     .unwrap_or(0xFFFF_FFFFu32 as i32),
             });
         } else if (method_name == "text" || method_name == "centeredText") && args.len() >= 6 {
-            let text = text_of_value(heap, &args[2]);
+            let mut text = text_of_value(heap, &args[2]);
+            if text.starts_with("[Object ") || text == "null" {
+                text.clear();
+            }
             let mut x = args[3].as_int();
             if method_name == "centeredText" {
                 x -= text_width(&text) / 2;
@@ -2952,8 +3375,12 @@ pub fn dispatch_builtin(
                 color: args[5].as_int(),
             });
         } else if method_name == "textWithWordWrap" && args.len() >= 7 {
+            let mut text = text_of_value(heap, &args[2]);
+            if text.starts_with("[Object ") || text == "null" {
+                text.clear();
+            }
             draw = Some(GuiDraw::Text {
-                text: text_of_value(heap, &args[2]),
+                text,
                 x: args[3].as_int(),
                 y: args[4].as_int(),
                 color: args
@@ -2964,8 +3391,22 @@ pub fn dispatch_builtin(
         } else if (method_name == "blit" || method_name == "blitSprite") && args.len() >= 5 {
             // Pipeline-taking overloads carry the pipeline before the texture.
             let texture = identifier_argument(heap, args, 1);
-            let (x, y, width, height) = if method_name == "blit" && descriptor.contains("IIFF") {
-                // blit(pipeline, texture, x, y, u, v, w, h, texW, texH, color)
+            // `blitSprite(pipeline, texture, x, y, width, height, ...)` keeps
+            // the texture before x. `blit` has a direct
+            // `(Identifier, x, y, width, height, ...)` overload and pipeline
+            // overloads shaped `(pipeline, texture, x, y, u, v, width, height, ...)`.
+            let pipeline =
+                descriptor.starts_with("(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;");
+            // `args[0]` is the receiver, so every Java parameter is one higher
+            // than its descriptor slot.
+            let (x, y, width, height) = if method_name == "blitSprite" {
+                (
+                    args.get(3).map(Value::as_int).unwrap_or(0),
+                    args.get(4).map(Value::as_int).unwrap_or(0),
+                    args.get(5).map(Value::as_int).unwrap_or(16).max(1),
+                    args.get(6).map(Value::as_int).unwrap_or(16).max(1),
+                )
+            } else if pipeline {
                 (
                     args.get(3).map(Value::as_int).unwrap_or(0),
                     args.get(4).map(Value::as_int).unwrap_or(0),
@@ -2973,11 +3414,16 @@ pub fn dispatch_builtin(
                     args.get(8).map(Value::as_int).unwrap_or(16).max(1),
                 )
             } else {
+                // The direct overload takes a bounding box: `x0, y0, x1, y1`.
+                let x0 = args.get(2).map(Value::as_int).unwrap_or(0);
+                let y0 = args.get(3).map(Value::as_int).unwrap_or(0);
+                let x1 = args.get(4).map(Value::as_int).unwrap_or(x0 + 16);
+                let y1 = args.get(5).map(Value::as_int).unwrap_or(y0 + 16);
                 (
-                    args.get(3).map(Value::as_int).unwrap_or(0),
-                    args.get(4).map(Value::as_int).unwrap_or(0),
-                    args.get(5).map(Value::as_int).unwrap_or(16).max(1),
-                    args.get(6).map(Value::as_int).unwrap_or(16).max(1),
+                    x0.min(x1),
+                    y0.min(y1),
+                    (x1 - x0).abs().max(1),
+                    (y1 - y0).abs().max(1),
                 )
             };
             draw = Some(GuiDraw::Blit {
@@ -3881,6 +4327,7 @@ pub fn dispatch_builtin(
         } else if method_name == "getVisualOrder" {
             let text = args
                 .get(1)
+                .filter(|v| !v.is_null())
                 .map(|v| text_of_value(heap, v))
                 .unwrap_or_default();
             let sid = heap.alloc_string(text);

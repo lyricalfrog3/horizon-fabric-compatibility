@@ -261,6 +261,9 @@ pub struct BootstrapMethodInfo {
     pub target_class: String,
     pub target_method: String,
     pub target_desc: String,
+    /// String constants in the bootstrap arguments. `StringConcatFactory` puts
+    /// its recipe here; other bootstrap methods can ignore them.
+    pub string_arguments: Vec<String>,
 }
 
 /// A parsed JVM class.
@@ -510,18 +513,39 @@ impl Class {
                     let mut target_class = String::new();
                     let mut target_method = String::new();
                     let mut target_desc = String::new();
+                    let mut string_arguments = Vec::new();
+                    // `StringConcatFactory` is the bootstrap method itself; the
+                    // method handle inside the arguments is the concat target.
+                    if entry.method.class_name == "java/lang/invoke/StringConcatFactory" {
+                        target_class = entry.method.class_name.to_string();
+                        target_method = entry.method.member_ref.name.to_string();
+                        target_desc = entry.method.member_ref.descriptor.to_string();
+                    }
                     for arg in &entry.arguments {
-                        if let BootstrapArgument::MethodHandle(mh) = arg {
-                            target_class = mh.class_name.to_string();
-                            target_method = mh.member_ref.name.to_string();
-                            target_desc = mh.member_ref.descriptor.to_string();
-                            break;
+                        match arg {
+                            BootstrapArgument::MethodHandle(mh) => {
+                                if target_class.is_empty() {
+                                    target_class = mh.class_name.to_string();
+                                    target_method = mh.member_ref.name.to_string();
+                                    target_desc = mh.member_ref.descriptor.to_string();
+                                }
+                            }
+                            BootstrapArgument::LiteralConstant(LiteralConstant::String(s)) => {
+                                string_arguments.push(s.to_string());
+                            }
+                            BootstrapArgument::LiteralConstant(LiteralConstant::StringBytes(
+                                bytes,
+                            )) => {
+                                string_arguments.push(String::from_utf8_lossy(bytes).into_owned());
+                            }
+                            _ => {}
                         }
                     }
                     bootstrap_methods.push(BootstrapMethodInfo {
                         target_class,
                         target_method,
                         target_desc,
+                        string_arguments,
                     });
                 }
             }

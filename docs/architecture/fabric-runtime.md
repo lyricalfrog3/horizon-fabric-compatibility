@@ -105,18 +105,28 @@ listener. Pressing that mapping through the host opens `ModsScreen`; the host in
 and replays its `GuiGraphicsExtractor` display list. The list itself is real: it builds an
 `AbstractSelectionList`, filters all loaded mods and renders their names. A pinned test
 (`tests/modmenu_screen.rs`) opens the screen from the key mapping, asserts more than 100
-draws, checks that `Minecraft` and other labels are present, and closes it with Escape.
+draws, checks that `Minecraft` and other labels are present, and closes it with Escape. A
+second test clicks the search field, types a character and checks that the list filters down
+and redraws.
 
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 
+- **There is no search placeholder because the mod never sets one.** Mod Menu 21.0.0 passes
+  `ModMenuScreenTexts.SEARCH` ("Search for mods") as the `EditBox` constructor's last
+  `Component`, and 26.3's constructor stores that as the widget's narration message. The mod
+  never calls `setHint`, and `EditBox.extractWidgetRenderState` only draws a separate `hint`
+  field. Vanilla 26.3 shows no placeholder here either, so the runtime does not invent one.
+  The field is still operable: clicking it focuses it and typing filters the list.
 - **Icons are placeholders.** Texture loading is a host boundary. `NativeImage.read`,
   `DynamicTexture`, `TextureManager.register` and `Minecraft.getTextureManager` avoid the GPU,
-  so icon creation can complete; the host has no mod icon to draw.
+  so icon creation can complete and the runtime records the `modmenu:*_icon` blits. The host
+  has no mod texture bytes, so it currently paints a labelled placeholder tile instead of the
+  real icon.
 - **Scissor state is recorded but not replayed.** A scrolled list can draw rows past its
   bounds until the host adds clipping.
 - **Description text is incomplete.** The description panel can render `null` and an empty
-  component while fields it reads are still missing; names, titles, buttons and the list are
-  the parts demonstrated by the test.
+  component while fields it reads are still missing; names, titles, buttons, the list and
+  search are the parts demonstrated by the tests.
 - **Input uses 26.3's SDL scancodes.** `KeyEvent.key` is a scancode (`Escape` is 41), not a
   GLFW key number; the host maps winit keys to that convention before dispatching.
 - **Only the Fabric screen host exists.** There is no general widget/layout engine; the real

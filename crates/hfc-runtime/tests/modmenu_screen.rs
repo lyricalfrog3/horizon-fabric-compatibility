@@ -8,7 +8,7 @@
 
 use hfc_runtime::bridge::FabricBridge;
 use hfc_runtime::minecraft::GuiDraw;
-use hfc_runtime::value::JavaObject;
+use hfc_runtime::value::{JavaObject, Value};
 use std::path::{Path, PathBuf};
 
 fn collect_jars(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -127,6 +127,30 @@ fn screen_class(bridge: &FabricBridge, screen: &hfc_runtime::value::Value) -> St
         .unwrap_or_default()
 }
 
+fn text_draws(draws: &[GuiDraw]) -> Vec<&str> {
+    draws
+        .iter()
+        .filter_map(|draw| match draw {
+            GuiDraw::Text { text, .. } if !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn search_box_rect(bridge: &FabricBridge, screen: &Value) -> Option<(i32, i32, i32, i32)> {
+    let fields = match screen.as_obj().and_then(|id| bridge.interp.heap.get(id)) {
+        Some(JavaObject::Instance { fields, .. }) => fields,
+        _ => return None,
+    };
+    let box_id = fields.get("searchBox").and_then(Value::as_obj)?;
+    let fields = match bridge.interp.heap.get(box_id) {
+        Some(JavaObject::Instance { fields, .. }) => fields,
+        _ => return None,
+    };
+    let get = |name: &str| fields.get(name).map(Value::as_int).unwrap_or(0);
+    Some((get("x"), get("y"), get("width"), get("height")))
+}
+
 #[test]
 fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
     let Some(fixture) = Fixture::discover() else {
@@ -134,6 +158,10 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
     };
     let mut bridge = fixture.bridge();
     bridge.init().unwrap();
+    assert!(
+        bridge.translations().contains_key("modmenu.showingMods.n"),
+        "the mod's own language file was not loaded"
+    );
 
     assert!(
         bridge.press_key_mapping("key.modmenu.open_menu"),
@@ -157,20 +185,55 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
         draws.len()
     );
 
-    let texts: Vec<&str> = draws
-        .iter()
-        .filter_map(|draw| match draw {
-            GuiDraw::Text { text, .. } if !text.is_empty() => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
+    let texts = text_draws(&draws);
     assert!(
         texts.contains(&"Minecraft"),
         "the mod list did not render the Minecraft entry: {texts:?}"
     );
     assert!(
-        texts.iter().filter(|text| **text != "null").count() >= 10,
+        texts.len() >= 10,
         "the list rendered too few labels: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.contains("Website")),
+        "the Website button rendered no label: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.starts_with("Showing ")),
+        "the mod count line did not render: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text.starts_with("modmenu.")),
+        "raw translation keys were rendered: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| *text == "null" || text.contains("[Object")),
+        "objects were rendered instead of their text: {texts:?}"
+    );
+
+    // Mod Menu's search field has no `setHint` call: it passes its search label
+    // to the `EditBox` constructor, which stores it as the narration message.
+    // Vanilla 26.3 therefore renders no placeholder here either, and the test
+    // must not invent one to look more complete than the runtime is.
+
+    let blits: Vec<&str> = draws
+        .iter()
+        .filter_map(|draw| match draw {
+            GuiDraw::Blit { texture, .. } => Some(texture.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        blits
+            .iter()
+            .any(|texture| texture.contains("inworld_menu_background")),
+        "the screen background was not recorded: {blits:?}"
+    );
+    assert!(
+        blits.iter().any(|texture| texture.starts_with("modmenu:")),
+        "no mod icon cell recorded a texture: {blits:?}"
     );
 
     // 26.3's `KeyEvent.key` is an SDL scancode: Escape is 41 (`InputWithModifiers::isEscape`).
@@ -178,5 +241,75 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
     assert!(
         bridge.current_screen().is_none(),
         "Escape did not close the mod screen"
+    );
+}
+
+#[test]
+fn the_mod_list_search_box_accepts_focus_and_filters_the_list() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+    assert!(
+        bridge.press_key_mapping("key.modmenu.open_menu"),
+        "the mod's registered key mapping was not found"
+    );
+    let screen = bridge
+        .current_screen()
+        .expect("pressing the key mapping did not install a screen");
+
+    let before = bridge
+        .render_screen(1280, 720, 0.0)
+        .expect("screen render failed")
+        .expect("no screen to render");
+    let before_texts = text_draws(&before);
+    let before_showing = before_texts
+        .iter()
+        .find(|text| text.starts_with("Showing "))
+        .expect("the unfiltered mod count was not rendered")
+        .to_string();
+    assert!(
+        !before_texts.iter().any(|text| *text == "Search for mods"),
+        "a search hint appeared even though Mod Menu never calls setHint: {before_texts:?}"
+    );
+
+    let (x, y, width, height) =
+        search_box_rect(&bridge, &screen).expect("the screen has no search field");
+    let cx = f64::from(x) + f64::from(width) / 2.0;
+    let cy = f64::from(y) + f64::from(height) / 2.0;
+
+    assert!(
+        bridge.mouse_button(cx, cy, 0, true),
+        "clicking the search field was not handled"
+    );
+    assert!(
+        bridge.char_event('z' as i32),
+        "typing into the focused search field was not handled"
+    );
+
+    let after = bridge
+        .render_screen(1280, 720, 0.0)
+        .expect("screen render failed")
+        .expect("no screen to render");
+    let after_texts = text_draws(&after);
+    let after_showing = after_texts
+        .iter()
+        .find(|text| text.starts_with("Showing "))
+        .expect("the filtered mod count was not rendered")
+        .to_string();
+    assert_ne!(
+        before_showing, after_showing,
+        "typing into the search field did not filter the list"
+    );
+    assert!(
+        after_showing.contains('/'),
+        "the filtered count should include the total: {after_showing:?}"
+    );
+    assert!(
+        after_texts.len() < before_texts.len(),
+        "the filtered list should draw fewer entries: {} -> {}",
+        before_texts.len(),
+        after_texts.len()
     );
 }

@@ -600,6 +600,12 @@ impl Interpreter {
 
         // 2. Find method in class, actual instance class, or superclasses/interfaces
         let mut queue = std::collections::VecDeque::new();
+        // When the call site names an interface or superclass, the receiver's
+        // own class hierarchy must win over that declaration's default method.
+        // Queue the declared class only as a fallback once the receiver chain is
+        // exhausted; otherwise `GuiEventListener.isMouseOver` (always false)
+        // shadows `AbstractWidget.isMouseOver` for every widget.
+        let mut declared_fallback = None;
         if virtual_dispatch && method_name != "<init>" {
             if let Some(first) = args.first() {
                 if let Some(id) = first.as_obj() {
@@ -609,16 +615,23 @@ impl Interpreter {
                     {
                         if actual != class_name {
                             queue.push_back(actual.clone());
+                            declared_fallback = Some(class_name.to_string());
                         }
                     }
                 }
             }
         }
-        queue.push_back(class_name.to_string());
+        if declared_fallback.is_none() {
+            queue.push_back(class_name.to_string());
+        }
 
         let mut visited = std::collections::HashSet::new();
         let (this_class, bsm, code) = 'lookup: loop {
             let Some(curr) = queue.pop_front() else {
+                if let Some(fallback) = declared_fallback.take() {
+                    queue.push_back(fallback);
+                    continue;
+                }
                 if self.loader.get(class_name).is_none() {
                     self.note_missing(format!("class {class_name}"));
                 } else {
@@ -675,10 +688,21 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value> {
         let mut locals = vec![Value::NULL; code.max_locals as usize];
-        for (i, arg) in args.iter().enumerate() {
-            if i < locals.len() {
-                locals[i] = arg.clone();
+        // JVM locals are typed slots: `long` and `double` arguments occupy two
+        // consecutive slots. Advancing one slot per Rust value would store the
+        // second parameter over the high half of the first and leave every
+        // following argument in the wrong slot, so hit-tests and other
+        // double-taking methods compare against zero.
+        let mut slot = 0usize;
+        for arg in args.iter() {
+            if slot < locals.len() {
+                locals[slot] = arg.clone();
             }
+            slot += if matches!(arg, Value::Long(_) | Value::Double(_)) {
+                2
+            } else {
+                1
+            };
         }
 
         let mut stack: Vec<Value> = Vec::with_capacity(code.max_stack as usize);
@@ -1526,6 +1550,50 @@ impl Interpreter {
                     } else {
                         (this_class.to_string(), name.clone(), descriptor.clone())
                     };
+
+                    // String concatenation is compiled to invokedynamic on every
+                    // modern Java class. Treat the bootstrap recipe as real
+                    // string construction instead of returning a lambda object:
+                    // mod UIs build labels, version prefixes and keys this way.
+                    if target_class == "java/lang/invoke/StringConcatFactory"
+                        && (target_method == "makeConcatWithConstants"
+                            || target_method == "makeConcat")
+                    {
+                        let strings = bsm
+                            .map(|b| b.string_arguments.as_slice())
+                            .unwrap_or_default();
+                        let mut out = String::new();
+                        if target_method == "makeConcatWithConstants" {
+                            if let Some(recipe) = strings.first() {
+                                let mut dynamic = 0usize;
+                                let mut constant = 0usize;
+                                for ch in recipe.chars() {
+                                    if ch == '\u{1}' {
+                                        if let Some(value) = captured.get(dynamic) {
+                                            out.push_str(&crate::builtins::value_to_string(
+                                                &self.heap, value,
+                                            ));
+                                        }
+                                        dynamic += 1;
+                                    } else if ch == '\u{2}' {
+                                        if let Some(value) = strings.get(constant + 1) {
+                                            out.push_str(value);
+                                        }
+                                        constant += 1;
+                                    } else {
+                                        out.push(ch);
+                                    }
+                                }
+                            }
+                        } else {
+                            for value in &captured {
+                                out.push_str(&crate::builtins::value_to_string(&self.heap, value));
+                            }
+                        }
+                        let sid = self.heap.alloc_string(out);
+                        stack.push(Value::Object(Some(sid)));
+                        continue;
+                    }
 
                     let return_type = extract_return_type(descriptor);
                     let lambda_id = self.heap.alloc(JavaObject::Lambda {

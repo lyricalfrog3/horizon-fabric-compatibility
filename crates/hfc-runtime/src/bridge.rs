@@ -158,6 +158,14 @@ impl FabricBridge {
         &self.translations
     }
 
+    /// Merge the host's active language into the runtime dictionary. Mod
+    /// resources provide their own keys; vanilla GUI keys such as `gui.done`
+    /// come from the client's loaded language file.
+    pub fn extend_translations(&mut self, entries: HashMap<String, String>) {
+        self.interp.heap.add_translations(entries.clone());
+        self.translations.extend(entries);
+    }
+
     /// Add a mod JAR file.
     pub fn add_jar(&mut self, path: impl AsRef<Path>) -> Result<()> {
         self.interp.loader.add_jar(path)

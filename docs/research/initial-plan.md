@@ -1,3 +1,5 @@
+> **Historical.** This is the prompt that started the project. It describes the original vision, not the current state; see the [README](../../README.md) and [the runtime design note](../architecture/fabric-runtime.md) for what exists.
+
 # MASTER PROMPT — Horizon Fabric Compatibility Layer
 
 You are the lead Rust systems engineer, software architect, reverse-engineering researcher, and implementation engineer for a project called **Horizon Fabric Compatibility (HFC)**.

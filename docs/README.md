@@ -30,6 +30,7 @@ Start with the [README](../README.md) for the player-facing flow and the
 | [fabric-architecture.md](research/fabric-architecture.md) | Fabric Loader metadata, lifecycle, Mixins, Fabric API |
 | [java-runtime-research.md](research/java-runtime-research.md) | JVM embedding, AOT/WASM, bytecode analysis options |
 | [existing-projects.md](research/existing-projects.md) | prior Fabric-on-other-engine efforts and lessons |
+| [initial-plan.md](research/initial-plan.md) | the original project prompt (historical) |
 
 ## Delivery
 

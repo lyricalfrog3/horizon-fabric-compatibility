@@ -15,8 +15,10 @@ jars.
 > **Separate experimental track.** `crates/hfc-runtime` is an in-client bytecode interpreter
 > for selected Fabric entrypoints, wired into Horizon under `workspace/horizon`. It is not
 > part of the HFC installer and is not covered by the compatibility claims above. It runs
-> Right Click Harvest and dispatches tooltip callbacks; it does not provide Java screens,
-> Mixins, client UI or general gameplay compatibility. See
+> Right Click Harvest, dispatches tooltip callbacks, and replays Mod Menu's own screen from
+> a recorded draw list (mod icons, search, scrolling, the title and pause menu buttons its
+> mixins add). It is not general Mixin support, a general widget engine, gameplay or
+> networking compatibility, and the interpreter is not a sandbox. See
 > [the runtime design note](docs/architecture/fabric-runtime.md).
 
 ## The user experience

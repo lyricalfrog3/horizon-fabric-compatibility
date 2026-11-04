@@ -926,18 +926,8 @@ pub fn dispatch_builtin(
         }
     }
 
-    if class_name == "com/terraformersmc/modmenu/util/HttpUtil" {
-        if method_name == "request" {
-            let body_id = heap.alloc_string("{}");
-            let mut fields = HashMap::new();
-            fields.insert("statusCode".to_string(), Value::Int(404));
-            fields.insert("body".to_string(), Value::Object(Some(body_id)));
-            let rid = heap.alloc(JavaObject::Instance {
-                class_name: "java/net/http/HttpResponse".to_string(),
-                fields,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(rid)));
-        }
+    if let Some(result) = crate::shims::modmenu_http_util(heap, class_name, method_name) {
+        return result;
     }
 
     if class_name.starts_with("java/net/http/HttpResponse") {
@@ -3138,57 +3128,10 @@ pub fn dispatch_builtin(
         }
     }
 
-    if class_name == "io/github/jamalam360/jamlib/api/config/ConfigManager" {
-        if method_name == "<init>" {
-            let mut cfg_fields = HashMap::new();
-            cfg_fields.insert("requireHoe".into(), Value::from_bool(false));
-            cfg_fields.insert("harvestInRadius".into(), Value::from_bool(true));
-            let hunger_none = heap.alloc(JavaObject::Instance {
-                class_name: "io/github/jamalam360/rightclickharvest/Config$HungerLevel".into(),
-                fields: {
-                    let mut f = HashMap::new();
-                    f.insert("modifier".into(), Value::Float(0.0));
-                    f
-                },
-            });
-            cfg_fields.insert("hungerLevel".into(), Value::Object(Some(hunger_none)));
-            let exp_none = heap.alloc(JavaObject::Instance {
-                class_name: "io/github/jamalam360/rightclickharvest/Config$ExperienceType".into(),
-                fields: {
-                    let mut f = HashMap::new();
-                    f.insert("ordinal".into(), Value::Int(2));
-                    f
-                },
-            });
-            cfg_fields.insert("experienceType".into(), Value::Object(Some(exp_none)));
-            cfg_fields.insert(
-                "hasUserBeenWarnedForNotUsingHoe".into(),
-                Value::from_bool(false),
-            );
-            cfg_fields.insert("showServerWarning".into(), Value::from_bool(false));
-
-            let cfg_id = heap.alloc(JavaObject::Instance {
-                class_name: "io/github/jamalam360/rightclickharvest/Config".into(),
-                fields: cfg_fields,
-            });
-
-            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
-                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this_id) {
-                    fields.insert("config".into(), Value::Object(Some(cfg_id)));
-                }
-            }
-            return BuiltinResult::Handled(Value::NULL);
-        } else if method_name == "get" {
-            if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
-                if let Some(JavaObject::Instance { fields, .. }) = heap.get(this_id) {
-                    if let Some(cfg) = fields.get("config") {
-                        return BuiltinResult::Handled(cfg.clone());
-                    }
-                }
-            }
-        } else if method_name == "save" {
-            return BuiltinResult::Handled(Value::NULL);
-        }
+    if let Some(result) =
+        crate::shims::right_click_harvest_config(heap, class_name, method_name, args)
+    {
+        return result;
     }
 
     if class_name == "io/github/jamalam360/jamlib/api/events/core/CancellableEvent"
@@ -4043,7 +3986,7 @@ pub fn dispatch_builtin(
     // Block & CropBlock
     if class_name == "net/minecraft/world/level/block/CropBlock"
         || class_name == "net/minecraft/world/level/block/Block"
-        || class_name == "io/github/jamalam360/rightclickharvest/mixin/CropBlockAccessor"
+        || crate::shims::is_crop_block_accessor(class_name)
     {
         if method_name == "isMaxAge" && args.len() >= 2 {
             if let Some(id) = args[1].as_obj() {
@@ -4296,13 +4239,8 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::Object(Some(sid)));
     }
 
-    // RightClickHarvestPlatform event hooks
-    if class_name == "io/github/jamalam360/rightclickharvest/RightClickHarvestPlatform" {
-        if method_name == "postBreakEvent" || method_name == "postPlaceEvent" {
-            return BuiltinResult::Handled(Value::from_bool(false));
-        } else if method_name == "postAfterHarvestEvent" {
-            return BuiltinResult::Handled(Value::NULL);
-        }
+    if let Some(result) = crate::shims::right_click_harvest_platform(class_name, method_name) {
+        return result;
     }
 
     // ServiceLoader

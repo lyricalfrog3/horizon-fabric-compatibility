@@ -72,7 +72,7 @@ fabricated classes.
 
 - Prefer executing the mod's real bytecode. Add a builtin only at a host boundary (I/O,
   registry data, rendering) or for a class the runtime deliberately replaces.
-- `ENTRYPOINT_BUDGET` in `crates/hfc-runtime/src/bridge.rs` is 10M. It exists to stop a
+- `ENTRYPOINT_BUDGET` in `crates/hfc-runtime/src/bridge/mod.rs` is 10M. It exists to stop a
   mis-decoded branch, not to police legitimate initialization. If you change it, record the
   measured entrypoint costs in `docs/architecture/fabric-runtime.md`.
 - Classes whose static fields are synthesized must be in both

@@ -1929,24 +1929,10 @@ impl Interpreter {
             return Value::Object(Some(id));
         }
 
-        if class_name == "io/github/jamalam360/rightclickharvest/Config$HungerLevel" {
-            let mut f = HashMap::new();
-            f.insert("modifier".into(), Value::Float(0.0));
-            let id = self.heap.alloc(JavaObject::Instance {
-                class_name: class_name.into(),
-                fields: f,
-            });
-            return Value::Object(Some(id));
-        }
-
-        if class_name == "io/github/jamalam360/rightclickharvest/Config$ExperienceType" {
-            let mut f = HashMap::new();
-            f.insert("ordinal".into(), Value::Int(2)); // NONE
-            let id = self.heap.alloc(JavaObject::Instance {
-                class_name: class_name.into(),
-                fields: f,
-            });
-            return Value::Object(Some(id));
+        if let Some(value) =
+            crate::shims::right_click_harvest_config_enum(&mut self.heap, class_name)
+        {
+            return value;
         }
 
         if field_name == "EVENT" || field_name.ends_with("_EVENT") || class_name.contains("Event") {

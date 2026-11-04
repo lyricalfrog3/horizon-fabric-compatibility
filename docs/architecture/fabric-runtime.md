@@ -14,11 +14,12 @@ gameplay, screens, rendering or networking work.
 | Piece | Path | Role |
 |---|---|---|
 | Interpreter and class loader | `crates/hfc-runtime/src/interp.rs`, `loader.rs`, `class.rs`, `jimage.rs` | Parses class files, interprets bytecode, loads the JDK image and Minecraft jars on demand |
-| Fabric bridge | `crates/hfc-runtime/src/bridge.rs` | Reads `fabric.mod.json`, runs entrypoints, dispatches events, owns the instruction budget |
+| Fabric bridge | `crates/hfc-runtime/src/bridge/` | `mod.rs`: reads `fabric.mod.json`, runs entrypoints, owns the instruction budget. `screen.rs`: the open screen, ticks, key mappings and input. `menu.rs`: mixin-added menu widgets. `events.rs`: right-click and tooltip events. `textures.rs`: registered textures and jar sprites |
 | Runtime builtins | `crates/hfc-runtime/src/builtins.rs` | Java/JDK, Fabric API and Minecraft shims |
-| Client adapter | `workspace/horizon/crates/horizon-client/src/game/fabric_bridge.rs` | Loads jars, supplies the real Minecraft classpath, bridges host blocks/items |
+| Per-mod shims (debt) | `crates/hfc-runtime/src/shims.rs` | Stand-ins for one mod's own classes, gathered in one place to be deleted; do not add to it |
+| Client adapter | `workspace/horizon/crates/horizon-client/src/game/fabric_bridge/` | `mod.rs`: loads jars, supplies the real Minecraft classpath, bridges host blocks/items. `gui.rs`: display-list replay and screen input. `menu.rs`: host-placed menu widgets. `textures.rs`: atlas upload. `keys.rs`: SDL key numbering |
 | Client hooks | `.../game/native_hooks.rs`, `.../game/stations.rs` | Right-click dispatch, tooltip text and tooltip colors |
-| Fabric screens | `.../game/fabric_bridge.rs`, `Screen::Fabric` in `game.rs` | Replays the recorded GUI calls and routes mouse/key/char input |
+| Fabric screens | `.../game/fabric_bridge/gui.rs`, `Screen::Fabric` in `game.rs` | Replays the recorded GUI calls and routes mouse/key/char input |
 
 The interpreter is **not a JVM and not a sandbox**. It executes mod bytecode in the client
 process with a custom heap and builtins. Only run mods you trust.

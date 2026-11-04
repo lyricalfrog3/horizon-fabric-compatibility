@@ -9,6 +9,7 @@ pub mod jimage;
 pub mod loader;
 pub mod minecraft;
 pub mod mixin;
+pub(crate) mod shims;
 pub mod value;
 
 pub use bridge::FabricModMetadata;

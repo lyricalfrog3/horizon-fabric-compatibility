@@ -3124,12 +3124,6 @@ pub fn dispatch_builtin(
         }
     }
 
-    if let Some(result) =
-        crate::shims::right_click_harvest_config(heap, class_name, method_name, args)
-    {
-        return result;
-    }
-
     if class_name == "io/github/jamalam360/jamlib/api/events/core/CancellableEvent"
         || class_name == "io/github/jamalam360/jamlib/api/events/core/Event"
     {
@@ -3982,7 +3976,6 @@ pub fn dispatch_builtin(
     // Block & CropBlock
     if class_name == "net/minecraft/world/level/block/CropBlock"
         || class_name == "net/minecraft/world/level/block/Block"
-        || crate::shims::is_crop_block_accessor(class_name)
     {
         if method_name == "isMaxAge" && args.len() >= 2 {
             if let Some(id) = args[1].as_obj() {
@@ -3992,7 +3985,7 @@ pub fn dispatch_builtin(
             }
         } else if method_name == "getMaxAge" {
             return BuiltinResult::Handled(Value::Int(7));
-        } else if method_name == "getAgeProperty" || method_name == "invokeGetAgeProperty" {
+        } else if method_name == "getAgeProperty" {
             let pid = heap.alloc_native(IntegerProperty {
                 name: "age".into(),
                 min: 0,
@@ -4233,10 +4226,6 @@ pub fn dispatch_builtin(
             fields: HashMap::new(),
         });
         return BuiltinResult::Handled(Value::Object(Some(sid)));
-    }
-
-    if let Some(result) = crate::shims::right_click_harvest_platform(class_name, method_name) {
-        return result;
     }
 
     // ServiceLoader

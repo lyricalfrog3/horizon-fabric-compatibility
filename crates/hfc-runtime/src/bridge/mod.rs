@@ -518,6 +518,21 @@ impl FabricBridge {
 
         let prev_budget = self.interp.step_budget;
         self.mixins = self.load_mixin_manifest();
+        self.interp.mixin_accessors = self
+            .mixins
+            .accessors
+            .iter()
+            .map(|accessor| {
+                (
+                    (
+                        accessor.interface.clone(),
+                        accessor.method.clone(),
+                        accessor.descriptor.clone(),
+                    ),
+                    accessor.clone(),
+                )
+            })
+            .collect();
 
         // Run common/main entrypoints (ModInitializer) first, then client entrypoints (ClientModInitializer)
         let mut sorted_entrypoints = self.entrypoints.clone();

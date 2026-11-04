@@ -39,6 +39,9 @@ impl FabricBridge {
                     let Some(class) = self.interp.loader.get(&class_name) else {
                         continue;
                     };
+                    manifest
+                        .accessors
+                        .extend(mixin::accessors_from_class(class));
                     for injector in mixin::injectors_from_class(class) {
                         if injector.supported() {
                             manifest.injectors.push(injector);

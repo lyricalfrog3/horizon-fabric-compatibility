@@ -65,10 +65,36 @@ impl MixinInjector {
     }
 }
 
+/// What an accessor-mixin method does to its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessorKind {
+    /// `@Invoker`: calls the target class's method of this name.
+    Invoker { method: String },
+    /// `@Accessor` getter of a field.
+    Getter { field: String },
+    /// `@Accessor` setter of a field.
+    Setter { field: String },
+}
+
+/// One `@Accessor` / `@Invoker` method of a mixin interface. Mixin merges the
+/// interface into its target class, so a call on the interface is a call on the
+/// target; the interpreter performs that redirect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinAccessor {
+    /// The mixin interface and the method as callers name it.
+    pub interface: String,
+    pub method: String,
+    pub descriptor: String,
+    /// The class the interface is mixed into.
+    pub target_class: String,
+    pub kind: AccessorKind,
+}
+
 /// Every injector (applied or unsupported) found in the loaded mods.
 #[derive(Debug, Clone, Default)]
 pub struct MixinManifest {
     pub injectors: Vec<MixinInjector>,
+    pub accessors: Vec<MixinAccessor>,
     /// Human-readable notes about annotations this bridge skipped.
     pub unsupported: Vec<String>,
 }
@@ -206,6 +232,81 @@ pub fn injectors_from_class(class: &Class) -> Vec<MixinInjector> {
         }
     }
     out
+}
+
+/// The `@Accessor` / `@Invoker` methods a mixin class declares.
+pub fn accessors_from_class(class: &Class) -> Vec<MixinAccessor> {
+    let mut out = Vec::new();
+    let Some(targets) = mixin_targets(class) else {
+        return out;
+    };
+    let Some(target_class) = targets.first().cloned() else {
+        return out;
+    };
+    for (_, method) in class.methods.iter() {
+        for annotation in &method.annotations {
+            let explicit = annotation.string("value").filter(|name| !name.is_empty());
+            let kind = match annotation.type_name.as_str() {
+                "org/spongepowered/asm/mixin/gen/Invoker" => {
+                    let name = explicit
+                        .map(str::to_string)
+                        .unwrap_or_else(|| accessor_target_name(&method.name, &["invoke", "call"]));
+                    AccessorKind::Invoker { method: name }
+                }
+                "org/spongepowered/asm/mixin/gen/Accessor" => {
+                    let setter = descriptor_parameter_types(&method.descriptor).len() == 1;
+                    let name = explicit.map(str::to_string).unwrap_or_else(|| {
+                        accessor_target_name(&method.name, &["get", "set", "is"])
+                    });
+                    if setter {
+                        AccessorKind::Setter { field: name }
+                    } else {
+                        AccessorKind::Getter { field: name }
+                    }
+                }
+                _ => continue,
+            };
+            out.push(MixinAccessor {
+                interface: class.this_class.clone(),
+                method: method.name.clone(),
+                descriptor: method.descriptor.clone(),
+                target_class: target_class.clone(),
+                kind,
+            });
+        }
+    }
+    out
+}
+
+/// Mixin's rule for an unnamed accessor: drop the `get`/`set`/`invoke` prefix and
+/// lower-case the first letter.
+fn accessor_target_name(method: &str, prefixes: &[&str]) -> String {
+    for prefix in prefixes {
+        if let Some(rest) = method.strip_prefix(prefix) {
+            let mut chars = rest.chars();
+            if let Some(first) = chars.next() {
+                if first.is_uppercase() {
+                    return first.to_lowercase().chain(chars).collect();
+                }
+            }
+        }
+    }
+    method.to_string()
+}
+
+fn mixin_targets(class: &Class) -> Option<Vec<String>> {
+    let mixin = class
+        .annotations
+        .iter()
+        .find(|annotation| annotation.type_name == "org/spongepowered/asm/mixin/Mixin")?;
+    let mut targets = Vec::new();
+    if let Some(values) = mixin.element("value") {
+        collect_class_targets(values, &mut targets);
+    }
+    if let Some(values) = mixin.element("targets") {
+        collect_string_targets(values, &mut targets);
+    }
+    Some(targets)
 }
 
 fn injection_points(inject: &AnnotationInfo) -> Vec<InjectionPoint> {

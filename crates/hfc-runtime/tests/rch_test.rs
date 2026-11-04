@@ -1,12 +1,11 @@
-use hfc_runtime::interp::Interpreter;
-use hfc_runtime::loader::ClassLoader;
+use hfc_runtime::bridge::FabricBridge;
 use hfc_runtime::minecraft::{BlockPos, BlockState, Direction, EventResult, Level, Player};
 use hfc_runtime::value::Value;
 use std::path::PathBuf;
 
 #[test]
 fn test_rch_initialize() {
-    let mut loader = ClassLoader::new();
+    let mut bridge = FabricBridge::new();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -16,23 +15,59 @@ fn test_rch_initialize() {
     let jamlib_path = root.join("test-mods/jamlib-fabric-2.3.1+26.3.x.jar");
     let rch_path = root.join("test-mods/rightclickharvest-fabric-4.6.2+26.3.x.jar");
 
-    loader.add_jar(&jamlib_path).expect("load jamlib");
-    loader.add_jar(&rch_path).expect("load rch");
+    bridge.load_mod_jar(&jamlib_path).expect("load jamlib");
+    bridge.load_mod_jar(&rch_path).expect("load rch");
+    // `init` reads the mods' mixin configs (the accessor interfaces) and runs
+    // their entrypoints, exactly as the client does.
+    bridge.init().expect("mod initialization");
 
-    let mut interp = Interpreter::with_loader(loader);
-
-    let res = interp.execute_method(
-        "io/github/jamalam360/rightclickharvest/fabric/RightClickHarvestFabric",
-        "onInitialize",
-        "()V",
-        &[],
+    // The mod's `@Invoker` interface is read from its mixin config, not hardcoded.
+    let invoker = bridge
+        .interp
+        .mixin_accessors
+        .values()
+        .find(|accessor| accessor.interface.ends_with("/CropBlockAccessor"))
+        .expect("the mod's invoker mixin is registered");
+    assert_eq!(
+        invoker.target_class,
+        "net/minecraft/world/level/block/CropBlock"
     );
-    assert!(res.is_ok(), "onInitialize failed: {:?}", res.err());
+    assert_eq!(
+        invoker.kind,
+        hfc_runtime::mixin::AccessorKind::Invoker {
+            method: "getAgeProperty".into()
+        }
+    );
+
+    let interp = &mut bridge.interp;
+    let manager = interp.resolve_static_field(
+        "io/github/jamalam360/rightclickharvest/RightClickHarvest",
+        "CONFIG",
+    );
+    let config = interp
+        .execute_method(
+            "io/github/jamalam360/jamlib/api/config/ConfigManager",
+            "get",
+            "()Ljava/lang/Object;",
+            &[manager],
+        )
+        .expect("ConfigManager.get");
+    // The mod's own constructor built it (through `Constructor.newInstance`),
+    // with the defaults its field initializers declare.
+    let config_id = config.as_obj().expect("a config object, not null");
+    match interp.heap.get(config_id) {
+        Some(hfc_runtime::value::JavaObject::Instance { class_name, fields }) => {
+            assert_eq!(class_name, "io/github/jamalam360/rightclickharvest/Config");
+            assert_eq!(fields.get("harvestInRadius"), Some(&Value::Int(1)));
+            assert_eq!(fields.get("requireHoe"), Some(&Value::Int(0)));
+        }
+        other => panic!("unexpected config object: {other:?}"),
+    }
 }
 
 #[test]
 fn test_rch_harvest_crop_dynamically() {
-    let mut loader = ClassLoader::new();
+    let mut bridge = FabricBridge::new();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -42,20 +77,12 @@ fn test_rch_harvest_crop_dynamically() {
     let jamlib_path = root.join("test-mods/jamlib-fabric-2.3.1+26.3.x.jar");
     let rch_path = root.join("test-mods/rightclickharvest-fabric-4.6.2+26.3.x.jar");
 
-    loader.add_jar(&jamlib_path).expect("load jamlib");
-    loader.add_jar(&rch_path).expect("load rch");
-
-    let mut interp = Interpreter::with_loader(loader);
-
-    // Initialize the mod first
-    interp
-        .execute_method(
-            "io/github/jamalam360/rightclickharvest/fabric/RightClickHarvestFabric",
-            "onInitialize",
-            "()V",
-            &[],
-        )
-        .expect("onInitialize");
+    bridge.load_mod_jar(&jamlib_path).expect("load jamlib");
+    bridge.load_mod_jar(&rch_path).expect("load rch");
+    // `init` reads the mods' mixin configs (the accessor interfaces) and runs
+    // their entrypoints, exactly as the client does.
+    bridge.init().expect("mod initialization");
+    let interp = &mut bridge.interp;
 
     // Setup world with a mature wheat crop (age 7) at (10, 64, 10)
     let mut level = Level::new(false);

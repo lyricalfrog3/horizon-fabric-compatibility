@@ -1,0 +1,4 @@
+# The interpreter runs Java calls on the host stack (capped at 100 frames), and
+# an unoptimized build's frames are large. Test threads get a stack sized for it.
+[env]
+RUST_MIN_STACK = "268435456"

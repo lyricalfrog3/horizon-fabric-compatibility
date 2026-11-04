@@ -16,7 +16,6 @@ gameplay, screens, rendering or networking work.
 | Interpreter and class loader | `crates/hfc-runtime/src/interp.rs`, `loader.rs`, `class.rs`, `jimage.rs` | Parses class files, interprets bytecode, loads the JDK image and Minecraft jars on demand |
 | Fabric bridge | `crates/hfc-runtime/src/bridge/` | `mod.rs`: reads `fabric.mod.json`, runs entrypoints, owns the instruction budget. `screen.rs`: the open screen, ticks, key mappings and input. `menu.rs`: mixin-added menu widgets. `events.rs`: right-click and tooltip events. `textures.rs`: registered textures and jar sprites |
 | Runtime builtins | `crates/hfc-runtime/src/builtins.rs` | Java/JDK, Fabric API and Minecraft shims |
-| Per-mod shims (debt) | `crates/hfc-runtime/src/shims.rs` | Stand-ins for one mod's own classes, gathered in one place to be deleted; do not add to it |
 | Client adapter | `workspace/horizon/crates/horizon-client/src/game/fabric_bridge/` | `mod.rs`: loads jars, supplies the real Minecraft classpath, bridges host blocks/items. `gui.rs`: display-list replay and screen input. `menu.rs`: host-placed menu widgets. `textures.rs`: atlas upload. `keys.rs`: SDL key numbering |
 | Client hooks | `.../game/native_hooks.rs`, `.../game/stations.rs` | Right-click dispatch, tooltip text and tooltip colors |
 | Fabric screens | `.../game/fabric_bridge/gui.rs`, `Screen::Fabric` in `game.rs` | Replays the recorded GUI calls and routes mouse/key/char input |
@@ -129,13 +128,27 @@ native menu, and Done/Escape returns to it. The pinned tests assert both menus p
 
 This is **not general Mixin support**. The vanilla layout method itself is not executed, so the
 callback runs with synthesized locals and the widget is host-placed; `@ModifyArg`,
-`@ModifyVariable`, `@Redirect`, `@WrapOperation`, MixinExtras expressions, accessors/invokers
+`@ModifyVariable`, `@Redirect`, `@WrapOperation`, MixinExtras expressions
 and all gameplay/draw-code transforms are not applied. Menu buttons whose sprites are not in the HUD atlas (Mod Menu's own icon) are resolved by
 `FabricBridge::gui_texture`: a `namespace:path` sprite is read from
 `assets/<namespace>/textures/gui/sprites/<path>.png` in the loaded mods' jars, decoded by the host
 and placed in the atlas's run-time region, the same way registered icons are. Title/pause widgets
 and Fabric screens share that upload. Nine-slice `.mcmeta` scaling is not read; such a sprite is
 stretched. An identifier no jar provides still renders as a labelled placeholder tile.
+
+`@Accessor` and `@Invoker` interfaces are the one other mixin form applied. The runtime reads
+them from every mixin class (`mixin::accessors_from_class`, name inference as Mixin does) and
+registers them with the interpreter: a call naming the interface runs the target class's method
+(invoker) or reads/writes its field (accessor). Right Click Harvest's `CropBlockAccessor` works
+this way.
+
+Reflection that constructs objects (`Class.getConstructor`/`getDeclaredConstructor` and
+`Constructor.newInstance`) runs the class's real constructor. That is how JamLib's
+`ConfigManager` builds a mod's config class, so Right Click Harvest's `Config` and its enums come
+from the mod's own bytecode. Config files are not read or written yet: `Files.writeString`,
+Jankson and `Path.getParent` are unresolved and return defaults, so every mod runs on its config
+defaults. Unresolved calls returning defaults is also why a test can pass without a feature
+working; check `Interpreter::missing` (set `trace_missing`) before claiming a path runs.
 
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 
@@ -237,7 +250,7 @@ with fabricated classes.
    Do not check a mod id, a mod's package/class name, a config field, a jar name or a version.
    A test may load one mod to reproduce a bug; the implementation must remain universal.
    Library adapters for APIs shared by many mods are allowed, but adapters for one mod's own
-   classes are not. Existing per-mod shims are debt and must be generalized when touched.
+   classes are not. There are no per-mod shims left; do not add one.
 2. Prefer executing the mod's real bytecode. Add a builtin only for a host boundary (I/O,
    registry data, rendering) or a class the runtime intentionally replaces.
 3. If a class has synthetic static fields, add it to `has_synthetic_statics` and to

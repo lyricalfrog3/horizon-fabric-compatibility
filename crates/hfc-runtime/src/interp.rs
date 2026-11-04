@@ -54,6 +54,9 @@ pub struct Interpreter {
     pub injection_depth: usize,
     /// Widget heap ids added by the running menu injectors.
     pub menu_contributions: Vec<usize>,
+    /// `@Accessor` / `@Invoker` mixin methods by (interface, name, descriptor):
+    /// a call naming the interface is performed on the class it is mixed into.
+    pub mixin_accessors: HashMap<(String, String, String), crate::mixin::MixinAccessor>,
 }
 
 impl Default for Interpreter {
@@ -77,6 +80,7 @@ impl Interpreter {
             menu_injection: false,
             injection_depth: 0,
             menu_contributions: Vec::new(),
+            mixin_accessors: HashMap::new(),
         }
     }
 
@@ -94,6 +98,7 @@ impl Interpreter {
             menu_injection: false,
             injection_depth: 0,
             menu_contributions: Vec::new(),
+            mixin_accessors: HashMap::new(),
         }
     }
 
@@ -302,6 +307,145 @@ impl Interpreter {
         }
         self.call_depth -= 1;
         res
+    }
+
+    /// A fresh, uninitialized instance of `cls`, as `new` produces before the
+    /// constructor runs.
+    #[inline(never)]
+    fn alloc_uninitialized(&mut self, cls: &str) -> usize {
+        match cls {
+            "java/util/ArrayList" | "java/util/LinkedList" => {
+                self.heap.alloc(JavaObject::List(Vec::new()))
+            }
+            "java/util/HashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/TreeMap"
+            | "java/util/concurrent/ConcurrentHashMap" => {
+                self.heap.alloc(JavaObject::Map(Vec::new()))
+            }
+            "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/TreeSet" => {
+                self.heap.alloc(JavaObject::Set(Vec::new()))
+            }
+            _ => self.heap.alloc(JavaObject::Instance {
+                class_name: cls.to_string(),
+                fields: HashMap::new(),
+            }),
+        }
+    }
+
+    /// `Class.getConstructor` / `getDeclaredConstructor` and
+    /// `Constructor.newInstance`: reflection that has to run a constructor, so
+    /// it lives here rather than with the heap-only builtins. A `Constructor`
+    /// is an instance remembering its class and parameter types.
+    #[inline(never)]
+    fn reflect_constructor(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        args: &[Value],
+    ) -> Option<Result<Value>> {
+        match (class_name, method_name) {
+            ("java/lang/Class", "getConstructor" | "getDeclaredConstructor") => {
+                let class_obj = args.first()?.clone();
+                let params = args.get(1).cloned().unwrap_or(Value::NULL);
+                let mut fields = HashMap::new();
+                fields.insert("class".to_string(), class_obj);
+                fields.insert("parameterTypes".to_string(), params);
+                let id = self.heap.alloc(JavaObject::Instance {
+                    class_name: "java/lang/reflect/Constructor".into(),
+                    fields,
+                });
+                Some(Ok(Value::Object(Some(id))))
+            }
+            ("java/lang/reflect/Constructor", "newInstance") => {
+                let (target, params) = match self.heap.get(args.first()?.as_obj()?) {
+                    Some(JavaObject::Instance { fields, .. }) => (
+                        fields.get("class")?.clone(),
+                        fields.get("parameterTypes")?.clone(),
+                    ),
+                    _ => return None,
+                };
+                let target_name = match self.heap.get(target.as_obj()?) {
+                    Some(JavaObject::Class(name)) => name.clone(),
+                    _ => return None,
+                };
+                let mut descriptor = String::from("(");
+                if let Some(JavaObject::Array { elements, .. }) =
+                    params.as_obj().and_then(|id| self.heap.get(id))
+                {
+                    for element in elements {
+                        if let Some(JavaObject::Class(name)) =
+                            element.as_obj().and_then(|id| self.heap.get(id))
+                        {
+                            descriptor.push_str(&class_descriptor(name));
+                        }
+                    }
+                }
+                descriptor.push_str(")V");
+                let call_args: Vec<Value> = match args.get(1).and_then(|v| v.as_obj()) {
+                    Some(id) => match self.heap.get(id) {
+                        Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                        _ => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                Some((|| {
+                    self.ensure_initialized(&target_name)?;
+                    let id = self.alloc_uninitialized(&target_name);
+                    let this = Value::Object(Some(id));
+                    let mut full = vec![this.clone()];
+                    full.extend(call_args);
+                    self.execute_method(&target_name, "<init>", &descriptor, &full)?;
+                    Ok(this)
+                })())
+            }
+            _ => None,
+        }
+    }
+
+    /// A call on an `@Accessor` / `@Invoker` mixin interface is a call on the
+    /// class Mixin merges the interface into: an invoker calls the named target
+    /// method, an accessor reads or writes the named field.
+    #[inline(never)]
+    fn redirect_mixin_accessor(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<Result<Value>> {
+        use crate::mixin::AccessorKind;
+        if self.mixin_accessors.is_empty() {
+            return None;
+        }
+        let accessor = self
+            .mixin_accessors
+            .get(&(
+                class_name.to_string(),
+                method_name.to_string(),
+                descriptor.to_string(),
+            ))?
+            .clone();
+        let receiver = args.first()?.as_obj();
+        Some(match accessor.kind {
+            AccessorKind::Invoker { method } => {
+                self.execute_method(&accessor.target_class, &method, descriptor, args)
+            }
+            AccessorKind::Getter { field } => Ok(receiver
+                .and_then(|id| match self.heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get(&field).cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::NULL)),
+            AccessorKind::Setter { field } => {
+                if let (Some(id), Some(value)) = (receiver, args.get(1)) {
+                    if let Some(JavaObject::Instance { fields, .. }) = self.heap.get_mut(id) {
+                        fields.insert(field, value.clone());
+                    }
+                }
+                Ok(Value::NULL)
+            }
+        })
     }
 
     fn execute_method_inner(
@@ -682,6 +826,15 @@ impl Interpreter {
             let _ =
                 self.execute_method("java/util/concurrent/FutureTask", "run", "()V", &[task_obj]);
             return Ok(Value::Int(2));
+        }
+
+        if let Some(result) =
+            self.redirect_mixin_accessor(class_name, method_name, descriptor, args)
+        {
+            return result;
+        }
+        if let Some(result) = self.reflect_constructor(class_name, method_name, args) {
+            return result;
         }
 
         // 1. Built-in shims
@@ -1478,24 +1631,7 @@ impl Interpreter {
 
                 Opcode::New(cls) => {
                     self.ensure_initialized(cls)?;
-                    let id = match cls.as_str() {
-                        "java/util/ArrayList" | "java/util/LinkedList" => {
-                            self.heap.alloc(JavaObject::List(Vec::new()))
-                        }
-                        "java/util/HashMap"
-                        | "java/util/LinkedHashMap"
-                        | "java/util/TreeMap"
-                        | "java/util/concurrent/ConcurrentHashMap" => {
-                            self.heap.alloc(JavaObject::Map(Vec::new()))
-                        }
-                        "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/TreeSet" => {
-                            self.heap.alloc(JavaObject::Set(Vec::new()))
-                        }
-                        _ => self.heap.alloc(JavaObject::Instance {
-                            class_name: cls.clone(),
-                            fields: HashMap::new(),
-                        }),
-                    };
+                    let id = self.alloc_uninitialized(cls);
                     stack.push(Value::Object(Some(id)));
                 }
                 Opcode::Newarray(elem) | Opcode::Anewarray(elem) => {
@@ -1929,12 +2065,6 @@ impl Interpreter {
             return Value::Object(Some(id));
         }
 
-        if let Some(value) =
-            crate::shims::right_click_harvest_config_enum(&mut self.heap, class_name)
-        {
-            return value;
-        }
-
         if field_name == "EVENT" || field_name.ends_with("_EVENT") || class_name.contains("Event") {
             let mut fields = HashMap::new();
             let arr_id = self.heap.alloc(JavaObject::Array {
@@ -2044,4 +2174,20 @@ fn extract_return_type(desc: &str) -> String {
         return ret.to_string();
     }
     "java/lang/Object".into()
+}
+
+/// The JVM descriptor of the class a `java.lang.Class` object names.
+fn class_descriptor(name: &str) -> String {
+    match name {
+        "boolean" => "Z".into(),
+        "byte" => "B".into(),
+        "char" => "C".into(),
+        "short" => "S".into(),
+        "int" => "I".into(),
+        "long" => "J".into(),
+        "float" => "F".into(),
+        "double" => "D".into(),
+        _ if name.starts_with('[') => name.to_string(),
+        _ => format!("L{name};"),
+    }
 }

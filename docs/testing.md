@@ -150,3 +150,5 @@ on a regression in analysis without parsing English.
 4. Concurrency stress: two bootstraps, same cache, assert a single valid entry and a single
    installed folder.
 5. Property tests for version-range parsing and archive-path validation.
+
+The repository's `.cargo/config.toml` sets `RUST_MIN_STACK` so test threads can hold the interpreter's host-stack recursion (100 Java frames) in an unoptimized build; without it Mod Menu and the classpath test overflow the default 2 MB.

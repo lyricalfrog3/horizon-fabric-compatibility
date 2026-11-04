@@ -221,6 +221,102 @@ fn read_zip_entry<R: std::io::Read + std::io::Seek>(
 /// The `InputStream` methods of a [`ByteStream`] (the bytes behind
 /// `Files.newInputStream` and similar). Without them a JDK reader loops on the
 /// abstract `read()`, which never reports the end of the stream.
+/// `Atomic{Reference,Integer,Long}FieldUpdater` over an instance field. The
+/// real classes go through `Unsafe`, which the runtime does not model; the
+/// interpreter is single-threaded, so a plain read-modify-write is atomic.
+fn field_updater_method(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    let kind = class_name.strip_prefix("java/util/concurrent/atomic/")?;
+    if !matches!(
+        kind,
+        "AtomicReferenceFieldUpdater" | "AtomicIntegerFieldUpdater" | "AtomicLongFieldUpdater"
+    ) {
+        return None;
+    }
+    if method_name == "newUpdater" {
+        let name = args.last()?.as_obj()?;
+        let name = heap.get_string(name)?.to_string();
+        let name_val = Value::Object(Some(heap.alloc_string(name)));
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), name_val);
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: class_name.into(),
+            fields,
+        });
+        return Some(BuiltinResult::Handled(Value::Object(Some(id))));
+    }
+    let updater = args.first()?.as_obj()?;
+    let field = match heap.get(updater)? {
+        JavaObject::Instance { fields, .. } => fields.get("name")?.as_obj()?,
+        _ => return None,
+    };
+    let field = heap.get_string(field)?.to_string();
+    let target = args.get(1)?.as_obj()?;
+    let is_long = kind == "AtomicLongFieldUpdater";
+    let is_ref = kind == "AtomicReferenceFieldUpdater";
+    let zero = if is_ref {
+        Value::NULL
+    } else if is_long {
+        Value::Long(0)
+    } else {
+        Value::Int(0)
+    };
+    let current = match heap.get(target)? {
+        JavaObject::Instance { fields, .. } => fields.get(&field).cloned().unwrap_or(zero.clone()),
+        _ => return None,
+    };
+    let same = |a: &Value, b: &Value| match (a, b) {
+        (Value::Object(x), Value::Object(y)) => x == y,
+        (Value::Long(x), Value::Long(y)) => x == y,
+        _ => a.as_int() == b.as_int(),
+    };
+    let add = |v: &Value, d: i64| {
+        if is_long {
+            Value::Long(v.as_long().wrapping_add(d))
+        } else {
+            Value::Int(v.as_int().wrapping_add(d as i32))
+        }
+    };
+    let (store, result): (Option<Value>, Value) = match method_name {
+        "get" => (None, current),
+        "set" | "lazySet" => (Some(args.get(2)?.clone()), Value::NULL),
+        "getAndSet" => (Some(args.get(2)?.clone()), current),
+        "compareAndSet"
+        | "weakCompareAndSet"
+        | "weakCompareAndSetPlain"
+        | "weakCompareAndSetVolatile" => {
+            let ok = same(&current, args.get(2)?);
+            (ok.then(|| args[3].clone()), Value::from_bool(ok))
+        }
+        "incrementAndGet" => {
+            let n = add(&current, 1);
+            (Some(n.clone()), n)
+        }
+        "decrementAndGet" => {
+            let n = add(&current, -1);
+            (Some(n.clone()), n)
+        }
+        "getAndIncrement" => (Some(add(&current, 1)), current),
+        "getAndDecrement" => (Some(add(&current, -1)), current),
+        "addAndGet" => {
+            let n = add(&current, args.get(2)?.as_long());
+            (Some(n.clone()), n)
+        }
+        "getAndAdd" => (Some(add(&current, args.get(2)?.as_long())), current),
+        _ => return None,
+    };
+    if let Some(value) = store {
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(target) {
+            fields.insert(field, value);
+        }
+    }
+    Some(BuiltinResult::Handled(result))
+}
+
 fn byte_stream_method(
     heap: &mut Heap,
     class_name: &str,
@@ -636,6 +732,10 @@ pub fn dispatch_builtin(
     args: &[Value],
     virtual_dispatch: bool,
 ) -> BuiltinResult {
+    if let Some(result) = field_updater_method(heap, class_name, method_name, args) {
+        return result;
+    }
+
     // Collection builtins model the runtime's own List/Map/Set/Iterator objects.
     // A real Java implementation reached through an interface call must run its
     // own bytecode instead, otherwise e.g. AbstractSelectionList$TrackedList.size()
@@ -1350,6 +1450,15 @@ pub fn dispatch_builtin(
             elements: vec![default; length],
         });
         return BuiltinResult::Handled(Value::Object(Some(array)));
+    }
+
+    // The runtime never bootstraps Minecraft's registries (it synthesizes the
+    // ones mods read), so the "was Bootstrap run?" guards that Minecraft classes
+    // call before touching a registry have nothing to check.
+    if class_name == "net/minecraft/server/Bootstrap"
+        && matches!(method_name, "checkBootstrapCalled" | "validate")
+    {
+        return BuiltinResult::Handled(Value::NULL);
     }
 
     if class_name == "java/lang/Throwable" {

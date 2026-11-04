@@ -152,9 +152,13 @@ impl Interpreter {
                 class.static_initialized = true;
             }
             if let Some(class) = self.loader.get(class_name) {
-                if class
-                    .methods
-                    .contains_key(&("<clinit>".into(), "()V".into()))
+                // `Language` is replaced wholesale (translations come from the
+                // host), so its initializer, which reads en_us.json through JDK
+                // stream decoders, must not run.
+                if class_name != "net/minecraft/locale/Language"
+                    && class
+                        .methods
+                        .contains_key(&("<clinit>".into(), "()V".into()))
                 {
                     // A throwing initializer leaves the class half-initialized (a JVM
                     // would raise ExceptionInInitializerError on the next use); say so.
@@ -313,6 +317,16 @@ impl Interpreter {
         }
         self.call_depth -= 1;
         res
+    }
+
+    /// Whether `class_name` declares `method_name`/`descriptor` as a static method.
+    fn is_static_method(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
+        self.loader.get(class_name).is_some_and(|class| {
+            class
+                .methods
+                .get(&(method_name.to_string(), descriptor.to_string()))
+                .is_some_and(|method| method.is_static)
+        })
     }
 
     /// A fresh, uninitialized instance of `cls`, as `new` produces before the
@@ -483,15 +497,13 @@ impl Interpreter {
         }
 
         // If this invocation is on a Lambda object, unpack and delegate to the lambda
-        // target. KNOWN BUG: this also fires for a static method that merely takes a
-        // lambda as its first argument (`Intrinsics.checkNotNullParameter`,
-        // `Bootstrap.checkBootstrapCalled`), running the lambda by mistake. Gating it
-        // on `is_static_method` is right, but the client then executes the real
-        // bootstrap check that this mistake was skipping (the slow registry rebuild),
-        // so the gate needs the bootstrap boundary first.
+        // target. A static method that merely takes a lambda as its first argument
+        // (`Intrinsics.checkNotNullParameter(lambda, name)`) must not run it.
         if let Some(first_arg) = args.first() {
             if let Some(this_id) = first_arg.as_obj() {
-                if !matches!(method_name, "getClass" | "toString" | "hashCode" | "equals") {
+                if !matches!(method_name, "getClass" | "toString" | "hashCode" | "equals")
+                    && !self.is_static_method(class_name, method_name, descriptor)
+                {
                     if let Some(JavaObject::Lambda {
                         target_class,
                         target_method,

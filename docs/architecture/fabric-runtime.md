@@ -161,10 +161,12 @@ them aborted static initializers, including Right Click Harvest's config. Those 
 boundaries first; each is a place where the runtime is still wrong, not only silent.
 
 Other known gaps found by running Veinminer (Kotlin): a null that would throw in a JVM still
-loops (Kotlin's null-parameter message walks an empty stack trace), there are no real threads or
-atomic field updaters so Kotlin coroutine dispatchers do not run, and a static call whose first
-argument is a lambda runs that lambda (see the comment in `execute_method_inner`). Veinminer's
-`onInitialize` therefore still exhausts its budget.
+loops (Kotlin's null-parameter message walks an empty stack trace), and there are no real threads,
+so Kotlin coroutine dispatchers only get as far as a single-threaded interpreter allows.
+`Atomic*FieldUpdater` is modelled as a plain read-modify-write over the instance field. A static
+call is never treated as a lambda invocation, and `Language`'s initializer is skipped because
+translations come from the host. Veinminer's `onInitialize` now returns without error; that says
+nothing about its block-breaking behaviour, which is not exercised.
 
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 

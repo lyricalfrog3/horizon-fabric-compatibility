@@ -30,6 +30,62 @@ fn type_name(descriptor: &str) -> String {
     }
 }
 
+/// The top-level type arguments of a generic signature
+/// (`Lfoo/Bar<Lbaz/Qux;Ljava/util/List<TT;>;>;` gives `baz/Qux`, `java/util/List`).
+fn signature_type_arguments(signature: &str) -> Vec<String> {
+    let Some(open) = signature.find('<') else {
+        return Vec::new();
+    };
+    let chars: Vec<char> = signature[open + 1..].chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && chars[i] != '>' {
+        // Wildcard markers and the unbounded wildcard.
+        if matches!(chars[i], '+' | '-') {
+            i += 1;
+        }
+        match chars.get(i) {
+            Some('*') => {
+                out.push("java/lang/Object".to_string());
+                i += 1;
+            }
+            Some('L') => {
+                let mut depth = 0;
+                let mut name = String::new();
+                let mut in_name = true;
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '<' => {
+                            depth += 1;
+                            in_name = false;
+                        }
+                        '>' => depth -= 1,
+                        ';' if depth == 0 => {
+                            i += 1;
+                            break;
+                        }
+                        c if in_name => name.push(c),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                out.push(name);
+            }
+            // A type variable or an array: not a class this can name.
+            Some('T') => {
+                while i < chars.len() && chars[i] != ';' {
+                    i += 1;
+                }
+                i += 1;
+                out.push("java/lang/Object".to_string());
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 /// The parameter types of a method descriptor, as class object names.
 fn parameter_types(descriptor: &str) -> Vec<String> {
     let inner = descriptor
@@ -230,11 +286,53 @@ impl Interpreter {
     ) -> Option<Value> {
         let receiver = args.first()?;
         match class_name {
+            // `Class.forName(name)` initializes the class, which is how a
+            // library registers itself (Night Config's format detector loads
+            // `TomlFormat` for its static registration).
+            "java/lang/Class" if method_name == "forName" => {
+                let name = self.heap.get_string(receiver.as_obj()?)?.replace('.', "/");
+                if !self.loader.has_class(&name) {
+                    return None;
+                }
+                let _ = self.ensure_initialized(&name);
+                Some(Value::Object(Some(self.heap.alloc_class(name))))
+            }
             "java/lang/Class" => {
                 let class = self.class_arg(receiver)?;
                 match method_name {
                     "getFields" => Some(self.field_objects(&class, true)),
                     "getDeclaredFields" => Some(self.field_objects(&class, false)),
+                    "getSuperclass" => {
+                        let class = self.loader.get_or_load_mut(&class).ok()??;
+                        Some(match class.super_class.clone() {
+                            Some(parent) if !class.is_interface => {
+                                Value::Object(Some(self.heap.alloc_class(parent)))
+                            }
+                            _ => Value::NULL,
+                        })
+                    }
+                    "getInterfaces" => {
+                        let names = self
+                            .loader
+                            .get_or_load_mut(&class)
+                            .ok()??
+                            .interfaces
+                            .clone();
+                        let classes = names
+                            .into_iter()
+                            .map(|n| Value::Object(Some(self.heap.alloc_class(n))))
+                            .collect();
+                        Some(self.array_of("java/lang/Class", classes))
+                    }
+                    "isInterface" => Some(Value::from_bool(
+                        self.loader.get_or_load_mut(&class).ok()??.is_interface,
+                    )),
+                    "isEnum" => {
+                        let c = self.loader.get_or_load_mut(&class).ok()??;
+                        Some(Value::from_bool(
+                            c.super_class.as_deref() == Some("java/lang/Enum"),
+                        ))
+                    }
                     "getDeclaredMethods" => {
                         let methods = self.method_objects(&class, false);
                         Some(self.array_of("java/lang/reflect/Method", methods))
@@ -322,6 +420,17 @@ impl Interpreter {
             "java/util/ServiceLoader" => self.service_loader_call(method_name, args),
             "java/lang/reflect/Field" | "java/lang/reflect/AccessibleObject" => {
                 self.reflect_field_call(method_name, args)
+            }
+            "java/lang/reflect/ParameterizedType" => {
+                let id = receiver.as_obj()?;
+                let JavaObject::Instance { fields, .. } = self.heap.get(id)? else {
+                    return None;
+                };
+                match method_name {
+                    "getActualTypeArguments" => fields.get("arguments").cloned(),
+                    "getRawType" => fields.get("raw").cloned(),
+                    _ => None,
+                }
             }
             _ => {
                 // An annotation instance answers its element methods.
@@ -596,9 +705,42 @@ impl Interpreter {
         match method_name {
             "getName" => Some(Value::Object(Some(self.heap.alloc_string(info.name)))),
             "getModifiers" => Some(Value::Int(info.access as i32)),
-            "getType" | "getGenericType" => Some(Value::Object(Some(
+            "getType" => Some(Value::Object(Some(
                 self.heap.alloc_class(type_name(&info.descriptor)),
             ))),
+            "getGenericType" => {
+                // A field declared with type arguments reports a
+                // `ParameterizedType`; any other field reports its class.
+                let arguments = info
+                    .signature
+                    .as_deref()
+                    .map(signature_type_arguments)
+                    .unwrap_or_default();
+                if arguments.is_empty() {
+                    return Some(Value::Object(Some(
+                        self.heap.alloc_class(type_name(&info.descriptor)),
+                    )));
+                }
+                let classes: Vec<Value> = arguments
+                    .into_iter()
+                    .map(|name| Value::Object(Some(self.heap.alloc_class(name))))
+                    .collect();
+                let array = self.heap.alloc(JavaObject::Array {
+                    elem_type: "java/lang/reflect/Type".into(),
+                    elements: classes,
+                });
+                let mut fields = HashMap::new();
+                fields.insert("arguments".to_string(), Value::Object(Some(array)));
+                fields.insert(
+                    "raw".to_string(),
+                    Value::Object(Some(self.heap.alloc_class(type_name(&info.descriptor)))),
+                );
+                let id = self.heap.alloc(JavaObject::Instance {
+                    class_name: "java/lang/reflect/ParameterizedType".into(),
+                    fields,
+                });
+                Some(Value::Object(Some(id)))
+            }
             "getDeclaringClass" => Some(Value::Object(Some(self.heap.alloc_class(owner)))),
             "setAccessible" => Some(Value::NULL),
             "trySetAccessible" | "canAccess" | "isAccessible" => Some(Value::from_bool(true)),
@@ -608,6 +750,7 @@ impl Interpreter {
                 if args.len() == 2 =>
             {
                 let value = if info.is_static {
+                    self.ensure_initialized(&owner).ok()?;
                     self.loader
                         .get_or_load_mut(&owner)
                         .ok()??
@@ -636,6 +779,7 @@ impl Interpreter {
             {
                 let value = self.unbox_field_value(&info.descriptor, &args[2]);
                 if info.is_static {
+                    self.ensure_initialized(&owner).ok()?;
                     self.loader
                         .get_or_load_mut(&owner)
                         .ok()??

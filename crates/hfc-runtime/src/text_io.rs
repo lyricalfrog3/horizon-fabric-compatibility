@@ -192,6 +192,92 @@ pub fn text_method(
                 string_of(heap, &args[1]).is_some_and(|b| a.to_lowercase() == b.to_lowercase());
             return handled(Value::from_bool(equal));
         }
+        ("java/lang/String", "format" | "formatted") if !args.is_empty() => {
+            // format(fmt, args[]), format(Locale, fmt, args[]), "fmt".formatted(args[])
+            let (fmt, rest) = if method_name == "formatted" {
+                (string_of(heap, &args[0])?, args.get(1))
+            } else if let Some(fmt) = string_of(heap, &args[0]) {
+                (fmt, args.get(1))
+            } else {
+                (string_of(heap, args.get(1)?)?, args.get(2))
+            };
+            let values = rest.and_then(|v| array_values(heap, v)).unwrap_or_default();
+            let text = java_format(heap, &fmt, &values);
+            return handled(alloc_str(heap, text));
+        }
+        ("java/lang/Comparable" | "java/lang/String", "compareTo") if args.len() == 2 => {
+            // Natural ordering of the plain values the runtime keeps unboxed.
+            let ordering = if let (Some(a), Some(b)) =
+                (string_of(heap, &args[0]), string_of(heap, &args[1]))
+            {
+                // Java compares UTF-16 code units and returns their difference.
+                let (mut left, mut right) = (a.encode_utf16(), b.encode_utf16());
+                let (mut left_len, mut right_len) = (0, 0);
+                let mut diff = 0;
+                loop {
+                    match (left.next(), right.next()) {
+                        (Some(x), Some(y)) => {
+                            left_len += 1;
+                            right_len += 1;
+                            if x != y && diff == 0 {
+                                diff = x as i32 - y as i32;
+                            }
+                        }
+                        (Some(_), None) => left_len += 1,
+                        (None, Some(_)) => right_len += 1,
+                        (None, None) => break,
+                    }
+                    if diff != 0 {
+                        break;
+                    }
+                }
+                if diff != 0 {
+                    diff
+                } else {
+                    left_len - right_len
+                }
+            } else {
+                match (&args[0], &args[1]) {
+                    (Value::Double(_) | Value::Float(_), _)
+                    | (_, Value::Double(_) | Value::Float(_)) => {
+                        let (a, b) = (args[0].as_double(), args[1].as_double());
+                        a.partial_cmp(&b).map_or(0, |o| o as i32)
+                    }
+                    (Value::Int(_) | Value::Long(_), Value::Int(_) | Value::Long(_)) => {
+                        args[0].as_long().cmp(&args[1].as_long()) as i32
+                    }
+                    _ => return None,
+                }
+            };
+            return handled(Value::Int(ordering));
+        }
+        ("java/lang/String", "join") if args.len() == 2 => {
+            // join(delimiter, elements...) or join(delimiter, Iterable)
+            let delimiter = crate::builtins::text_of_value(heap, &args[0]);
+            let items: Vec<Value> = match args[1].as_obj().and_then(|id| heap.get(id)) {
+                Some(JavaObject::List(items)) | Some(JavaObject::Set(items)) => items.clone(),
+                Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                _ => return None,
+            };
+            let parts: Vec<String> = items
+                .iter()
+                .map(|item| match item {
+                    Value::Object(None) => "null".to_string(),
+                    other => crate::builtins::text_of_value(heap, other),
+                })
+                .collect();
+            return handled(alloc_str(heap, parts.join(&delimiter)));
+        }
+        ("java/lang/String", "chars" | "codePoints") if args.len() == 1 => {
+            let text = string_of(heap, &args[0])?;
+            let items = if method_name == "chars" {
+                text.encode_utf16().map(|c| Value::Int(c as i32)).collect()
+            } else {
+                text.chars().map(|c| Value::Int(c as i32)).collect()
+            };
+            let sid = heap.alloc_stream(items);
+            return handled(Value::Object(Some(sid)));
+        }
         ("java/lang/String", "split") if args.len() >= 2 => {
             let text = string_of(heap, &args[0])?;
             let pattern = java_pattern(&string_of(heap, &args[1])?);
@@ -220,6 +306,15 @@ pub fn text_method(
                 Err(_) => text,
             };
             return handled(alloc_str(heap, out));
+        }
+        ("java/lang/String", "matches") if args.len() >= 2 => {
+            // The whole text must match, as `Pattern.matches`.
+            let text = string_of(heap, &args[0])?;
+            let pattern = java_pattern(&string_of(heap, &args[1])?);
+            let hit = regex::Regex::new(&format!("^(?:{pattern})$"))
+                .map(|re| re.is_match(&text))
+                .unwrap_or(false);
+            return handled(Value::from_bool(hit));
         }
         ("java/lang/String", "toCharArray") => {
             let text = string_of(heap, args.first()?)?;
@@ -500,4 +595,221 @@ fn java_split(text: &str, pattern: &str, limit: i32) -> Vec<String> {
         }
     }
     parts
+}
+
+/// Java's `Float.toString`/`Double.toString` for the plain cases (`1.0`, `0.5`).
+fn java_float_string(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".into()
+    } else if value.is_infinite() {
+        if value > 0.0 { "Infinity" } else { "-Infinity" }.into()
+    } else if value == value.trunc() && value.abs() < 1e7 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
+/// `String.format`: `%s %S %d %x %X %o %c %b %f %e %n %%` with the `-`, `+`,
+/// ` `, `0`, `,` and `#` flags, width, precision and `n$` argument indexes.
+fn java_format(heap: &Heap, fmt: &str, args: &[Value]) -> String {
+    let as_text = |value: &Value| -> String {
+        match value {
+            Value::Int(v) => v.to_string(),
+            Value::Long(v) => v.to_string(),
+            Value::Float(v) => java_float_string(*v as f64),
+            Value::Double(v) => java_float_string(*v),
+            Value::Object(None) => "null".into(),
+            other => crate::builtins::text_of_value(heap, other),
+        }
+    };
+    let as_i64 = |value: &Value| match value {
+        Value::Long(v) => *v,
+        other => other.as_int() as i64,
+    };
+    let as_f64 = |value: &Value| match value {
+        Value::Float(v) => *v as f64,
+        Value::Double(v) => *v,
+        Value::Long(v) => *v as f64,
+        other => other.as_int() as f64,
+    };
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut next_arg = 0;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let mut spec = String::new();
+        let conversion = loop {
+            match chars.next() {
+                Some(ch) if ch.is_ascii_alphabetic() || ch == '%' => break Some(ch),
+                Some(ch) => spec.push(ch),
+                None => break None,
+            }
+        };
+        let Some(conversion) = conversion else {
+            out.push('%');
+            out.push_str(&spec);
+            break;
+        };
+        match conversion {
+            '%' => {
+                out.push('%');
+                continue;
+            }
+            'n' => {
+                out.push('\n');
+                continue;
+            }
+            _ => {}
+        }
+        let mut index = None;
+        if let Some((num, rest)) = spec.split_once('$') {
+            index = num.parse::<usize>().ok().map(|n| n.saturating_sub(1));
+            spec = rest.to_string();
+        }
+        let flags: String = spec
+            .chars()
+            .take_while(|c| "-+ 0,#(".contains(*c))
+            .collect();
+        let rest = &spec[flags.len()..];
+        let (width, precision) = match rest.split_once('.') {
+            Some((w, p)) => (w.parse::<usize>().unwrap_or(0), p.parse::<usize>().ok()),
+            None => (rest.parse::<usize>().unwrap_or(0), None),
+        };
+        let arg = match index {
+            Some(i) => args.get(i),
+            None => {
+                next_arg += 1;
+                args.get(next_arg - 1)
+            }
+        };
+        let Some(arg) = arg else {
+            out.push_str("null");
+            continue;
+        };
+        let mut body = match conversion {
+            's' | 'S' => {
+                let mut text = as_text(arg);
+                if let Some(p) = precision {
+                    text = text.chars().take(p).collect();
+                }
+                if conversion == 'S' {
+                    text = text.to_uppercase();
+                }
+                text
+            }
+            'd' => {
+                let value = as_i64(arg);
+                let digits = value.unsigned_abs().to_string();
+                let digits = if flags.contains(',') {
+                    let mut grouped = String::new();
+                    for (i, d) in digits.chars().enumerate() {
+                        if i > 0 && (digits.len() - i) % 3 == 0 {
+                            grouped.push(',');
+                        }
+                        grouped.push(d);
+                    }
+                    grouped
+                } else {
+                    digits
+                };
+                let sign = if value < 0 {
+                    "-"
+                } else if flags.contains('+') {
+                    "+"
+                } else if flags.contains(' ') {
+                    " "
+                } else {
+                    ""
+                };
+                format!("{sign}{digits}")
+            }
+            'x' | 'X' | 'o' => {
+                let value = match arg {
+                    Value::Long(v) => *v as u64,
+                    other => other.as_int() as u32 as u64,
+                };
+                let text = match conversion {
+                    'x' => format!("{value:x}"),
+                    'X' => format!("{value:X}"),
+                    _ => format!("{value:o}"),
+                };
+                if flags.contains('#') && conversion != 'o' {
+                    format!("0{}{text}", conversion)
+                } else {
+                    text
+                }
+            }
+            'c' | 'C' => char::from_u32(arg.as_int() as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+            'b' | 'B' => match arg {
+                Value::Object(None) => "false".into(),
+                other => {
+                    let text = crate::builtins::text_of_value(heap, other);
+                    if text == "false" { "false" } else { "true" }.into()
+                }
+            },
+            'f' => {
+                let value = as_f64(arg);
+                let mut text = format!("{:.*}", precision.unwrap_or(6), value.abs());
+                if flags.contains(',') {
+                    let (int, frac) = text.split_once('.').unwrap_or((&text, ""));
+                    let mut grouped = String::new();
+                    for (i, d) in int.chars().enumerate() {
+                        if i > 0 && (int.len() - i) % 3 == 0 {
+                            grouped.push(',');
+                        }
+                        grouped.push(d);
+                    }
+                    text = if frac.is_empty() {
+                        grouped
+                    } else {
+                        format!("{grouped}.{frac}")
+                    };
+                }
+                let sign = if value.is_sign_negative() && value != 0.0 {
+                    "-"
+                } else if flags.contains('+') {
+                    "+"
+                } else {
+                    ""
+                };
+                format!("{sign}{text}")
+            }
+            'e' | 'E' => {
+                let text = format!("{:.*e}", precision.unwrap_or(6), as_f64(arg));
+                let text = match text.split_once('e') {
+                    Some((m, e)) => {
+                        let exp: i32 = e.parse().unwrap_or(0);
+                        format!("{m}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+                    }
+                    None => text,
+                };
+                if conversion == 'E' {
+                    text.to_uppercase()
+                } else {
+                    text
+                }
+            }
+            _ => as_text(arg),
+        };
+        let len = body.chars().count();
+        if len < width {
+            let pad = width - len;
+            if flags.contains('-') {
+                body.push_str(&" ".repeat(pad));
+            } else if flags.contains('0') && matches!(conversion, 'd' | 'x' | 'X' | 'o' | 'f') {
+                let sign_len = usize::from(body.starts_with(['-', '+', ' ']));
+                body.insert_str(sign_len, &"0".repeat(pad));
+            } else {
+                body.insert_str(0, &" ".repeat(pad));
+            }
+        }
+        out.push_str(&body);
+    }
+    out
 }

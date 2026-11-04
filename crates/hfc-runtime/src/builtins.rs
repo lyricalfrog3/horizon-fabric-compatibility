@@ -1872,6 +1872,16 @@ pub fn dispatch_builtin(
             });
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         }
+        if method_name == "valueOf" && descriptor.starts_with("(Z)") && !args.is_empty() {
+            // Boxing: a plain int could not be told from an `Integer`.
+            let mut fields = HashMap::new();
+            fields.insert("value".to_string(), Value::from_bool(args[0].as_bool()));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/lang/Boolean".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
         if (method_name == "valueOf" || method_name == "booleanValue") && !args.is_empty() {
             return BuiltinResult::Handled(Value::from_bool(args[0].as_bool()));
         }
@@ -2001,6 +2011,39 @@ pub fn dispatch_builtin(
             };
             let sid = heap.alloc_string(text);
             return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // `Appendable.append` on a `StringBuilder` (Gson's `AppendableWriter` appends
+    // through the interface, not the class).
+    if class_name == "java/lang/Appendable" && method_name == "append" && args.len() >= 2 {
+        if let Some(this_id) = args[0].as_obj() {
+            if matches!(heap.get(this_id), Some(JavaObject::String(_))) {
+                let piece = if descriptor.starts_with("(C)") {
+                    char::from_u32(args[1].as_int() as u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                } else {
+                    let text = match &args[1] {
+                        Value::Object(None) => "null".to_string(),
+                        other => text_of_value(heap, other),
+                    };
+                    if args.len() >= 4 {
+                        let start = args[2].as_int().max(0) as usize;
+                        let end = args[3].as_int().max(0) as usize;
+                        text.chars()
+                            .skip(start)
+                            .take(end.saturating_sub(start))
+                            .collect()
+                    } else {
+                        text
+                    }
+                };
+                if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
+                    s.push_str(&piece);
+                }
+                return BuiltinResult::Handled(Value::Object(Some(this_id)));
+            }
         }
     }
 
@@ -2566,6 +2609,44 @@ pub fn dispatch_builtin(
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
+        } else if matches!(method_name, "contains" | "indexOf" | "lastIndexOf") && args.len() == 2 {
+            if let Some(JavaObject::List(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
+                let position = if method_name == "lastIndexOf" {
+                    items.iter().rposition(|item| *item == args[1])
+                } else {
+                    items.iter().position(|item| *item == args[1])
+                };
+                return BuiltinResult::Handled(if method_name == "contains" {
+                    Value::from_bool(position.is_some())
+                } else {
+                    Value::Int(position.map_or(-1, |p| p as i32))
+                });
+            }
+        } else if method_name == "set" && args.len() == 3 {
+            if let Some(JavaObject::List(items)) = args[0].as_obj().and_then(|id| heap.get_mut(id))
+            {
+                let index = args[1].as_int().max(0) as usize;
+                if index < items.len() {
+                    let old = std::mem::replace(&mut items[index], args[2].clone());
+                    return BuiltinResult::Handled(old);
+                }
+            }
+        } else if matches!(method_name, "getFirst" | "getLast") && args.len() == 1 {
+            if let Some(JavaObject::List(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
+                let item = if method_name == "getFirst" {
+                    items.first()
+                } else {
+                    items.last()
+                };
+                return BuiltinResult::Handled(item.cloned().unwrap_or(Value::NULL));
+            }
+        } else if method_name == "containsAll" && args.len() == 2 {
+            let wanted = collection_items(heap, &args[1]);
+            if let Some(JavaObject::List(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
+                return BuiltinResult::Handled(Value::from_bool(
+                    wanted.iter().all(|w| items.contains(w)),
+                ));
+            }
         } else if method_name == "iterator" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(JavaObject::List(items)) = heap.get(id) {
@@ -2612,6 +2693,22 @@ pub fn dispatch_builtin(
 
     // Collection & Iterable
     if class_name == "java/util/Collection" || class_name == "java/lang/Iterable" {
+        if matches!(method_name, "contains" | "containsAll") && args.len() == 2 {
+            let items = match args[0].as_obj().and_then(|id| heap.get(id)) {
+                Some(JavaObject::List(items)) | Some(JavaObject::Set(items)) => Some(items.clone()),
+                _ => None,
+            };
+            if let Some(items) = items {
+                let found = if method_name == "contains" {
+                    items.contains(&args[1])
+                } else {
+                    collection_items(heap, &args[1])
+                        .iter()
+                        .all(|wanted| items.contains(wanted))
+                };
+                return BuiltinResult::Handled(Value::from_bool(found));
+            }
+        }
         if method_name == "iterator" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 let items = match heap.get(id) {
@@ -2758,17 +2855,43 @@ pub fn dispatch_builtin(
         }
     }
 
+    // IntStream.range / rangeClosed / of
+    if class_name == "java/util/stream/IntStream" {
+        match method_name {
+            "range" | "rangeClosed" if args.len() == 2 => {
+                let end = args[1].as_int() + i32::from(method_name == "rangeClosed");
+                let items = (args[0].as_int()..end).map(Value::Int).collect();
+                let sid = heap.alloc_stream(items);
+                return BuiltinResult::Handled(Value::Object(Some(sid)));
+            }
+            "of" if args.len() == 1 => {
+                let items = match args[0].as_obj().and_then(|id| heap.get(id)) {
+                    Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                    _ => vec![args[0].clone()],
+                };
+                let sid = heap.alloc_stream(items);
+                return BuiltinResult::Handled(Value::Object(Some(sid)));
+            }
+            _ => {}
+        }
+    }
+
     // java.util.stream.Collectors
     if class_name == "java/util/stream/Collectors" {
         let name = match method_name {
-            "toSet" => "toSet",
-            "toList" => "toList",
+            "toSet" | "toUnmodifiableSet" => "toSet",
+            "toList" | "toUnmodifiableList" => "toList",
             "joining" => "joining",
+            "toCollection" => "toCollection",
+            "toMap" | "toUnmodifiableMap" => "toMap",
             _ => "collector",
         };
         let mut fields = HashMap::new();
         let nid = heap.alloc_string(name);
         fields.insert("type".into(), Value::Object(Some(nid)));
+        for (index, arg) in args.iter().enumerate() {
+            fields.insert(format!("arg{index}"), arg.clone());
+        }
         let cid = heap.alloc(JavaObject::Instance {
             class_name: "java/util/stream/Collector".into(),
             fields,
@@ -2812,6 +2935,47 @@ pub fn dispatch_builtin(
                     entries.push((key, val));
                     return BuiltinResult::Handled(Value::NULL);
                 }
+            }
+        } else if method_name == "putAll" && args.len() >= 2 {
+            let incoming = match args[1].as_obj().and_then(|id| heap.get(id)) {
+                Some(JavaObject::Map(entries)) => entries.clone(),
+                _ => Vec::new(),
+            };
+            if let Some(JavaObject::Map(entries)) = args[0].as_obj().and_then(|id| heap.get_mut(id))
+            {
+                for (key, val) in incoming {
+                    match entries.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, v)) => *v = val,
+                        None => entries.push((key, val)),
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "putIfAbsent" && args.len() >= 3 {
+            if let Some(JavaObject::Map(entries)) = args[0].as_obj().and_then(|id| heap.get_mut(id))
+            {
+                if let Some((_, v)) = entries.iter_mut().find(|(k, _)| *k == args[1]) {
+                    if v.is_null() {
+                        *v = args[2].clone();
+                        return BuiltinResult::Handled(Value::NULL);
+                    }
+                    return BuiltinResult::Handled(v.clone());
+                }
+                entries.push((args[1].clone(), args[2].clone()));
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "containsValue" && args.len() >= 2 {
+            let found = matches!(
+                args[0].as_obj().and_then(|id| heap.get(id)),
+                Some(JavaObject::Map(entries)) if entries.iter().any(|(_, v)| *v == args[1])
+            );
+            return BuiltinResult::Handled(Value::from_bool(found));
+        } else if method_name == "copyOf" && args.len() == 1 {
+            // `Map.copyOf(map)` is static: the map is the first argument.
+            if let Some(JavaObject::Map(entries)) = args[0].as_obj().and_then(|id| heap.get(id)) {
+                let copy = entries.clone();
+                let id = heap.alloc(JavaObject::Map(copy));
+                return BuiltinResult::Handled(Value::Object(Some(id)));
             }
         } else if method_name == "get" && args.len() >= 2 {
             let key = &args[1];
@@ -2946,6 +3110,13 @@ pub fn dispatch_builtin(
         || class_name == "java/util/LinkedHashSet"
         || class_name == "java/util/TreeSet"
     {
+        if method_name == "stream" && args.len() == 1 {
+            if let Some(JavaObject::Set(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
+                let items = items.clone();
+                let sid = heap.alloc_stream(items);
+                return BuiltinResult::Handled(Value::Object(Some(sid)));
+            }
+        }
         if method_name == "<init>" {
             let mut initial: Vec<Value> = Vec::new();
             if let Some(src) = args.get(1) {
@@ -3172,13 +3343,6 @@ pub fn dispatch_builtin(
         }
     }
 
-    if class_name == "com/google/gson/Gson" {
-        if method_name == "toJson" {
-            let sid = heap.alloc_string("{}");
-            return BuiltinResult::Handled(Value::Object(Some(sid)));
-        }
-    }
-
     if class_name == "java/nio/file/Files" {
         if method_name == "exists" || method_name == "isDirectory" || method_name == "isRegularFile"
         {
@@ -3238,7 +3402,16 @@ pub fn dispatch_builtin(
         || class_name == "java/io/BufferedWriter"
         || class_name == "java/io/StringWriter"
     {
-        if method_name == "write" || method_name == "close" || method_name == "flush" {
+        // A library's own `Writer` subclass (Gson's `AppendableWriter`) has real
+        // `write` methods; only the JDK writers with no host behind them are inert.
+        let library_writer = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| heap.get(id))
+            .is_some_and(|o| matches!(o, JavaObject::Instance { class_name, .. } if !class_name.starts_with("java/")));
+        if !library_writer
+            && (method_name == "write" || method_name == "close" || method_name == "flush")
+        {
             return BuiltinResult::Handled(Value::NULL);
         }
     }

@@ -207,6 +207,14 @@ pub fn file_system_method(
             let path = vfs::join("", &path);
             handled(alloc_path(heap, &path))
         }
+        "java/nio/file/FileSystem" if method_name == "newWatchService" => {
+            handled(inert(heap, "java/nio/file/WatchService"))
+        }
+        "java/nio/file/WatchService" | "java/nio/file/WatchKey"
+            if matches!(method_name, "close" | "cancel" | "reset") =>
+        {
+            handled(Value::from_bool(true))
+        }
         "java/nio/file/Path" => {
             let this = path_of(heap, args.first()?)?;
             match method_name {
@@ -233,6 +241,11 @@ pub fn file_system_method(
                     let sid = heap.alloc_string(this);
                     handled(Value::Object(Some(sid)))
                 }
+                // Watching the game directory for edits is a host boundary: the
+                // runtime has no watcher thread, so a watch registers and never
+                // fires (a config edited on disk is read at the next start).
+                "getFileSystem" => handled(inert(heap, "java/nio/file/FileSystem")),
+                "register" => handled(inert(heap, "java/nio/file/WatchKey")),
                 "toAbsolutePath" | "normalize" | "toRealPath" => handled(args[0].clone()),
                 "toFile" => {
                     let mut fields = HashMap::new();
@@ -351,4 +364,12 @@ pub fn file_system_method(
         }
         _ => None,
     }
+}
+
+/// An object with no state, for host services the runtime does not provide.
+fn inert(heap: &mut Heap, class_name: &str) -> Value {
+    Value::Object(Some(heap.alloc(JavaObject::Instance {
+        class_name: class_name.into(),
+        fields: HashMap::new(),
+    })))
 }

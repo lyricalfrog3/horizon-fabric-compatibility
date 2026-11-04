@@ -286,10 +286,24 @@ metadata drives this in `reflect.rs`, ahead of the builtins:
   constructs the providers; there is no per-service table.
 - `String.replaceAll/replaceFirst/split` use the `regex` crate with Java's `\R`
   translated; `System.lineSeparator` is `"\n"`.
+- `String.matches/format/formatted/join/compareTo`, `Collectors` (`toList`, `toSet`,
+  `joining`, `toCollection`, `toMap`), `IntStream.range`, and `Map`/`List` helpers
+  (`computeIfAbsent`, `merge`, `putIfAbsent`, `subList`, ...) run real semantics.
+- `Field.getGenericType` reads the class file's `Signature` attribute and answers a
+  `ParameterizedType` whose `getActualTypeArguments` are class objects; `instanceof
+  Class` holds for class objects. Mod Menu uses this to write its enum options.
+- Gson is not stubbed: `Gson.toJson` runs Gson's own `JsonWriter`. A library
+  `Writer` subclass keeps its own `write`/`append`, and a library `CharSequence`
+  appended to a `StringBuilder` contributes its `toString()`.
+- A mod's own static field that nothing assigned is `null`; only platform classes
+  get synthesized statics.
+- File watchers (`WatchService`, `Path.register`) are inert: nothing changes on disk
+  while the game runs, so a config is not reloaded live.
 
 Verified: `tests/config_files.rs` loads JamLib and Right Click Harvest and compares
 the written `config/rightclickharvest.json5`, comments included, with the file the real
-game writes. Known limits: `getMethod` of a missing method returns null instead of
+game writes; it also checks Legendary Tooltips' `legendarytooltips.toml` (Iceberg and
+Night Config) and Mod Menu's pretty-printed `modmenu.json` (Gson). Known limits: `getMethod` of a missing method returns null instead of
 throwing `NoSuchMethodException`; `List.subList` is a copy, not a view; a config
 file that already exists is read back through the same reflection path
 (`Field.set` with the parsed value), which is not covered by a test yet.

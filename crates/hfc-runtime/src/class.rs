@@ -446,6 +446,8 @@ pub struct FieldInfo {
     /// Position in the class file, which is declaration order.
     pub index: usize,
     pub annotations: Vec<AnnotationInfo>,
+    /// The generic `Signature` attribute (`Lfoo/Bar<Lbaz/Qux;>;`), when present.
+    pub signature: Option<String>,
 }
 
 /// Information about an invokedynamic bootstrap method.
@@ -465,6 +467,8 @@ pub struct Class {
     pub this_class: String,
     pub super_class: Option<String>,
     pub interfaces: Vec<String>,
+    /// Whether the class file is an interface (`ACC_INTERFACE`).
+    pub is_interface: bool,
     pub fields: HashMap<String, FieldInfo>,
     pub static_fields: HashMap<String, Value>,
     pub methods: HashMap<(String, String), MethodInfo>,
@@ -696,6 +700,12 @@ impl Class {
                     access: f.access_flags.bits(),
                     index,
                     annotations: annotation_attributes(&f.attributes),
+                    signature: f.attributes.iter().find_map(|a| match &a.data {
+                        cafebabe::attributes::AttributeData::Signature(sig) => {
+                            Some(sig.to_string())
+                        }
+                        _ => None,
+                    }),
                 },
             );
             if is_static {
@@ -798,6 +808,9 @@ impl Class {
             this_class,
             super_class,
             interfaces,
+            is_interface: parsed
+                .access_flags
+                .contains(cafebabe::ClassAccessFlags::INTERFACE),
             fields,
             static_fields,
             methods,

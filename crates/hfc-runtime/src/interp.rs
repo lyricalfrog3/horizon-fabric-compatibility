@@ -46,6 +46,14 @@ pub struct Interpreter {
     /// normal runs: the bookkeeping allocates a string per call.
     pub trace_calls: bool,
     pub call_stack: Vec<String>,
+    /// Menu widget injections are applied only while the bridge runs a host
+    /// menu's layout method, never to ordinary gameplay code.
+    pub menu_injection: bool,
+    /// Depth inside a mixin callback; layout additions made here are the
+    /// widgets a menu contribution may draw.
+    pub injection_depth: usize,
+    /// Widget heap ids added by the running menu injectors.
+    pub menu_contributions: Vec<usize>,
 }
 
 impl Default for Interpreter {
@@ -66,6 +74,9 @@ impl Interpreter {
             call_depth: 0,
             trace_calls: false,
             call_stack: Vec::new(),
+            menu_injection: false,
+            injection_depth: 0,
+            menu_contributions: Vec::new(),
         }
     }
 
@@ -80,6 +91,9 @@ impl Interpreter {
             call_depth: 0,
             trace_calls: false,
             call_stack: Vec::new(),
+            menu_injection: false,
+            injection_depth: 0,
+            menu_contributions: Vec::new(),
         }
     }
 
@@ -299,6 +313,24 @@ impl Interpreter {
         virtual_dispatch: bool,
     ) -> Result<Value> {
         log::trace!("Execute: {class_name}.{method_name}{descriptor}");
+
+        // A mixin menu callback runs against host-synthesized layout objects;
+        // the only layout operation that matters is adding a widget, which is
+        // recorded as a menu contribution.
+        if self.injection_depth > 0
+            && args.len() >= 2
+            && matches!(
+                method_name,
+                "addChild"
+                    | "addRenderableWidget"
+                    | "addWidget"
+                    | "addDrawableChild"
+                    | "addRenderableOnly"
+            )
+        {
+            self.record_menu_child(method_name, args);
+            return Ok(args[1].clone());
+        }
 
         // If this invocation is on a Lambda object, unpack and delegate to the lambda target
         if let Some(first_arg) = args.first() {
@@ -747,6 +779,30 @@ impl Interpreter {
         self.interpret_code(&this_class, method_name, descriptor, &bsm, &code, args)
     }
 
+    /// Record a widget a mixin callback added to a layout or screen.
+    fn record_menu_child(&mut self, method_name: &str, args: &[Value]) {
+        if !self.menu_injection || self.injection_depth == 0 {
+            return;
+        }
+        if !matches!(
+            method_name,
+            "addChild"
+                | "addRenderableWidget"
+                | "addWidget"
+                | "addDrawableChild"
+                | "addRenderableOnly"
+                | "add"
+        ) {
+            return;
+        }
+        let Some(id) = args.get(1).and_then(Value::as_obj) else {
+            return;
+        };
+        if !self.menu_contributions.contains(&id) {
+            self.menu_contributions.push(id);
+        }
+    }
+
     /// Interpret a code block with the given arguments as initial locals.
     fn interpret_code(
         &mut self,
@@ -778,7 +834,6 @@ impl Interpreter {
         let mut stack: Vec<Value> = Vec::with_capacity(code.max_stack as usize);
         let mut pc = 0;
         let opcodes = &code.opcodes;
-
         while pc < opcodes.len() {
             if let Some(budget) = &mut self.step_budget {
                 if *budget == 0 {
@@ -1540,6 +1595,7 @@ impl Interpreter {
                         descriptor,
                         &call_args,
                     )?;
+                    self.record_menu_child(method_name, &call_args);
                     if !descriptor.ends_with(")V") {
                         stack.push(ret);
                     }
@@ -1565,6 +1621,7 @@ impl Interpreter {
                         descriptor,
                         &call_args,
                     )?;
+                    self.record_menu_child(method_name, &call_args);
 
                     if !descriptor.ends_with(")V") {
                         stack.push(ret);
@@ -1592,6 +1649,7 @@ impl Interpreter {
 
                     let ret =
                         self.execute_method(class_name, method_name, descriptor, &call_args)?;
+                    self.record_menu_child(method_name, &call_args);
 
                     if !descriptor.ends_with(")V") {
                         stack.push(ret);

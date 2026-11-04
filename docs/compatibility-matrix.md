@@ -7,10 +7,11 @@ own end-to-end tests do not cover every content type.
 
 The matrix covers the HFC installer and its carried content. It does **not** cover the
 experimental in-client interpreter in `crates/hfc-runtime`; that runtime has its own
-[design note](architecture/fabric-runtime.md) and its own limits (no Mixins, no general
-Fabric API, and a partial replayed GUI: Mod Menu's list opens, hides Fabric API libraries,
-filters, scrolls by wheel or scrollbar drag, and shows real mod icons when the jar provides
-one; description text and synthetic mod icons remain incomplete).
+[design note](architecture/fabric-runtime.md) and its own limits (no general Mixin support,
+only widget-adding menu `@Inject` callbacks; no general Fabric API; and a partial replayed GUI:
+Mod Menu's list opens, hides Fabric API libraries, filters, scrolls by wheel or scrollbar drag,
+and shows real mod icons when the jar provides one. Title/pause menu buttons from screen mixins
+are partial: layout/draw transforms and description text remain missing).
 
 ## Player-facing result
 

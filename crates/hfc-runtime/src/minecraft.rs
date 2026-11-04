@@ -69,6 +69,69 @@ impl NativeObject for PngImage {
     }
 }
 
+/// A host menu a Fabric mixin may add widgets to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MenuKind {
+    Title,
+    Pause,
+    Inventory,
+    Container,
+}
+
+impl MenuKind {
+    /// The Minecraft screen class whose layout a contribution pass runs.
+    pub fn screen_class(self) -> &'static str {
+        match self {
+            MenuKind::Title => "net/minecraft/client/gui/screens/TitleScreen",
+            MenuKind::Pause => "net/minecraft/client/gui/screens/PauseScreen",
+            MenuKind::Inventory => "net/minecraft/client/gui/screens/inventory/InventoryScreen",
+            MenuKind::Container => {
+                "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen"
+            }
+        }
+    }
+
+    /// The method the mixin adds widgets to, in the screen class.
+    pub fn layout_method(self) -> &'static str {
+        match self {
+            MenuKind::Pause => "createPauseMenu",
+            MenuKind::Title | MenuKind::Inventory | MenuKind::Container => "init",
+        }
+    }
+}
+
+/// A widget a mod's mixin added to a host menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuWidget {
+    pub id: usize,
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub visible: bool,
+    pub active: bool,
+}
+
+/// The callback object a Mixin injector receives. `cancel` ends the target
+/// method early, as `CallbackInfo.cancel()` does in a real Mixin application.
+#[derive(Debug, Clone, Default)]
+pub struct CallbackInfo {
+    pub cancelled: bool,
+}
+
+impl NativeObject for CallbackInfo {
+    fn class_name(&self) -> &str {
+        "org/spongepowered/asm/mixin/injection/callback/CallbackInfo"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// The bytes behind `Files.newInputStream` for a path inside a mod jar.
 #[derive(Debug, Clone)]
 pub struct ByteStream {

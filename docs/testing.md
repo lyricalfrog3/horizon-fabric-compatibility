@@ -37,8 +37,8 @@ mod's id or class name is not coverage and must not be added.
 | `hfc-cache` (keying, commit, recovery, prune, stats) | 6 |
 | `hfc-bootstrap` unit (config, state, report, install, ids, carry verification) | 12 |
 | `hfc-bootstrap` end to end | 5 |
-| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, Mod Menu screen) | 15 |
-| **HFC total** | **59** |
+| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, mixin menu widgets, Mod Menu screen) | 17 |
+| **HFC total** | **61** |
 | Launcher `fabric_compat` (`cargo test --lib fabric_compat`) | 3 |
 
 `cargo test --workspace` also runs the tests of the path-dependency crates under
@@ -48,8 +48,10 @@ The runtime suite also opens Mod Menu's own `ModsScreen` through its registered 
 mapping, replays its `GuiGraphicsExtractor` draws, checks the rendered labels and a registered
 mod icon's PNG bytes, and closes the screen with Escape. Companion tests click the search box,
 type a query, verify the list filters down and the character is drawn, clear it with Backspace,
-click Done, and scroll an overflowing list with both the wheel and a scrollbar drag. Those
-tests skip when the pinned jars or a Minecraft install are absent.
+click Done, and scroll an overflowing list with both the wheel and a scrollbar drag. Two
+further tests run the widget-adding mixin callbacks for the title and pause menus, assert each
+produces a `Mods` widget, that the widget renders, and that clicking it installs `ModsScreen`.
+Those tests skip when the pinned jars or a Minecraft install are absent.
 
 The end-to-end tests cover:
 

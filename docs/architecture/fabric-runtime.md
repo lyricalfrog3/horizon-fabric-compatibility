@@ -96,7 +96,7 @@ the server applies the harvest.
 | Fabric `ScreenEvents.AFTER_INIT` | dispatched | runs for every initialized mod screen |
 | Fabric `ClientTickEvents` | dispatched | runs once per host tick, before the screen tick |
 | Fabric key mappings | supported | `KeyMapping`, `KeyMappingHelper` and `consumeClick`; the host binds by translation key or physical key |
-| Mixins / access wideners | **not applied** | Java patches are outside this runtime |
+| Mixins / access wideners | **partially applied, menu widgets only** | `@Inject` callbacks that add widgets to a host menu are run with synthesized screen/layout locals; all other mixins and access wideners are ignored |
 
 ### Mod Menu
 
@@ -115,6 +115,23 @@ Fabric Loader's custom metadata (`fabric-api:module-lifecycle` under `custom` in
 `fabric.mod.json`) and on `ModMenuConfig.SHOW_LIBRARIES` defaulting to `WITH_CONFIG`; both are
 answered from the real mod metadata, so the list shows the root mods (11 with the pinned test
 set) rather than every Fabric API module.
+
+Mod Menu's title and pause buttons come from its `MixinTitleScreen`/`MixinPauseScreen` mixins,
+not from a Fabric API event. The runtime reads the mods' mixin configs and annotations and
+applies only the widget-adding `@Inject` callbacks: it synthesizes the callback's target-screen
+receiver, `CallbackInfo`, `@Local`/MixinExtras value refs and layout objects, then records the
+widgets the callback adds through a layout's `addChild` or Fabric's
+`Screens.getWidgets(screen).add(widget)`. The host draws those widgets on the native title and
+pause menus (appended to each menu's icon row); clicking one opens the mod's screen over the
+native menu, and Done/Escape returns to it. The pinned tests assert both menus produce a
+`Mods` widget, that it renders, and that clicking it installs `ModsScreen`.
+
+This is **not general Mixin support**. The vanilla layout method itself is not executed, so the
+callback runs with synthesized locals and the widget is host-placed; `@ModifyArg`,
+`@ModifyVariable`, `@Redirect`, `@WrapOperation`, MixinExtras expressions, accessors/invokers
+and all gameplay/draw-code transforms are not applied. Menu buttons whose sprite assets are not
+in the HUD atlas (Mod Menu's own icon) render as labelled placeholder tiles until a mod GUI
+sprite atlas exists.
 
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 

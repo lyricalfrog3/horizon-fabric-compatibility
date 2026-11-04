@@ -245,6 +245,178 @@ pub struct MethodInfo {
     pub descriptor: String,
     pub is_static: bool,
     pub code: Option<Arc<CodeInfo>>,
+    /// Annotations on the method, including Mixin's `@Inject`.
+    pub annotations: Vec<AnnotationInfo>,
+    /// Annotations on each parameter, in parameter order.
+    pub parameter_annotations: Vec<Vec<AnnotationInfo>>,
+}
+
+/// One class-file annotation, with its element values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnotationInfo {
+    /// The annotation type as a class name (`Lpkg/Name;` stripped).
+    pub type_name: String,
+    pub elements: Vec<(String, AnnotationValue)>,
+}
+
+impl AnnotationInfo {
+    pub fn element(&self, name: &str) -> Option<&AnnotationValue> {
+        self.elements
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    pub fn string(&self, name: &str) -> Option<&str> {
+        match self.element(name)? {
+            AnnotationValue::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn strings(&self, name: &str) -> Vec<&str> {
+        match self.element(name) {
+            Some(AnnotationValue::String(value)) => vec![value.as_str()],
+            Some(AnnotationValue::Array(values)) => values
+                .iter()
+                .filter_map(|value| match value {
+                    AnnotationValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn annotation(&self, name: &str) -> Option<&AnnotationInfo> {
+        match self.element(name)? {
+            AnnotationValue::Annotation(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn annotations(&self, name: &str) -> Vec<&AnnotationInfo> {
+        match self.element(name) {
+            Some(AnnotationValue::Annotation(value)) => vec![value],
+            Some(AnnotationValue::Array(values)) => values
+                .iter()
+                .filter_map(|value| match value {
+                    AnnotationValue::Annotation(value) => Some(value),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// A class-file annotation element value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnnotationValue {
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Bool(bool),
+    Char(char),
+    String(String),
+    Enum { type_name: String, name: String },
+    Class(String),
+    Annotation(AnnotationInfo),
+    Array(Vec<AnnotationValue>),
+}
+
+/// A class name from a `Lpkg/Name;` descriptor, or the name unchanged.
+fn annotation_class_name(name: &str) -> String {
+    name.strip_prefix('L')
+        .and_then(|name| name.strip_suffix(';'))
+        .unwrap_or(name)
+        .replace('.', "/")
+}
+
+fn convert_annotation(annotation: &cafebabe::attributes::Annotation<'_>) -> AnnotationInfo {
+    use cafebabe::attributes::AnnotationElementValue;
+
+    fn convert_value(value: &AnnotationElementValue<'_>) -> AnnotationValue {
+        match value {
+            AnnotationElementValue::ByteConstant(value)
+            | AnnotationElementValue::ShortConstant(value)
+            | AnnotationElementValue::IntConstant(value) => AnnotationValue::Int(*value),
+            AnnotationElementValue::CharConstant(value) => {
+                AnnotationValue::Char(char::from_u32(*value as u32).unwrap_or('\0'))
+            }
+            AnnotationElementValue::LongConstant(value) => AnnotationValue::Long(*value),
+            AnnotationElementValue::FloatConstant(value) => AnnotationValue::Float(*value),
+            AnnotationElementValue::DoubleConstant(value) => AnnotationValue::Double(*value),
+            AnnotationElementValue::BooleanConstant(value) => AnnotationValue::Bool(*value != 0),
+            AnnotationElementValue::StringConstant(value) => {
+                AnnotationValue::String(value.to_string())
+            }
+            AnnotationElementValue::EnumConstant {
+                type_name,
+                const_name,
+            } => AnnotationValue::Enum {
+                type_name: annotation_class_name(&type_name.to_string()),
+                name: const_name.to_string(),
+            },
+            AnnotationElementValue::ClassLiteral { class_name } => {
+                AnnotationValue::Class(annotation_class_name(class_name))
+            }
+            AnnotationElementValue::AnnotationValue(annotation) => {
+                AnnotationValue::Annotation(convert_annotation(annotation))
+            }
+            AnnotationElementValue::ArrayValue(values) => {
+                AnnotationValue::Array(values.iter().map(convert_value).collect())
+            }
+        }
+    }
+
+    AnnotationInfo {
+        type_name: annotation_class_name(&annotation.type_descriptor.to_string()),
+        elements: annotation
+            .elements
+            .iter()
+            .map(|element| (element.name.to_string(), convert_value(&element.value)))
+            .collect(),
+    }
+}
+
+fn annotation_attributes(
+    attributes: &[cafebabe::attributes::AttributeInfo<'_>],
+) -> Vec<AnnotationInfo> {
+    use cafebabe::attributes::AttributeData;
+    let mut out = Vec::new();
+    for attribute in attributes {
+        match &attribute.data {
+            AttributeData::RuntimeVisibleAnnotations(annotations)
+            | AttributeData::RuntimeInvisibleAnnotations(annotations) => {
+                out.extend(annotations.iter().map(convert_annotation));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn parameter_annotation_attributes(
+    attributes: &[cafebabe::attributes::AttributeInfo<'_>],
+) -> Vec<Vec<AnnotationInfo>> {
+    use cafebabe::attributes::AttributeData;
+    let mut out: Vec<Vec<AnnotationInfo>> = Vec::new();
+    for attribute in attributes {
+        let annotations = match &attribute.data {
+            AttributeData::RuntimeVisibleParameterAnnotations(annotations)
+            | AttributeData::RuntimeInvisibleParameterAnnotations(annotations) => annotations,
+            _ => continue,
+        };
+        for (index, parameter) in annotations.iter().enumerate() {
+            if out.len() <= index {
+                out.resize(index + 1, Vec::new());
+            }
+            out[index].extend(parameter.annotations.iter().map(convert_annotation));
+        }
+    }
+    out
 }
 
 /// Information about a class field.
@@ -277,6 +449,8 @@ pub struct Class {
     pub methods: HashMap<(String, String), MethodInfo>,
     pub bootstrap_methods: Vec<BootstrapMethodInfo>,
     pub static_initialized: bool,
+    /// Class-level annotations (`@Mixin` on a mixin class).
+    pub annotations: Vec<AnnotationInfo>,
 }
 
 /// True for a value that is already a class name rather than a descriptor.
@@ -579,6 +753,8 @@ impl Class {
                     descriptor: m.descriptor.to_string(),
                     is_static,
                     code,
+                    annotations: annotation_attributes(&m.attributes),
+                    parameter_annotations: parameter_annotation_attributes(&m.attributes),
                 },
             );
         }
@@ -592,6 +768,7 @@ impl Class {
             methods,
             bootstrap_methods,
             static_initialized: false,
+            annotations: annotation_attributes(&parsed.attributes),
         })
     }
 }

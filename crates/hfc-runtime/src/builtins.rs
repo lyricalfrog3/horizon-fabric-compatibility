@@ -49,7 +49,7 @@ fn collection_items(heap: &Heap, val: &Value) -> Vec<Value> {
 /// Text carried by a string, component, or formatted text object. Components
 /// built by the runtime keep their plain text in a `text` field; formatted
 /// sequences copy it from the component they were made from.
-fn text_of_value(heap: &Heap, val: &Value) -> String {
+pub(crate) fn text_of_value(heap: &Heap, val: &Value) -> String {
     if let Some(id) = val.as_obj() {
         if let Some(s) = heap.get_string(id) {
             return s.to_string();
@@ -444,6 +444,56 @@ pub fn dispatch_builtin(
         if let Some(text) = text {
             return BuiltinResult::Handled(alloc_formatted_char_sequence(heap, text));
         }
+    }
+
+    // MixinExtras `@Local` sugar wrappers (`LocalIntRef`, `LocalBooleanRef`,
+    // `LocalRef`, ...): a mutable box over a synthesized local value.
+    if class_name.contains("mixinextras/sugar/ref/Local") {
+        let this = args.first().and_then(Value::as_obj);
+        if matches!(
+            method_name,
+            "get" | "getValue" | "getAsInt" | "getAsBoolean"
+        ) {
+            return BuiltinResult::Handled(
+                this.and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get("value").cloned(),
+                    _ => None,
+                })
+                .unwrap_or(Value::NULL),
+            );
+        }
+        if matches!(method_name, "set" | "setValue") && args.len() >= 2 {
+            if let Some(id) = this {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(id) {
+                    fields.insert("value".into(), args[1].clone());
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Mixin callback objects. Only the menu-widget bridge creates these, but
+    // a callback may also call `isCancellable`/`cancel`.
+    if class_name.ends_with("/injection/callback/CallbackInfo")
+        || class_name.ends_with("/injection/callback/CallbackInfoReturnable")
+    {
+        let info = args.first().and_then(Value::as_obj);
+        if method_name == "cancel" {
+            if let Some(id) = info {
+                if let Some(callback) = heap.get_native_mut::<CallbackInfo>(id) {
+                    callback.cancelled = true;
+                }
+            }
+        } else if method_name == "isCancelled" {
+            return BuiltinResult::Handled(Value::from_bool(
+                info.and_then(|id| heap.get_native::<CallbackInfo>(id))
+                    .map(|callback| callback.cancelled)
+                    .unwrap_or(false),
+            ));
+        } else if method_name == "isCancellable" {
+            return BuiltinResult::Handled(Value::from_bool(true));
+        }
+        return BuiltinResult::Handled(Value::NULL);
     }
 
     // -------------------------------------------------------------

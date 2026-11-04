@@ -7,7 +7,7 @@
 //! would.
 
 use hfc_runtime::bridge::FabricBridge;
-use hfc_runtime::minecraft::GuiDraw;
+use hfc_runtime::minecraft::{GuiDraw, MenuKind};
 use hfc_runtime::value::{JavaObject, Value};
 use std::path::{Path, PathBuf};
 
@@ -255,6 +255,87 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
     assert!(
         bridge.current_screen().is_none(),
         "Escape did not close the mod screen"
+    );
+}
+
+#[test]
+fn the_title_menu_receives_mod_menu_widgets() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+    assert!(bridge.has_menu_injectors(MenuKind::Title));
+    let widgets = bridge.prepare_menu_contributions(MenuKind::Title, 1280, 720);
+    let index = widgets
+        .iter()
+        .position(|widget| widget.label == "Mods")
+        .unwrap_or_else(|| panic!("no Mods widget in {widgets:?}"));
+    let widget = &widgets[index];
+    assert_eq!((widget.width, widget.height), (20, 20));
+    assert!(widget.visible && widget.active);
+    assert!(
+        bridge.menu_widget_click(
+            MenuKind::Title,
+            1280,
+            720,
+            index,
+            f64::from(widget.x) + 10.0,
+            f64::from(widget.y) + 10.0,
+            1,
+            true,
+        ),
+        "clicking the title widget was not handled"
+    );
+    let screen = bridge
+        .current_screen()
+        .expect("the title widget did not open a screen");
+    assert_eq!(
+        screen_class(&bridge, &screen),
+        "com/terraformersmc/modmenu/gui/ModsScreen"
+    );
+    let small = bridge.prepare_menu_contributions(MenuKind::Title, 427, 240);
+    assert!(!small.is_empty(), "no title widget at the live GUI size");
+    let draws = bridge.menu_widget_draw(MenuKind::Title, 427, 240, 0, 0, 0);
+    assert!(!draws.is_empty(), "the title widget rendered nothing");
+}
+
+#[test]
+fn the_pause_menu_receives_mod_menu_widgets() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+    assert!(
+        bridge.has_menu_injectors(MenuKind::Pause),
+        "the pause menu has no mod injectors"
+    );
+    let widgets = bridge.prepare_menu_contributions(MenuKind::Pause, 1280, 720);
+    let index = widgets
+        .iter()
+        .position(|widget| widget.label == "Mods")
+        .unwrap_or_else(|| panic!("no Mods widget in {widgets:?}"));
+    let widget = &widgets[index];
+    assert_eq!((widget.width, widget.height), (20, 20));
+    assert!(widget.visible && widget.active);
+
+    let draws = bridge.menu_widget_draw(MenuKind::Pause, 1280, 720, index, 0, 0);
+    assert!(
+        !draws.is_empty(),
+        "the contributed widget rendered nothing: {draws:?}"
+    );
+
+    assert!(
+        bridge.menu_widget_click(MenuKind::Pause, 1280, 720, index, 10.0, 10.0, 1, true),
+        "clicking the contributed widget was not handled"
+    );
+    let screen = bridge
+        .current_screen()
+        .expect("the contributed widget did not open a screen");
+    assert_eq!(
+        screen_class(&bridge, &screen),
+        "com/terraformersmc/modmenu/gui/ModsScreen"
     );
 }
 

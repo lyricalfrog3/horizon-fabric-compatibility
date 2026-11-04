@@ -8,6 +8,7 @@ pub mod interp;
 pub mod jimage;
 pub mod loader;
 pub mod minecraft;
+pub mod mixin;
 pub mod value;
 
 pub use bridge::FabricModMetadata;

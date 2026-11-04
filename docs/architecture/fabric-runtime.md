@@ -90,8 +90,8 @@ the server applies the harvest.
 | Path | Status | Notes |
 |---|---|---|
 | Right Click Harvest | **works** | JamLib `InteractionEvent.USE_BLOCK`; the mod's replant and drops are replayed into the host |
-| Fabric `PlayerBlockBreakEvents.BEFORE` | dispatched by the runtime (`FabricBridge::block_break_before`) | Veinminer's listener runs end to end in a test: it breaks the connected ore through `ServerPlayerGameMode.destroyBlock`, and the bridge hands each broken position to `HostBridge::break_block`. **The Horizon client does not call it yet**, so nothing vein-mines in the game. |
-| Fabric `ServerLifecycleEvents.SERVER_STARTING` | dispatched (`FabricBridge::server_starting`) | runs with an empty `MinecraftServer`; the client does not call it yet |
+| Fabric `PlayerBlockBreakEvents.BEFORE` | dispatched by the runtime (`FabricBridge::block_break_before`) | Veinminer's listener runs end to end in a test: it breaks the connected ore through `ServerPlayerGameMode.destroyBlock`, and the bridge hands each broken position to `HostBridge::break_block`. The client calls it from `native_destroy_block`; a live run broke a 5-block coal row with one break and a pickaxe carrying the mod's enchantment (offscreen run, no durability or drops for the extra blocks beyond what `Game::break_block` does). |
+| Fabric `ServerLifecycleEvents.SERVER_STARTING` | dispatched (`FabricBridge::server_starting`) | runs with an empty `MinecraftServer`; the client calls it once after `init` |
 | Fabric `ItemTooltipCallback` | dispatched | text lines can be added/changed |
 | Iceberg `RenderTooltipEvents.COLOREXT` | dispatched | background/border colors and gradient flags |
 | Iceberg `GATHER` / `POSTEXT` | **not dispatched** | Legendary Tooltips needs these for its frame |

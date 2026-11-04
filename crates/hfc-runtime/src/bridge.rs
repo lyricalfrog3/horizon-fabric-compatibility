@@ -38,6 +38,15 @@ pub struct FabricModMetadata {
     pub description: String,
     pub authors: Vec<String>,
     pub is_nested: bool,
+    /// The `fabric.mod.json` this entry was read from. Fabric Loader exposes
+    /// unknown top-level keys through `ModMetadata.getCustomValue` and
+    /// `containsCustomValue`; Mod Menu reads `fabric-api:module-lifecycle`
+    /// there to mark a mod as a library and `modmenu` for parent/badge data.
+    pub raw: String,
+    /// The jar holding this mod's resources, and for a nested mod the jar
+    /// inside it. `ModContainer.getPath` resolves a mod's icon path here.
+    pub jar: Option<String>,
+    pub nested_jar: Option<String>,
 }
 
 /// Event matching Horizon's `RightClickBlockEvent`.
@@ -97,6 +106,12 @@ pub struct FabricBridge {
     screen_id: Option<usize>,
     screen_width: i32,
     screen_height: i32,
+    /// The button held since a press on the screen (26.3's `MouseHandler`
+    /// `activeButton`), which turns mouse movement into `mouseDragged` so a
+    /// scrollbar thumb or slider follows the pointer.
+    drag_button: Option<i32>,
+    /// The last pointer position, for the drag deltas.
+    last_mouse: (f64, f64),
 }
 
 impl Default for FabricBridge {
@@ -117,11 +132,19 @@ impl FabricBridge {
             screen_id: None,
             screen_width: 0,
             screen_height: 0,
+            drag_button: None,
+            last_mouse: (0.0, 0.0),
         }
     }
 
     pub fn loaded_mods(&self) -> &[FabricModMetadata] {
         &self.mods
+    }
+
+    /// Textures mods registered with `TextureManager.register`, keyed by
+    /// identifier. The host decodes and draws them; the runtime has no GPU.
+    pub fn registered_textures(&self) -> &HashMap<String, crate::minecraft::PngImage> {
+        &self.interp.heap.textures
     }
 
     pub fn with_loader(loader: ClassLoader) -> Self {
@@ -135,6 +158,8 @@ impl FabricBridge {
             screen_id: None,
             screen_width: 0,
             screen_height: 0,
+            drag_button: None,
+            last_mouse: (0.0, 0.0),
         }
     }
 
@@ -200,7 +225,7 @@ impl FabricBridge {
                 if let Ok(mut mod_json) = archive.by_name("fabric.mod.json") {
                     let mut text = String::new();
                     if std::io::Read::read_to_string(&mut mod_json, &mut text).is_ok() {
-                        self.parse_and_add_metadata(&text, false);
+                        self.parse_and_add_metadata(&text, false, Some(path), None);
                         self.parse_and_add_entrypoints(&text);
                     }
                 }
@@ -300,7 +325,12 @@ impl FabricBridge {
                                     if std::io::Read::read_to_string(&mut sub_mod_json, &mut text)
                                         .is_ok()
                                     {
-                                        self.parse_and_add_metadata(&text, true);
+                                        self.parse_and_add_metadata(
+                                            &text,
+                                            true,
+                                            Some(path),
+                                            Some(&nested_name),
+                                        );
                                         self.parse_and_add_entrypoints(&text);
                                     }
                                 }
@@ -314,7 +344,13 @@ impl FabricBridge {
         Ok(())
     }
 
-    fn parse_and_add_metadata(&mut self, json_str: &str, is_nested: bool) {
+    fn parse_and_add_metadata(
+        &mut self,
+        json_str: &str,
+        is_nested: bool,
+        jar: Option<&Path>,
+        nested_jar: Option<&str>,
+    ) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
             if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
                 let name = json
@@ -352,6 +388,9 @@ impl FabricBridge {
                     description,
                     authors,
                     is_nested,
+                    raw: json_str.to_string(),
+                    jar: jar.map(|path| path.display().to_string()),
+                    nested_jar: nested_jar.map(str::to_string),
                 };
                 if !self.mods.iter().any(|m| m.id == meta.id) {
                     self.interp.heap.register_mod(meta.clone());
@@ -967,21 +1006,8 @@ impl FabricBridge {
         pressed
     }
 
-    pub fn mouse_moved(&mut self, x: f64, y: f64) {
-        if let Some(screen) = self.current_screen() {
-            let _ = self.interp.execute_method(
-                "net/minecraft/client/gui/screens/Screen",
-                "mouseMoved",
-                "(DD)V",
-                &[screen, Value::Double(x), Value::Double(y)],
-            );
-        }
-    }
-
-    pub fn mouse_button(&mut self, x: f64, y: f64, button: i32, pressed: bool) -> bool {
-        let Some(screen) = self.current_screen() else {
-            return false;
-        };
+    /// The 26.3 `MouseButtonEvent` a screen dispatch carries.
+    fn mouse_event(&mut self, x: f64, y: f64, button: i32) -> Value {
         let info = self.interp.heap.alloc(JavaObject::Instance {
             class_name: "net/minecraft/client/input/MouseButtonInfo".into(),
             fields: [
@@ -999,21 +1025,59 @@ impl FabricBridge {
             ]
             .into(),
         });
+        Value::Object(Some(event))
+    }
+
+    pub fn mouse_moved(&mut self, x: f64, y: f64) {
+        let (dx, dy) = (x - self.last_mouse.0, y - self.last_mouse.1);
+        self.last_mouse = (x, y);
+        let Some(screen) = self.current_screen() else {
+            return;
+        };
+        if let Some(button) = self.drag_button {
+            // `MouseHandler.onMove` with an active button dispatches
+            // `mouseDragged`, not `mouseMoved`: a scrollbar thumb or slider
+            // only follows the pointer through the drag, while the wheel
+            // reaches `mouseScrolled`.
+            let event = self.mouse_event(x, y, button);
+            let _ = self.interp.execute_method(
+                "net/minecraft/client/gui/screens/Screen",
+                "mouseDragged",
+                "(Lnet/minecraft/client/input/MouseButtonEvent;DD)Z",
+                &[screen, event, Value::Double(dx), Value::Double(dy)],
+            );
+        } else {
+            let _ = self.interp.execute_method(
+                "net/minecraft/client/gui/screens/Screen",
+                "mouseMoved",
+                "(DD)V",
+                &[screen, Value::Double(x), Value::Double(y)],
+            );
+        }
+    }
+
+    pub fn mouse_button(&mut self, x: f64, y: f64, button: i32, pressed: bool) -> bool {
+        let Some(screen) = self.current_screen() else {
+            return false;
+        };
+        self.last_mouse = (x, y);
+        let event = self.mouse_event(x, y, button);
         let (method, descriptor, mut args) = if pressed {
             (
                 "mouseClicked",
                 "(Lnet/minecraft/client/input/MouseButtonEvent;Z)Z",
-                vec![screen, Value::Object(Some(event)), Value::from_bool(false)],
+                vec![screen, event, Value::from_bool(false)],
             )
         } else {
             (
                 "mouseReleased",
                 "(Lnet/minecraft/client/input/MouseButtonEvent;)Z",
-                vec![screen, Value::Object(Some(event))],
+                vec![screen, event],
             )
         };
         args.truncate(if pressed { 3 } else { 2 });
-        self.interp
+        let handled = self
+            .interp
             .execute_method(
                 "net/minecraft/client/gui/screens/Screen",
                 method,
@@ -1021,7 +1085,13 @@ impl FabricBridge {
                 &args,
             )
             .map(|v| v.as_bool())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if pressed {
+            self.drag_button = Some(button);
+        } else if self.drag_button == Some(button) {
+            self.drag_button = None;
+        }
+        handled
     }
 
     pub fn mouse_scrolled(&mut self, x: f64, y: f64, dx: f64, dy: f64) -> bool {
@@ -1102,6 +1172,7 @@ impl FabricBridge {
             );
         }
         self.screen_id = None;
+        self.drag_button = None;
     }
 
     /// Dispatches tooltip color queries to Iceberg `RenderTooltipEvents.COLOREXT` listeners.

@@ -104,10 +104,17 @@ the server applies the harvest.
 listener. Pressing that mapping through the host opens `ModsScreen`; the host initializes it
 and replays its `GuiGraphicsExtractor` display list. The list itself is real: it builds an
 `AbstractSelectionList`, filters all loaded mods and renders their names. A pinned test
-(`tests/modmenu_screen.rs`) opens the screen from the key mapping, asserts more than 100
-draws, checks that `Minecraft` and other labels are present, and closes it with Escape. A
-second test clicks the search field, types a character and checks that the list filters down
-and redraws.
+(`tests/modmenu_screen.rs`) opens the screen from the key mapping, asserts the list and its
+widgets, checks that `Minecraft`, `Java`, `Mod Menu` and the other root mods are present, and
+closes it with Escape. Two more tests drive the widgets: click the search field, type, see the
+filtered count and the typed character, press Backspace to clear it, and click Done; and
+scroll the list with both the wheel and a scrollbar drag at a height where it overflows.
+
+Fabric API's nested modules are libraries, and Mod Menu hides them by default. That depends on
+Fabric Loader's custom metadata (`fabric-api:module-lifecycle` under `custom` in
+`fabric.mod.json`) and on `ModMenuConfig.SHOW_LIBRARIES` defaulting to `WITH_CONFIG`; both are
+answered from the real mod metadata, so the list shows the root mods (11 with the pinned test
+set) rather than every Fabric API module.
 
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 
@@ -117,18 +124,21 @@ The rendering is partial, and the runtime does not claim Mod Menu is fully worki
   never calls `setHint`, and `EditBox.extractWidgetRenderState` only draws a separate `hint`
   field. Vanilla 26.3 shows no placeholder here either, so the runtime does not invent one.
   The field is still operable: clicking it focuses it and typing filters the list.
-- **Icons are placeholders.** Texture loading is a host boundary. `NativeImage.read`,
-  `DynamicTexture`, `TextureManager.register` and `Minecraft.getTextureManager` avoid the GPU,
-  so icon creation can complete and the runtime records the `modmenu:*_icon` blits. The host
-  has no mod texture bytes, so it currently paints a labelled placeholder tile instead of the
-  real icon.
-- **Scissor state is recorded but not replayed.** A scrolled list can draw rows past its
-  bounds until the host adds clipping.
+- **Mod icons are real when the jar provides them.** `ModContainer.getPath` resolves a mod's
+  icon resource inside its own jar (nested jars included), `Files.newInputStream` returns the
+  bytes, and `NativeImage.read` keeps the PNG with the image. `DynamicTexture` carries it to
+  `TextureManager.register`, where the runtime records the identifier and PNG bytes. The host
+  decodes that PNG, places it in the HUD atlas's run-time region, and draws the `blit` with it
+  (capped at 64 px per side). Mods with no readable icon, and synthetic containers with no jar
+  (Fabric Loader in the pinned set), still get a labelled placeholder tile.
 - **Description text is incomplete.** The description panel can render `null` and an empty
   component while fields it reads are still missing; names, titles, buttons, the list and
   search are the parts demonstrated by the tests.
-- **Input uses 26.3's SDL scancodes.** `KeyEvent.key` is a scancode (`Escape` is 41), not a
-  GLFW key number; the host maps winit keys to that convention before dispatching.
+- **Input uses 26.3's SDL field values.** `KeyEvent.key` is a scancode (`Escape` is 41) while
+  `KeyEvent.keycode` is the SDL keycode `EditBox`/`Screen` switch on for Tab, Backspace, Delete
+  and the arrows; `MouseButtonInfo.button` is SDL numbering (left is 1). A press makes the
+  following moves dispatch `mouseDragged`, which is how scrollbar thumbs and sliders follow the
+  pointer. The host maps winit keys and buttons to those conventions before dispatching.
 - **Only the Fabric screen host exists.** There is no general widget/layout engine; the real
   Minecraft `Screen`, `AbstractSelectionList` and widget bytecode runs, and the host replays
   the recorded calls.
@@ -150,14 +160,17 @@ frame will not be visible even though its listener runs.
 `fill`, `fillGradient`, `text`, `centeredText`, `blit`, `blitSprite`, and scissor bounds.
 `FabricBridge::render_screen(width, height, partial_tick)` runs the real
 `Screen.extractRenderStateWithTooltipAndSubtitles` and returns that list. The host
-(`Game::draw_fabric_screen`) replays fills and text through `HudBatch`; it draws a blit only
-when the HUD atlas has the sprite. `Screen::init` runs whenever the screen object or GUI size
-changes.
+(`Game::draw_fabric_screen`) replays fills, text and scissor clipping through `HudBatch`; it
+draws a blit from the HUD atlas when the sprite is packed there, or from a texture the mod
+registered (`TextureManager.register`) after decoding its PNG into the atlas's run-time region.
+`Screen::init` runs whenever the screen object or GUI size changes.
 
 Input is a host boundary too. `FabricBridge` builds real `KeyEvent`, `CharacterEvent` and
 `MouseButtonEvent` objects (with their 26.3 field layouts) and dispatches to the screen's
-`keyPressed`/`charTyped`/`mouseClicked`/`mouseReleased`/`mouseScrolled`/`mouseMoved`.
-`Minecraft` and `Gui.setScreen` keep the installed screen where mods read it back.
+`keyPressed`/`charTyped`/`mouseClicked`/`mouseReleased`/`mouseScrolled`/`mouseMoved`/
+`mouseDragged`. A held button turns movement into `mouseDragged`, as 26.3's `MouseHandler`
+does, so a scrollbar thumb or slider follows the pointer. `Minecraft` and `Gui.setScreen` keep
+the installed screen where mods read it back.
 
 Key mappings are registered by `KeyMappingHelper.registerKeyMapping` and stored in the
 runtime's mapping registry. `FabricBridge::press_key_mapping(name)` triggers one by its

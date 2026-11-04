@@ -47,6 +47,47 @@ pub struct GuiGraphics {
     pub draws: Vec<GuiDraw>,
 }
 
+/// A PNG a mod read through `NativeImage.read`. The runtime never decodes or
+/// uploads it: the host decodes these bytes when it replays the blits of the
+/// texture the mod registered, so a mod's own icon can be drawn for real.
+#[derive(Debug, Clone)]
+pub struct PngImage {
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+}
+
+impl NativeObject for PngImage {
+    fn class_name(&self) -> &str {
+        "com/mojang/blaze3d/platform/NativeImage"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// The bytes behind `Files.newInputStream` for a path inside a mod jar.
+#[derive(Debug, Clone)]
+pub struct ByteStream {
+    pub data: Vec<u8>,
+    pub pos: usize,
+}
+
+impl NativeObject for ByteStream {
+    fn class_name(&self) -> &str {
+        "java/io/ByteArrayInputStream"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 impl GuiGraphics {
     pub fn new(width: i32, height: i32) -> Self {
         Self {

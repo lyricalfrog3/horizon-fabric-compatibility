@@ -325,6 +325,76 @@ impl Interpreter {
             }
         }
 
+        // Optional combinators run a modifier's own lambda. A heap builtin
+        // cannot call back into the interpreter, so `filter`, `map` and
+        // `ifPresent` are handled here. ContainerEventHandler.mouseScrolled
+        // routes the wheel through Optional.filter: without this the Fabric
+        // selection lists never scroll.
+        if class_name == "java/util/Optional" && !args.is_empty() {
+            let value = args[0].as_obj().and_then(|id| match self.heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => fields.get("value").cloned(),
+                _ => None,
+            });
+            let value = value.filter(|value| !value.is_null());
+            let empty = |heap: &mut Heap| {
+                Value::Object(Some(heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Optional".into(),
+                    fields: HashMap::new(),
+                })))
+            };
+            match method_name {
+                "filter" if args.len() >= 2 => {
+                    let Some(value) = value else {
+                        return Ok(empty(&mut self.heap));
+                    };
+                    let keep = self
+                        .execute_method(
+                            "java/util/function/Predicate",
+                            "test",
+                            "(Ljava/lang/Object;)Z",
+                            &[args[1].clone(), value],
+                        )?
+                        .as_bool();
+                    if keep {
+                        return Ok(args[0].clone());
+                    }
+                    return Ok(empty(&mut self.heap));
+                }
+                "map" if args.len() >= 2 => {
+                    let Some(value) = value else {
+                        return Ok(empty(&mut self.heap));
+                    };
+                    let mapped = self.execute_method(
+                        "java/util/function/Function",
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[args[1].clone(), value],
+                    )?;
+                    if mapped.is_null() {
+                        return Ok(empty(&mut self.heap));
+                    }
+                    let mut fields = HashMap::new();
+                    fields.insert("value".into(), mapped);
+                    return Ok(Value::Object(Some(self.heap.alloc(JavaObject::Instance {
+                        class_name: "java/util/Optional".into(),
+                        fields,
+                    }))));
+                }
+                "ifPresent" if args.len() >= 2 => {
+                    if let Some(value) = value {
+                        self.execute_method(
+                            "java/util/function/Consumer",
+                            "accept",
+                            "(Ljava/lang/Object;)V",
+                            &[args[1].clone(), value],
+                        )?;
+                    }
+                    return Ok(Value::NULL);
+                }
+                _ => {}
+            }
+        }
+
         // Handle forEach on collections (List, Set, Array)
         if method_name == "forEach" && args.len() >= 2 {
             let target_obj = args[0].as_obj();

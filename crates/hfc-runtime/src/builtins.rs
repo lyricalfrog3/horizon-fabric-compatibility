@@ -74,8 +74,62 @@ fn text_of_value(heap: &Heap, val: &Value) -> String {
                 }
             }
         }
+        if let Some(JavaObject::Lambda {
+            interface_class,
+            captured,
+            ..
+        }) = heap.get(id)
+        {
+            // `FormattedCharSequence` is a functional interface: anything built
+            // by its factories is a lambda that captures the text it will hand
+            // to a sink. The runtime never calls the sink (the host draws the
+            // string), so read the captured text back instead of losing it.
+            if interface_class == "net/minecraft/util/FormattedCharSequence" {
+                return captured
+                    .iter()
+                    .map(|value| text_of_value(heap, value))
+                    .collect();
+            }
+        }
     }
     value_to_string(heap, val)
+}
+
+/// A `FormattedCharSequence` carrying `text`. The runtime never feeds a
+/// `FormattedCharSink`, so this shared representation is what the host reads
+/// back; the real interface's lambdas cannot be inspected for their text.
+fn alloc_formatted_char_sequence(heap: &mut Heap, text: String) -> Value {
+    let sid = heap.alloc_string(text);
+    let mut fields = HashMap::new();
+    fields.insert("text".into(), Value::Object(Some(sid)));
+    let id = heap.alloc(JavaObject::Instance {
+        class_name: "net/minecraft/util/FormattedCharSequence".into(),
+        fields,
+    });
+    Value::Object(Some(id))
+}
+
+/// The text a formatted sequence or a composite of them displays. `composite`
+/// and `fromList` take a list or an array of sequences, which `text_of_value`
+/// alone would stringify as an opaque object.
+fn formatted_text_of_value(heap: &Heap, val: &Value) -> String {
+    if let Some(id) = val.as_obj() {
+        match heap.get(id) {
+            Some(JavaObject::List(items))
+            | Some(JavaObject::Set(items))
+            | Some(JavaObject::Stream(items)) => {
+                return items.iter().map(|item| text_of_value(heap, item)).collect();
+            }
+            Some(JavaObject::Array { elements, .. }) => {
+                return elements
+                    .iter()
+                    .map(|item| text_of_value(heap, item))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    text_of_value(heap, val)
 }
 
 /// Font width in GUI pixels. The runtime has no glyph atlas, so text layout
@@ -136,6 +190,61 @@ fn identifier_argument(heap: &Heap, args: &[Value], from: usize) -> String {
         }
     }
     String::new()
+}
+
+/// The size in a PNG's IHDR chunk. `NativeImage.read` only needs the header;
+/// the host decodes the pixels when it draws the registered texture.
+fn png_size(data: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() >= 24 && &data[..8] == SIGNATURE {
+        let width = u32::from_be_bytes(data[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(data[20..24].try_into().ok()?);
+        if width > 0 && height > 0 {
+            return Some((width, height));
+        }
+    }
+    None
+}
+
+/// Read one entry out of a zip archive.
+fn read_zip_entry<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut resource = archive.by_name(name).ok()?;
+    let mut bytes = Vec::new();
+    resource.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Read one resource out of a mod jar (or a nested jar inside it). This is
+/// what `Files.newInputStream` needs for `ModContainer.getPath`: the mod's own
+/// `NativeImage.read` then runs on the real bytes.
+fn read_mod_resource(jar: &str, nested: Option<&str>, entry: &str) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(jar).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    match nested {
+        None => read_zip_entry(&mut archive, entry),
+        Some(nested) => {
+            let nested_bytes = read_zip_entry(&mut archive, nested)?;
+            let mut inner = zip::ZipArchive::new(std::io::Cursor::new(nested_bytes)).ok()?;
+            read_zip_entry(&mut inner, entry)
+        }
+    }
+}
+
+/// The raw `fabric.mod.json` behind a `ModMetadata` object.
+fn metadata_raw<'a>(heap: &'a Heap, value: &Value) -> Option<&'a str> {
+    let id = value.as_obj()?;
+    let JavaObject::Instance { fields, .. } = heap.get(id)? else {
+        return None;
+    };
+    let mod_id = fields.get("id")?.as_obj()?;
+    let mod_id = heap.get_string(mod_id)?;
+    heap.loaded_mods
+        .get(mod_id)
+        .map(|metadata| metadata.raw.as_str())
 }
 
 pub(crate) fn value_to_string(heap: &Heap, val: &Value) -> String {
@@ -302,14 +411,39 @@ pub fn dispatch_builtin(
         } else {
             text_of_value(heap, &args[0])
         };
-        let sid = heap.alloc_string(text);
-        let mut fields = HashMap::new();
-        fields.insert("text".into(), Value::Object(Some(sid)));
-        let id = heap.alloc(JavaObject::Instance {
-            class_name: "net/minecraft/util/FormattedCharSequence".into(),
-            fields,
-        });
-        return BuiltinResult::Handled(Value::Object(Some(id)));
+        return BuiltinResult::Handled(alloc_formatted_char_sequence(heap, text));
+    }
+
+    // `FormattedCharSequence` is a functional interface in 26.3: its factories
+    // (`forward`, `backward`, `codepoint`, `composite`, `fromPair`, `fromList`)
+    // build lambdas that capture the text. `EditBox` renders its value through
+    // `forward`, so a lambda there would draw as an empty string and the typed
+    // characters would stay invisible. Answer the factories with the runtime's
+    // text-carrying sequence instead of executing them.
+    if class_name == "net/minecraft/util/FormattedCharSequence" {
+        let text = match method_name {
+            "forward" | "backward" => {
+                let mut text = formatted_text_of_value(heap, args.first().unwrap_or(&Value::NULL));
+                if method_name == "backward" {
+                    text = text.chars().rev().collect();
+                }
+                Some(text)
+            }
+            "codepoint" => Some(
+                char::from_u32(args.first().map(Value::as_int).unwrap_or(0) as u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            "composite" | "fromPair" | "fromList" => Some(
+                args.iter()
+                    .map(|value| formatted_text_of_value(heap, value))
+                    .collect::<String>(),
+            ),
+            _ => None,
+        };
+        if let Some(text) = text {
+            return BuiltinResult::Handled(alloc_formatted_char_sequence(heap, text));
+        }
     }
 
     // -------------------------------------------------------------
@@ -2147,6 +2281,36 @@ pub fn dispatch_builtin(
                 fields: HashMap::new(),
             });
             return BuiltinResult::Handled(Value::Object(Some(rid)));
+        } else if method_name == "newInputStream" && !args.is_empty() {
+            // `ModContainer.getPath` returns a path carrying the mod jar and
+            // the entry; the bytes are the mod's own resource, so its
+            // `NativeImage.read` sees the real PNG instead of a placeholder.
+            let mut bytes = None;
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    let field = |name: &str| {
+                        fields
+                            .get(name)
+                            .and_then(|value| value.as_obj())
+                            .and_then(|id| heap.get_string(id))
+                            .map(str::to_string)
+                    };
+                    if let (Some(jar), Some(entry)) = (field("jar"), field("entry")) {
+                        bytes = read_mod_resource(&jar, field("nested").as_deref(), &entry);
+                    }
+                }
+            }
+            let stream = heap.alloc_native(ByteStream {
+                data: bytes.unwrap_or_default(),
+                pos: 0,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(stream)));
+        }
+    }
+
+    if class_name == "java/io/InputStream" || class_name == "java/io/ByteArrayInputStream" {
+        if method_name == "close" {
+            return BuiltinResult::Handled(Value::NULL);
         }
     }
 
@@ -2593,6 +2757,51 @@ pub fn dispatch_builtin(
                     }
                 }
             }
+        } else if method_name == "getPath" && args.len() >= 2 {
+            // `ModContainer.getPath("assets/<id>/icon.png")` is how a mod (and
+            // Mod Menu for it) reads its own icon. Carry the jar and entry in
+            // the path object; `Files.newInputStream` opens it.
+            let entry = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let mod_id = args[0]
+                .as_obj()
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get("metadata"),
+                    _ => None,
+                })
+                .and_then(|metadata| metadata.as_obj())
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get("id"),
+                    _ => None,
+                })
+                .and_then(|id| id.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .map(str::to_string)
+                .unwrap_or_default();
+            let (jar, nested) = heap
+                .loaded_mods
+                .get(&mod_id)
+                .map(|meta| (meta.jar.clone(), meta.nested_jar.clone()))
+                .unwrap_or((None, None));
+            let mut fields = HashMap::new();
+            if let Some(jar) = jar {
+                let sid = heap.alloc_string(jar);
+                fields.insert("jar".into(), Value::Object(Some(sid)));
+            }
+            if let Some(nested) = nested {
+                let sid = heap.alloc_string(nested);
+                fields.insert("nested".into(), Value::Object(Some(sid)));
+            }
+            let eid = heap.alloc_string(entry);
+            fields.insert("entry".into(), Value::Object(Some(eid)));
+            let pid = heap.alloc(JavaObject::Instance {
+                class_name: "java/nio/file/Path".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(pid)));
         } else if method_name == "getContainingMod" {
             let opt_id = heap.alloc(JavaObject::Instance {
                 class_name: "java/util/Optional".into(),
@@ -2663,13 +2872,65 @@ pub fn dispatch_builtin(
             let lid = heap.alloc_list(Vec::new());
             return BuiltinResult::Handled(Value::Object(Some(lid)));
         } else if method_name == "containsCustomValue" {
-            return BuiltinResult::Handled(Value::from_bool(false));
+            // Fabric Loader keeps unknown top-level `fabric.mod.json` keys as
+            // custom values. Mod Menu reads `fabric-api:module-lifecycle`
+            // here, which is what marks every Fabric API module as a library
+            // (and gives it a parent), so answering false leaves dozens of
+            // modules in the mod list.
+            let key = args
+                .get(1)
+                .and_then(|value| value.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let found = metadata_raw(heap, &args[0])
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .map(|json| {
+                    // Fabric Loader keeps custom values under `"custom"`, not
+                    // at the top level (`"custom": {"modmenu": ...}`).
+                    json.get("custom")
+                        .and_then(|custom| custom.get(key))
+                        .is_some()
+                })
+                .unwrap_or(false);
+            return BuiltinResult::Handled(Value::from_bool(found));
         } else if method_name == "getCustomValue" {
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "getIconPath" {
+            // `fabric.mod.json`'s `icon` is a path or a size -> path map. Read
+            // it so a mod's own declared icon is used, not just the default
+            // `assets/<id>/icon.png` fallback.
+            let size = args.get(1).map(Value::as_int).unwrap_or(0).max(0);
+            let path = metadata_raw(heap, &args[0])
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|json| {
+                    let icon = json.get("icon")?;
+                    if let Some(path) = icon.as_str() {
+                        return Some(path.to_string());
+                    }
+                    let icons = icon.as_object()?;
+                    let mut sizes: Vec<(i32, &str)> = icons
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            Some((key.parse::<i32>().ok()?, value.as_str()?))
+                        })
+                        .collect();
+                    sizes.sort_by_key(|(side, _)| *side);
+                    // Fabric Loader's `MapEntry`: the first side covering the
+                    // requested size, else the largest one.
+                    sizes
+                        .iter()
+                        .find(|(side, _)| *side >= size)
+                        .or_else(|| sizes.last())
+                        .map(|(_, path)| (*path).to_string())
+                });
+            let mut fields = HashMap::new();
+            if let Some(path) = path {
+                let sid = heap.alloc_string(path);
+                fields.insert("value".into(), Value::Object(Some(sid)));
+            }
             let opt_id = heap.alloc(JavaObject::Instance {
                 class_name: "java/util/Optional".into(),
-                fields: HashMap::new(),
+                fields,
             });
             return BuiltinResult::Handled(Value::Object(Some(opt_id)));
         } else if method_name == "getEnvironment" {
@@ -3027,23 +3288,45 @@ pub fn dispatch_builtin(
         }
     }
 
-    // Texture loading is a host boundary: the runtime has no GPU and no glyph
-    // atlas, so decoded images are placeholders and registered textures are
-    // never uploaded. The host draws the display list itself.
+    // Texture loading is a host boundary: the runtime never touches the GPU.
+    // The PNG bytes a mod reads are kept with the `NativeImage` and carried
+    // through `DynamicTexture` to `TextureManager.register`, where the host
+    // can pick them up and draw the texture itself.
     if class_name == "com/mojang/blaze3d/platform/NativeImage" {
         if method_name == "read" {
-            let id = heap.alloc(JavaObject::Instance {
-                class_name: "com/mojang/blaze3d/platform/NativeImage".into(),
-                fields: [
-                    ("width".to_string(), Value::Int(64)),
-                    ("height".to_string(), Value::Int(64)),
-                ]
-                .into(),
+            let data = args
+                .first()
+                .and_then(|value| value.as_obj())
+                .and_then(|id| heap.get_native::<ByteStream>(id))
+                .map(|stream| stream.data.clone())
+                .unwrap_or_default();
+            let (width, height) = png_size(&data).unwrap_or((64, 64));
+            let id = heap.alloc_native(PngImage {
+                width,
+                height,
+                png: data,
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
-        } else if method_name == "getWidth" {
-            return BuiltinResult::Handled(Value::Int(64));
-        } else if method_name == "getHeight" {
+        } else if method_name == "getWidth" || method_name == "getHeight" {
+            if let Some(id) = args.first().and_then(|value| value.as_obj()) {
+                if let Some(image) = heap.get_native::<PngImage>(id) {
+                    return BuiltinResult::Handled(Value::Int(if method_name == "getWidth" {
+                        image.width as i32
+                    } else {
+                        image.height as i32
+                    }));
+                }
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
+                    let key = if method_name == "getWidth" {
+                        "width"
+                    } else {
+                        "height"
+                    };
+                    return BuiltinResult::Handled(Value::Int(
+                        fields.get(key).map(|value| value.as_int()).unwrap_or(64),
+                    ));
+                }
+            }
             return BuiltinResult::Handled(Value::Int(64));
         }
     }
@@ -3051,12 +3334,33 @@ pub fn dispatch_builtin(
     if class_name == "net/minecraft/client/renderer/texture/DynamicTexture"
         && method_name == "<init>"
     {
+        if let Some(this) = args.first().and_then(|value| value.as_obj()) {
+            if let Some(image) = args.get(2).cloned() {
+                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this) {
+                    fields.insert("image".into(), image);
+                }
+            }
+        }
         return BuiltinResult::Handled(Value::NULL);
     }
 
     if class_name == "net/minecraft/client/renderer/texture/TextureManager"
         && method_name == "register"
+        && args.len() >= 3
     {
+        let texture = identifier_of(heap, &args[1]);
+        let image = args[2]
+            .as_obj()
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => fields.get("image"),
+                _ => None,
+            })
+            .and_then(|value| value.as_obj())
+            .and_then(|id| heap.get_native::<PngImage>(id))
+            .cloned();
+        if let (false, Some(image)) = (texture.is_empty(), image) {
+            heap.textures.insert(texture, image);
+        }
         return BuiltinResult::Handled(Value::NULL);
     }
 
@@ -3278,6 +3582,17 @@ pub fn dispatch_builtin(
             let lines = (text_width(&text) + max - 1) / max;
             return BuiltinResult::Handled(Value::Int(lines.max(1) * 9));
         }
+    }
+
+    // A widget's click sound is a host boundary: the runtime has no audio and
+    // the host does not replay mod sounds. Running the real path resolves
+    // `SoundEvents.UI_BUTTON_CLICK`, which initializes Minecraft's whole sound
+    // registry just to drop the sound (measured at ~30 s on a click), so the
+    // widget hook is a no-op.
+    if class_name == "net/minecraft/client/gui/components/AbstractWidget"
+        && (method_name == "playDownSound" || method_name == "playButtonClickSound")
+    {
+        return BuiltinResult::Handled(Value::NULL);
     }
 
     // Widgets draw their labels through an `ActiveTextCollector` returned by

@@ -15,6 +15,9 @@ pub struct Heap {
     /// A JVM keeps these in the class's static fields; the runtime keeps them
     /// here so builtins can share one without an interpreter borrow.
     singletons: HashMap<String, usize>,
+    /// Textures mods registered with `TextureManager.register`, by identifier.
+    /// The host draws them from the PNG bytes; the runtime never uploads.
+    pub textures: HashMap<String, crate::minecraft::PngImage>,
 }
 
 impl Heap {
@@ -26,6 +29,7 @@ impl Heap {
             loaded_mods: HashMap::new(),
             translations: HashMap::new(),
             singletons: HashMap::new(),
+            textures: HashMap::new(),
         }
     }
 

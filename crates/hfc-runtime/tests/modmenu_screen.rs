@@ -180,7 +180,7 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
         .expect("screen render failed")
         .expect("no screen to render");
     assert!(
-        draws.len() > 100,
+        draws.len() > 60,
         "expected the mod list and its widgets, got {} draws",
         draws.len()
     );
@@ -235,6 +235,20 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
         blits.iter().any(|texture| texture.starts_with("modmenu:")),
         "no mod icon cell recorded a texture: {blits:?}"
     );
+    let icon = bridge
+        .registered_textures()
+        .get("modmenu:modmenu_icon")
+        .expect("the mod's own icon was not registered with its PNG bytes");
+    assert!(
+        icon.png.starts_with(b"\x89PNG"),
+        "the registered icon does not carry the mod's PNG bytes"
+    );
+    assert!(
+        icon.width > 0 && icon.height > 0,
+        "the icon has no size: {}x{}",
+        icon.width,
+        icon.height
+    );
 
     // 26.3's `KeyEvent.key` is an SDL scancode: Escape is 41 (`InputWithModifiers::isEscape`).
     assert!(bridge.key_event(41, 0, 0, true), "Escape was not handled");
@@ -242,6 +256,62 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
         bridge.current_screen().is_none(),
         "Escape did not close the mod screen"
     );
+}
+
+#[test]
+fn the_mod_list_scrolls_with_the_wheel_and_the_scrollbar() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+    assert!(
+        bridge.press_key_mapping("key.modmenu.open_menu"),
+        "the mod's registered key mapping was not found"
+    );
+    let texts_at = |bridge: &mut FabricBridge| -> Vec<String> {
+        text_draws(
+            &bridge
+                .render_screen(1280, 200, 0.0)
+                .expect("screen render failed")
+                .expect("no screen to render"),
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    };
+    // The root mods at 36 px are taller than the list's ~97 px at this height,
+    // so the wheel and the scrollbar have somewhere to go.
+    let top = texts_at(&mut bridge);
+    assert!(
+        bridge.mouse_scrolled(300.0, 100.0, 0.0, -10.0),
+        "the wheel was not handled"
+    );
+    let wheeled = texts_at(&mut bridge);
+    assert_ne!(top, wheeled, "the wheel did not move the list");
+
+    assert!(
+        bridge.mouse_scrolled(300.0, 100.0, 0.0, 1000.0),
+        "the wheel was not handled"
+    );
+    assert_eq!(
+        texts_at(&mut bridge),
+        top,
+        "the wheel did not return the list to the top"
+    );
+
+    // `ModListWidget.scrollBarX` is `width - 6`; press on it and drag down.
+    assert!(
+        bridge.mouse_button(629.0, 80.0, 1, true),
+        "the scrollbar press was not handled"
+    );
+    bridge.mouse_moved(629.0, 260.0);
+    // `AbstractContainerWidget.mouseReleased` returns its container default's
+    // result (false when no child is focused), so the release's own return
+    // value is not meaningful; the list moving is.
+    bridge.mouse_button(629.0, 260.0, 1, false);
+    let dragged = texts_at(&mut bridge);
+    assert_ne!(top, dragged, "dragging the scrollbar did not move the list");
 }
 
 #[test]
@@ -273,14 +343,28 @@ fn the_mod_list_search_box_accepts_focus_and_filters_the_list() {
         !before_texts.iter().any(|text| *text == "Search for mods"),
         "a search hint appeared even though Mod Menu never calls setHint: {before_texts:?}"
     );
+    assert!(
+        !before_texts
+            .iter()
+            .any(|text| text.starts_with("Fabric API Lookup API")),
+        "a Fabric API library module was listed as a root mod: {before_texts:?}"
+    );
+    // ContainerEventHandler.mouseScrolled routes the wheel through
+    // Optional.filter; the list must accept it even when its content fits.
+    assert!(
+        bridge.mouse_scrolled(300.0, 300.0, 0.0, -3.0),
+        "the mod list did not accept a scroll"
+    );
 
     let (x, y, width, height) =
         search_box_rect(&bridge, &screen).expect("the screen has no search field");
     let cx = f64::from(x) + f64::from(width) / 2.0;
     let cy = f64::from(y) + f64::from(height) / 2.0;
 
+    // 26.3's `MouseButtonInfo` carries SDL button numbers: left is 1, not
+    // GLFW's 0. `AbstractWidget.isValidClickButton` accepts exactly 1.
     assert!(
-        bridge.mouse_button(cx, cy, 0, true),
+        bridge.mouse_button(cx, cy, 1, true),
         "clicking the search field was not handled"
     );
     assert!(
@@ -311,5 +395,47 @@ fn the_mod_list_search_box_accepts_focus_and_filters_the_list() {
         "the filtered list should draw fewer entries: {} -> {}",
         before_texts.len(),
         after_texts.len()
+    );
+    assert!(
+        after_texts.contains(&"z"),
+        "the typed character was not drawn in the search field: {after_texts:?}"
+    );
+
+    // `EditBox.keyPressed` reads Backspace through `KeyEvent.shortcutKey()`,
+    // which is the SDL keycode (Backspace is 8), not the scancode in `key`.
+    assert!(
+        bridge.key_event(42, 8, 0, true),
+        "Backspace was not handled by the search field"
+    );
+
+    let cleared = bridge
+        .render_screen(1280, 720, 0.0)
+        .expect("screen render failed")
+        .expect("no screen to render");
+    let cleared_texts = text_draws(&cleared);
+    let cleared_showing = cleared_texts
+        .iter()
+        .find(|text| text.starts_with("Showing "))
+        .expect("the cleared mod count was not rendered")
+        .to_string();
+    assert_eq!(
+        cleared_showing, before_showing,
+        "Backspace did not clear the search box and restore the list"
+    );
+    assert!(
+        !cleared_texts.contains(&"z"),
+        "the deleted character is still drawn: {cleared_texts:?}"
+    );
+
+    // The Done button is a real widget: a click on it must reach the widget
+    // and call its press handler, not just the screen's default handler. At
+    // 1280x720 it sits at (644, 692) with size 150x20.
+    assert!(
+        bridge.mouse_button(719.0, 702.0, 1, true),
+        "clicking the Done button was not handled"
+    );
+    assert!(
+        bridge.current_screen().is_none(),
+        "the Done button did not close the mod screen"
     );
 }

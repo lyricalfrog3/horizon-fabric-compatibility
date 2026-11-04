@@ -315,6 +315,112 @@ fn byte_stream_method(
     Some(BuiltinResult::Handled(value))
 }
 
+/// A `CustomValue` over one JSON value of a `fabric.mod.json` `custom` entry:
+/// an instance keeping the value's JSON text.
+fn custom_value(heap: &mut Heap, json: &serde_json::Value) -> Value {
+    let text = heap.alloc_string(json.to_string());
+    let mut fields = HashMap::new();
+    fields.insert("json".to_string(), Value::Object(Some(text)));
+    let id = heap.alloc(JavaObject::Instance {
+        class_name: "net/fabricmc/loader/api/metadata/CustomValue".into(),
+        fields,
+    });
+    Value::Object(Some(id))
+}
+
+/// `CustomValue`, `CvObject` and `CvArray` accessors, answered from the JSON the
+/// value was wrapped from. Mods (Mod Menu among them) read their own and other
+/// mods' `custom` data through these.
+fn custom_value_method(
+    heap: &mut Heap,
+    method_name: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    let this = args.first()?.as_obj()?;
+    let json: serde_json::Value = match heap.get(this)? {
+        JavaObject::Instance { fields, .. } => {
+            let text = fields.get("json")?.as_obj()?;
+            serde_json::from_str(heap.get_string(text)?).ok()?
+        }
+        _ => return None,
+    };
+    let string_arg = |heap: &Heap, index: usize| {
+        args.get(index)
+            .and_then(|value| value.as_obj())
+            .and_then(|id| heap.get_string(id))
+            .map(str::to_string)
+    };
+    let value = match method_name {
+        "getAsString" => {
+            let text = match &json {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            Value::Object(Some(heap.alloc_string(text)))
+        }
+        "getAsBoolean" => Value::from_bool(json.as_bool().unwrap_or(false)),
+        "getAsObject" | "getAsArray" => args[0].clone(),
+        "containsKey" => {
+            let key = string_arg(heap, 1)?;
+            Value::from_bool(json.get(&key).is_some())
+        }
+        "get" => match &json {
+            serde_json::Value::Object(map) => {
+                let key = string_arg(heap, 1)?;
+                match map.get(&key) {
+                    Some(inner) => custom_value(heap, inner),
+                    None => Value::NULL,
+                }
+            }
+            serde_json::Value::Array(items) => {
+                match items.get(args.get(1)?.as_int().max(0) as usize) {
+                    Some(inner) => custom_value(heap, inner),
+                    None => Value::NULL,
+                }
+            }
+            _ => return None,
+        },
+        "size" => Value::Int(match &json {
+            serde_json::Value::Object(map) => map.len(),
+            serde_json::Value::Array(items) => items.len(),
+            _ => 0,
+        } as i32),
+        "isEmpty" => Value::from_bool(match &json {
+            serde_json::Value::Object(map) => map.is_empty(),
+            serde_json::Value::Array(items) => items.is_empty(),
+            _ => true,
+        }),
+        "iterator" => {
+            let mut items = Vec::new();
+            match &json {
+                serde_json::Value::Object(map) => {
+                    for (key, inner) in map {
+                        let key = Value::Object(Some(heap.alloc_string(key.clone())));
+                        let inner = custom_value(heap, inner);
+                        let mut fields = HashMap::new();
+                        fields.insert("key".to_string(), key);
+                        fields.insert("value".to_string(), inner);
+                        let entry = heap.alloc(JavaObject::Instance {
+                            class_name: "java/util/Map$Entry".into(),
+                            fields,
+                        });
+                        items.push(Value::Object(Some(entry)));
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for inner in values {
+                        items.push(custom_value(heap, inner));
+                    }
+                }
+                _ => {}
+            }
+            Value::Object(Some(heap.alloc_iterator(items)))
+        }
+        _ => return None,
+    };
+    Some(BuiltinResult::Handled(value))
+}
+
 /// A `net.fabricmc.loader.api.ModContainer` for a loaded mod (or the built-in
 /// `minecraft` / `fabricloader`), carrying the metadata the mod declared.
 fn fabric_mod_container(heap: &mut Heap, mod_id: &str) -> usize {
@@ -3065,6 +3171,12 @@ pub fn dispatch_builtin(
         }
     }
 
+    if class_name.starts_with("net/fabricmc/loader/api/metadata/CustomValue") {
+        if let Some(result) = custom_value_method(heap, method_name, args) {
+            return result;
+        }
+    }
+
     if class_name == "net/fabricmc/loader/api/metadata/ModMetadata" {
         if method_name == "getId" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -3142,7 +3254,20 @@ pub fn dispatch_builtin(
                 .unwrap_or(false);
             return BuiltinResult::Handled(Value::from_bool(found));
         } else if method_name == "getCustomValue" {
-            return BuiltinResult::Handled(Value::NULL);
+            // `custom` entries of fabric.mod.json, wrapped for CustomValue.
+            let key = args
+                .get(1)
+                .and_then(|value| value.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let found = metadata_raw(heap, &args[0])
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|json| json.get("custom")?.get(&key).cloned());
+            return BuiltinResult::Handled(match found {
+                Some(json) => custom_value(heap, &json),
+                None => Value::NULL,
+            });
         } else if method_name == "getIconPath" {
             // `fabric.mod.json`'s `icon` is a path or a size -> path map. Read
             // it so a mod's own declared icon is used, not just the default

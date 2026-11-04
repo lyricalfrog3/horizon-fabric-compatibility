@@ -81,3 +81,74 @@ fn a_jar_in_jar_mod_reports_the_mod_that_ships_it() {
     );
     assert_eq!(containing(&mut bridge, &parent.id), None);
 }
+
+/// Mods read other mods' `custom` data through `CustomValue`; the answer comes
+/// from the declaring `fabric.mod.json`.
+#[test]
+fn custom_values_are_read_from_the_mods_json() {
+    let mut bridge = FabricBridge::new();
+    bridge
+        .load_mod_jar(root().join("test-mods/fabric-api-0.165.0+26.3.jar"))
+        .expect("load fabric api");
+    let child = bridge
+        .loaded_mods()
+        .iter()
+        .find(|meta| meta.raw.contains("fabric-api:module-lifecycle"))
+        .expect("a fabric api module declares its lifecycle")
+        .id
+        .clone();
+    let id = Value::Object(Some(bridge.interp.heap.alloc_string(&child)));
+    let container = bridge
+        .interp
+        .execute_method(
+            "net/fabricmc/loader/api/FabricLoader",
+            "getModContainer",
+            "(Ljava/lang/String;)Ljava/util/Optional;",
+            &[Value::NULL, id],
+        )
+        .unwrap();
+    let container = match bridge.interp.heap.get(container.as_obj().unwrap()) {
+        Some(JavaObject::Instance { fields, .. }) => fields["value"].clone(),
+        other => panic!("{other:?}"),
+    };
+    let metadata = bridge
+        .interp
+        .execute_method(
+            "net/fabricmc/loader/api/ModContainer",
+            "getMetadata",
+            "()Lnet/fabricmc/loader/api/metadata/ModMetadata;",
+            &[container],
+        )
+        .unwrap();
+    let key = Value::Object(Some(
+        bridge
+            .interp
+            .heap
+            .alloc_string("fabric-api:module-lifecycle"),
+    ));
+    let custom = bridge
+        .interp
+        .execute_method(
+            "net/fabricmc/loader/api/metadata/ModMetadata",
+            "getCustomValue",
+            "(Ljava/lang/String;)Lnet/fabricmc/loader/api/metadata/CustomValue;",
+            &[metadata, key],
+        )
+        .unwrap();
+    assert!(!custom.is_null(), "the declared custom value is found");
+    let text = bridge
+        .interp
+        .execute_method(
+            "net/fabricmc/loader/api/metadata/CustomValue",
+            "getAsString",
+            "()Ljava/lang/String;",
+            &[custom],
+        )
+        .unwrap();
+    let text = bridge
+        .interp
+        .heap
+        .get_string(text.as_obj().unwrap())
+        .unwrap();
+    assert!(!text.is_empty());
+}

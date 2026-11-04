@@ -476,7 +476,13 @@ impl Interpreter {
             return Ok(args[1].clone());
         }
 
-        // If this invocation is on a Lambda object, unpack and delegate to the lambda target
+        // If this invocation is on a Lambda object, unpack and delegate to the lambda
+        // target. KNOWN BUG: this also fires for a static method that merely takes a
+        // lambda as its first argument (`Intrinsics.checkNotNullParameter`,
+        // `Bootstrap.checkBootstrapCalled`), running the lambda by mistake. Gating it
+        // on `is_static_method` is right, but the client then executes the real
+        // bootstrap check that this mistake was skipping (the slow registry rebuild),
+        // so the gate needs the bootstrap boundary first.
         if let Some(first_arg) = args.first() {
             if let Some(this_id) = first_arg.as_obj() {
                 if !matches!(method_name, "getClass" | "toString" | "hashCode" | "equals") {

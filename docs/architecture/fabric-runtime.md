@@ -150,6 +150,13 @@ Jankson and `Path.getParent` are unresolved and return defaults, so every mod ru
 defaults. Unresolved calls returning defaults is also why a test can pass without a feature
 working; check `Interpreter::missing` (set `trace_missing`) before claiming a path runs.
 
+Known gaps found by running Veinminer (Kotlin) against the real classpath: the interpreter has
+no Java exceptions (`athrow` ends the method, an out-of-range array read yields null), so a null
+that would throw in a JVM instead loops or flows on; it has no real threads or atomic field
+updaters, so Kotlin coroutine dispatchers do not run; and a static call whose first argument is a
+lambda runs that lambda (see the comment in `execute_method_inner`). Veinminer's `onInitialize`
+therefore still exhausts its budget.
+
 The rendering is partial, and the runtime does not claim Mod Menu is fully working:
 
 - **There is no search placeholder because the mod never sets one.** Mod Menu 21.0.0 passes

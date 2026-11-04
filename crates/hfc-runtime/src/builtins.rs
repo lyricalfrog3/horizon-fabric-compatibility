@@ -218,6 +218,169 @@ fn read_zip_entry<R: std::io::Read + std::io::Seek>(
     Some(bytes)
 }
 
+/// The `InputStream` methods of a [`ByteStream`] (the bytes behind
+/// `Files.newInputStream` and similar). Without them a JDK reader loops on the
+/// abstract `read()`, which never reports the end of the stream.
+fn byte_stream_method(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    if !class_name.starts_with("java/io/") {
+        return None;
+    }
+    let id = args.first()?.as_obj()?;
+    heap.get_native::<ByteStream>(id)?;
+    let remaining = |heap: &Heap| {
+        heap.get_native::<ByteStream>(id)
+            .map(|s| s.data.len().saturating_sub(s.pos))
+            .unwrap_or(0)
+    };
+    let value = match method_name {
+        "read" if args.len() == 1 => {
+            let stream = heap.get_native_mut::<ByteStream>(id)?;
+            match stream.data.get(stream.pos).copied() {
+                Some(byte) => {
+                    stream.pos += 1;
+                    Value::Int(byte as i32)
+                }
+                None => Value::Int(-1),
+            }
+        }
+        "read" | "readNBytes" if args.len() >= 2 => {
+            let target = args[1].as_obj()?;
+            let (offset, wanted) = if args.len() >= 4 {
+                (
+                    args[2].as_int().max(0) as usize,
+                    args[3].as_int().max(0) as usize,
+                )
+            } else {
+                let len = match heap.get(target) {
+                    Some(JavaObject::Array { elements, .. }) => elements.len(),
+                    _ => 0,
+                };
+                (0, len)
+            };
+            if wanted == 0 {
+                return Some(BuiltinResult::Handled(Value::Int(0)));
+            }
+            if remaining(heap) == 0 {
+                return Some(BuiltinResult::Handled(Value::Int(-1)));
+            }
+            let chunk: Vec<u8> = {
+                let stream = heap.get_native_mut::<ByteStream>(id)?;
+                let n = wanted.min(stream.data.len() - stream.pos);
+                let chunk = stream.data[stream.pos..stream.pos + n].to_vec();
+                stream.pos += n;
+                chunk
+            };
+            if let Some(JavaObject::Array { elements, .. }) = heap.get_mut(target) {
+                for (i, byte) in chunk.iter().enumerate() {
+                    if let Some(slot) = elements.get_mut(offset + i) {
+                        *slot = Value::Int(*byte as i8 as i32);
+                    }
+                }
+            }
+            Value::Int(chunk.len() as i32)
+        }
+        "readAllBytes" => {
+            let rest: Vec<u8> = {
+                let stream = heap.get_native_mut::<ByteStream>(id)?;
+                let rest = stream.data[stream.pos.min(stream.data.len())..].to_vec();
+                stream.pos = stream.data.len();
+                rest
+            };
+            let elements = rest.iter().map(|b| Value::Int(*b as i8 as i32)).collect();
+            let array = heap.alloc(JavaObject::Array {
+                elem_type: "byte".into(),
+                elements,
+            });
+            Value::Object(Some(array))
+        }
+        "available" => Value::Int(remaining(heap) as i32),
+        "skip" if args.len() >= 2 => {
+            let wanted = match &args[1] {
+                Value::Long(n) => (*n).max(0) as usize,
+                other => other.as_int().max(0) as usize,
+            };
+            let stream = heap.get_native_mut::<ByteStream>(id)?;
+            let n = wanted.min(stream.data.len() - stream.pos);
+            stream.pos += n;
+            Value::Long(n as i64)
+        }
+        "markSupported" => Value::from_bool(false),
+        _ => return None,
+    };
+    Some(BuiltinResult::Handled(value))
+}
+
+/// A `net.fabricmc.loader.api.ModContainer` for a loaded mod (or the built-in
+/// `minecraft` / `fabricloader`), carrying the metadata the mod declared.
+fn fabric_mod_container(heap: &mut Heap, mod_id: &str) -> usize {
+    let (mname, mver, mdesc) = if let Some(meta) = heap.loaded_mods.get(mod_id) {
+        (
+            meta.name.clone(),
+            meta.version.clone(),
+            meta.description.clone(),
+        )
+    } else if mod_id == "minecraft" {
+        (
+            "Minecraft".into(),
+            "26.3".into(),
+            "Minecraft: Java Edition".into(),
+        )
+    } else if mod_id == "fabricloader" {
+        (
+            "Fabric Loader".into(),
+            "0.16.10".into(),
+            "Fabric Mod Loader".into(),
+        )
+    } else {
+        (mod_id.to_string(), "1.0.0".into(), String::new())
+    };
+    let mut meta_fields = HashMap::new();
+    let mid_id = heap.alloc_string(mod_id);
+    let mname_id = heap.alloc_string(&mname);
+    let mdesc_id = heap.alloc_string(&mdesc);
+    meta_fields.insert("id".into(), Value::Object(Some(mid_id)));
+    meta_fields.insert("name".into(), Value::Object(Some(mname_id)));
+    meta_fields.insert("description".into(), Value::Object(Some(mdesc_id)));
+
+    let mut ver_fields = HashMap::new();
+    let ver_str_id = heap.alloc_string(&mver);
+    ver_fields.insert("friendlyString".into(), Value::Object(Some(ver_str_id)));
+    let ver_id = heap.alloc(JavaObject::Instance {
+        class_name: "net/fabricmc/loader/api/Version".into(),
+        fields: ver_fields,
+    });
+    meta_fields.insert("version".into(), Value::Object(Some(ver_id)));
+
+    let meta_id = heap.alloc(JavaObject::Instance {
+        class_name: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+        fields: meta_fields,
+    });
+    let mut container_fields = HashMap::new();
+    container_fields.insert("metadata".into(), Value::Object(Some(meta_id)));
+    heap.alloc(JavaObject::Instance {
+        class_name: "net/fabricmc/loader/api/ModContainer".into(),
+        fields: container_fields,
+    })
+}
+
+/// The mod whose jar carries `mod_id` as a jar-in-jar, which Fabric reports as
+/// the nested mod's containing mod.
+fn containing_mod_id(heap: &Heap, mod_id: &str) -> Option<String> {
+    let meta = heap.loaded_mods.get(mod_id)?;
+    if !meta.is_nested {
+        return None;
+    }
+    heap.loaded_mods
+        .iter()
+        .find(|(_, other)| !other.is_nested && other.jar == meta.jar)
+        .map(|(id, _)| id.clone())
+}
+
 /// Read one resource out of a mod jar (or a nested jar inside it). This is
 /// what `Files.newInputStream` needs for `ModContainer.getPath`: the mod's own
 /// `NativeImage.read` then runs on the real bytes.
@@ -1055,15 +1218,76 @@ pub fn dispatch_builtin(
         }
     }
 
+    // `Array.newInstance` bottoms out in the native `newArray`; Kotlin's
+    // `toTypedArray` and most collection `toArray(T[])` copies go through it.
+    if class_name == "java/lang/reflect/Array"
+        && (method_name == "newArray" || method_name == "newInstance")
+        && args.len() == 2
+    {
+        let element = args[0]
+            .as_obj()
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::Class(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "java/lang/Object".to_string());
+        let length = args[1].as_int().max(0) as usize;
+        let default = match element.as_str() {
+            "boolean" | "byte" | "char" | "short" | "int" => Value::Int(0),
+            "long" => Value::Long(0),
+            "float" => Value::Float(0.0),
+            "double" => Value::Double(0.0),
+            _ => Value::NULL,
+        };
+        let array = heap.alloc(JavaObject::Array {
+            elem_type: element,
+            elements: vec![default; length],
+        });
+        return BuiltinResult::Handled(Value::Object(Some(array)));
+    }
+
     if class_name == "java/lang/Throwable" {
         if method_name == "fillInStackTrace" {
             return BuiltinResult::Handled(args.get(0).cloned().unwrap_or(Value::NULL));
         }
     }
 
+    // The interpreter does not record stack traces, and the JVM allows
+    // `getStackTrace` to return an empty array when it has none. Code that walks
+    // the array (Kotlin's null-parameter message does) then ends instead of
+    // reading garbage.
+    if (class_name == "java/lang/Throwable" || class_name == "java/lang/Thread")
+        && method_name == "getStackTrace"
+    {
+        let array = heap.alloc(JavaObject::Array {
+            elem_type: "java/lang/StackTraceElement".into(),
+            elements: Vec::new(),
+        });
+        return BuiltinResult::Handled(Value::Object(Some(array)));
+    }
+    if class_name == "java/lang/Thread" && method_name == "currentThread" {
+        let thread = heap.alloc(JavaObject::Instance {
+            class_name: "java/lang/Thread".into(),
+            fields: HashMap::new(),
+        });
+        return BuiltinResult::Handled(Value::Object(Some(thread)));
+    }
+
     // -------------------------------------------------------------
     // 3. java/lang/Enum & Primitives
     // -------------------------------------------------------------
+    // `Enum.<init>(String name, int ordinal)` is what every enum constructor
+    // calls first; keep the two values where `name()` / `ordinal()` read them.
+    if class_name == "java/lang/Enum" && method_name == "<init>" && args.len() >= 3 {
+        if let Some(this) = args[0].as_obj() {
+            if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this) {
+                fields.insert("name".into(), args[1].clone());
+                fields.insert("ordinal".into(), args[2].clone());
+            }
+        }
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
     if class_name == "java/lang/Enum" || method_name == "ordinal" {
         if method_name == "ordinal" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -1085,7 +1309,12 @@ pub fn dispatch_builtin(
         }
     }
 
-    if class_name.starts_with('[') && method_name == "clone" && !args.is_empty() {
+    // Arrays are cloned through either their own class or `Object.clone`
+    // (Kotlin emits the latter for an enum's `values()`).
+    if (class_name.starts_with('[') || class_name == "java/lang/Object")
+        && method_name == "clone"
+        && !args.is_empty()
+    {
         if let Some(id) = args[0].as_obj() {
             if let Some(JavaObject::Array {
                 elem_type,
@@ -2344,6 +2573,10 @@ pub fn dispatch_builtin(
         }
     }
 
+    if let Some(result) = byte_stream_method(heap, class_name, method_name, args) {
+        return result;
+    }
+
     if class_name == "java/io/InputStream" || class_name == "java/io/ByteArrayInputStream" {
         if method_name == "close" {
             return BuiltinResult::Handled(Value::NULL);
@@ -2713,54 +2946,7 @@ pub fn dispatch_builtin(
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("")
                 .to_string();
-            let (mname, mver, mdesc) = if let Some(meta) = heap.loaded_mods.get(&mod_id) {
-                (
-                    meta.name.clone(),
-                    meta.version.clone(),
-                    meta.description.clone(),
-                )
-            } else if mod_id == "minecraft" {
-                (
-                    "Minecraft".into(),
-                    "26.3".into(),
-                    "Minecraft: Java Edition".into(),
-                )
-            } else if mod_id == "fabricloader" {
-                (
-                    "Fabric Loader".into(),
-                    "0.16.10".into(),
-                    "Fabric Mod Loader".into(),
-                )
-            } else {
-                (mod_id.clone(), "1.0.0".into(), String::new())
-            };
-            let mut meta_fields = HashMap::new();
-            let mid_id = heap.alloc_string(&mod_id);
-            let mname_id = heap.alloc_string(&mname);
-            let mdesc_id = heap.alloc_string(&mdesc);
-            meta_fields.insert("id".into(), Value::Object(Some(mid_id)));
-            meta_fields.insert("name".into(), Value::Object(Some(mname_id)));
-            meta_fields.insert("description".into(), Value::Object(Some(mdesc_id)));
-
-            let mut ver_fields = HashMap::new();
-            let ver_str_id = heap.alloc_string(&mver);
-            ver_fields.insert("friendlyString".into(), Value::Object(Some(ver_str_id)));
-            let ver_id = heap.alloc(JavaObject::Instance {
-                class_name: "net/fabricmc/loader/api/Version".into(),
-                fields: ver_fields,
-            });
-            meta_fields.insert("version".into(), Value::Object(Some(ver_id)));
-
-            let meta_id = heap.alloc(JavaObject::Instance {
-                class_name: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
-                fields: meta_fields,
-            });
-            let mut container_fields = HashMap::new();
-            container_fields.insert("metadata".into(), Value::Object(Some(meta_id)));
-            let cid = heap.alloc(JavaObject::Instance {
-                class_name: "net/fabricmc/loader/api/ModContainer".into(),
-                fields: container_fields,
-            });
+            let cid = fabric_mod_container(heap, &mod_id);
             let mut opt_fields = HashMap::new();
             opt_fields.insert("value".into(), Value::Object(Some(cid)));
             let opt_id = heap.alloc(JavaObject::Instance {
@@ -2771,6 +2957,12 @@ pub fn dispatch_builtin(
         } else if method_name == "getEntrypointContainers" || method_name == "getEntrypoints" {
             let lid = heap.alloc_list(Vec::new());
             return BuiltinResult::Handled(Value::Object(Some(lid)));
+        } else if method_name == "getRawGameVersion" {
+            // The same Minecraft version `getModContainer("minecraft")` reports.
+            let version = heap.alloc_string("26.3");
+            return BuiltinResult::Handled(Value::Object(Some(version)));
+        } else if method_name == "isDevelopmentEnvironment" {
+            return BuiltinResult::Handled(Value::from_bool(false));
         } else if method_name == "getEnvironmentType" {
             let mut f = HashMap::new();
             let name_id = heap.alloc_string("CLIENT");
@@ -2839,9 +3031,29 @@ pub fn dispatch_builtin(
             });
             return BuiltinResult::Handled(Value::Object(Some(pid)));
         } else if method_name == "getContainingMod" {
+            let mod_id = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get("metadata").cloned(),
+                    _ => None,
+                })
+                .and_then(|m| m.as_obj())
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get("id").cloned(),
+                    _ => None,
+                })
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_string(id).map(str::to_string))
+                .unwrap_or_default();
+            let mut opt_fields = HashMap::new();
+            if let Some(parent) = containing_mod_id(heap, &mod_id) {
+                let cid = fabric_mod_container(heap, &parent);
+                opt_fields.insert("value".into(), Value::Object(Some(cid)));
+            }
             let opt_id = heap.alloc(JavaObject::Instance {
                 class_name: "java/util/Optional".into(),
-                fields: HashMap::new(),
+                fields: opt_fields,
             });
             return BuiltinResult::Handled(Value::Object(Some(opt_id)));
         } else if method_name == "getOrigin" {

@@ -19,6 +19,164 @@ impl FabricBridge {
         }
     }
 
+    /// Dispatch Fabric's `PlayerBlockBreakEvents.BEFORE` for a block the player
+    /// is about to break. Listeners may remove further blocks (`destroyBlock`);
+    /// those are handed to the host through [`HostBridge::break_block`]. The
+    /// level the listeners see is a snapshot of the host's blocks within
+    /// `radius` of `pos`, since a listener cannot call back into the host.
+    pub fn block_break_before(
+        &mut self,
+        host: &mut dyn HostBridge,
+        pos: [i32; 3],
+        crouching: bool,
+        radius: i32,
+    ) -> Flow {
+        if !self.initialized {
+            let _ = self.init();
+        }
+        let block_id = host.block(pos);
+        if block_id == "minecraft:air" || block_id.is_empty() {
+            return Flow::Continue;
+        }
+        let mut level = Level::new(false);
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                for dz in -radius..=radius {
+                    let at = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+                    let id = host.block(at);
+                    if id != "minecraft:air" && !id.is_empty() {
+                        level.blocks.insert(at, BlockState::new(&id));
+                    }
+                }
+            }
+        }
+        let state = level.blocks[&pos].clone();
+        let level_id = self.interp.heap.alloc_level(level);
+        let mut player = Player::new(level_id);
+        player.is_crouching = crouching;
+        player.server_side = true;
+        player.hand_item = host.held_item().map(|id| {
+            let mut stack = ItemStack::new(id, 1);
+            stack.enchantments = host.held_enchantments();
+            stack
+        });
+        let player_id = self.interp.heap.alloc_player(player);
+        let pos_id = self.interp.heap.alloc_block_pos(pos[0], pos[1], pos[2]);
+        let state_id = self.interp.heap.alloc_block_state(state);
+
+        // The mod registered on the field the interface's own initializer
+        // created; resolve it the same way `getstatic` does.
+        let _ = self
+            .interp
+            .ensure_initialized("net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents");
+        let event = self.interp.resolve_static_field(
+            "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents",
+            "BEFORE",
+        );
+        let mut listeners = Vec::new();
+        if let Some(JavaObject::Instance { fields, .. }) =
+            event.as_obj().and_then(|id| self.interp.heap.get(id))
+        {
+            if let Some(Value::Object(Some(arr))) = fields.get("listeners") {
+                if let Some(JavaObject::Array { elements, .. }) = self.interp.heap.get(*arr) {
+                    listeners.extend(elements.clone());
+                }
+            }
+        }
+        let mut flow = Flow::Continue;
+        let prev_budget = self.interp.step_budget;
+        self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+        for listener in listeners {
+            let result = self.interp.execute_method(
+                "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents$Before",
+                "beforeBlockBreak",
+                "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/block/entity/BlockEntity;)Z",
+                &[
+                    listener,
+                    Value::Object(Some(level_id)),
+                    Value::Object(Some(player_id)),
+                    Value::Object(Some(pos_id)),
+                    Value::Object(Some(state_id)),
+                    Value::NULL,
+                ],
+            );
+            match result {
+                Ok(value) if value.as_int() == 0 => {
+                    flow = Flow::Cancel;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("PlayerBlockBreakEvents.BEFORE listener failed: {error}"),
+            }
+        }
+        self.interp.run_server_tasks();
+        self.interp.step_budget = prev_budget;
+        let broken = self
+            .interp
+            .heap
+            .get_native::<Level>(level_id)
+            .map(|level| level.broken.clone())
+            .unwrap_or_default();
+        for at in broken {
+            if at.x != pos[0] || at.y != pos[1] || at.z != pos[2] {
+                host.break_block([at.x, at.y, at.z]);
+            }
+        }
+        flow
+    }
+
+    /// The listeners registered on a Fabric `Event` held in a static field.
+    fn event_listeners(&mut self, class_name: &str, field: &str) -> Vec<Value> {
+        // Resolve the field the way `getstatic` does: the interface's own
+        // initializer creates the Event the mods registered on.
+        let _ = self.interp.ensure_initialized(class_name);
+        let event = self.interp.resolve_static_field(class_name, field);
+        let mut listeners = Vec::new();
+        if let Some(JavaObject::Instance { fields, .. }) =
+            event.as_obj().and_then(|id| self.interp.heap.get(id))
+        {
+            if let Some(Value::Object(Some(arr))) = fields.get("listeners") {
+                if let Some(JavaObject::Array { elements, .. }) = self.interp.heap.get(*arr) {
+                    listeners.extend(elements.clone());
+                }
+            }
+        }
+        listeners
+    }
+
+    /// Tell mods the game's (integrated) server is starting, as
+    /// `ServerLifecycleEvents.SERVER_STARTING` does. Server-side mods load
+    /// their configuration here.
+    pub fn server_starting(&mut self) {
+        if !self.initialized {
+            let _ = self.init();
+        }
+        let server = self.interp.heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/server/MinecraftServer".into(),
+            fields: HashMap::new(),
+        });
+        let prev_budget = self.interp.step_budget;
+        self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+        let listeners = self.event_listeners(
+            "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents",
+            "SERVER_STARTING",
+        );
+        for listener in listeners {
+            self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+            let result = self.interp.execute_method(
+                "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents$ServerStarting",
+                "onServerStarting",
+                "(Lnet/minecraft/server/MinecraftServer;)V",
+                &[listener, Value::Object(Some(server))],
+            );
+            if let Err(error) = result {
+                log::warn!("ServerLifecycleEvents.SERVER_STARTING listener failed: {error}");
+            }
+        }
+        self.interp.run_server_tasks();
+        self.interp.step_budget = prev_budget;
+    }
+
     /// Dispatch a right-click block event into the dynamic Fabric compatibility layer.
     pub fn right_click_block(
         &mut self,

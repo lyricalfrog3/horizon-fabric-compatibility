@@ -586,7 +586,7 @@ fn containing_mod_id(heap: &Heap, mod_id: &str) -> Option<String> {
 /// Read one resource out of a mod jar (or a nested jar inside it). This is
 /// what `Files.newInputStream` needs for `ModContainer.getPath`: the mod's own
 /// `NativeImage.read` then runs on the real bytes.
-fn read_mod_resource(jar: &str, nested: Option<&str>, entry: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_mod_resource(jar: &str, nested: Option<&str>, entry: &str) -> Option<Vec<u8>> {
     let file = std::fs::File::open(jar).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
     match nested {
@@ -724,6 +724,156 @@ fn format_translation(template: &str, args: &[String]) -> String {
 }
 
 /// Try to dispatch a method call to built-in handlers.
+/// The registry kind ("BLOCK", "ITEM") a `Registry` object or `ResourceKey` stands for.
+fn registry_kind(heap: &Heap, value: &Value) -> Option<String> {
+    let id = value.as_obj()?;
+    match heap.get(id)? {
+        JavaObject::String(s) => Some(s.clone()),
+        JavaObject::Instance { fields, .. } => fields
+            .get("kind")
+            .and_then(|k| k.as_obj())
+            .and_then(|k| heap.get_string(k))
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A `ResourceKey` for `kind` (the registry) and `location` (an Identifier).
+fn resource_key(heap: &mut Heap, kind: &str, location: usize) -> Value {
+    let kind = heap.alloc_string(kind);
+    let mut fields = HashMap::new();
+    fields.insert("kind".to_string(), Value::Object(Some(kind)));
+    fields.insert("location".to_string(), Value::Object(Some(location)));
+    Value::Object(Some(heap.alloc(JavaObject::Instance {
+        class_name: "net/minecraft/resources/ResourceKey".into(),
+        fields,
+    })))
+}
+
+fn resource_key_text(heap: &Heap, key: &Value) -> Option<String> {
+    let kind = registry_kind(heap, key)?;
+    let location = match heap.get(key.as_obj()?)? {
+        JavaObject::Instance { fields, .. } => fields.get("location")?.clone(),
+        _ => return None,
+    };
+    Some(format!("{kind}/{}", identifier_text(heap, &location)?))
+}
+
+fn identifier_text(heap: &Heap, value: &Value) -> Option<String> {
+    let id = value.as_obj()?;
+    match heap.get(id)? {
+        JavaObject::Instance { fields, .. } => {
+            let part = |name: &str| {
+                fields
+                    .get(name)
+                    .and_then(|v| v.as_obj())
+                    .and_then(|v| heap.get_string(v))
+            };
+            Some(format!("{}:{}", part("namespace")?, part("path")?))
+        }
+        _ => None,
+    }
+}
+
+/// `MinecraftServer.registryAccess()`, `Registry.containsKey/getTagOrEmpty`
+/// and `TagKey.create`, answered from the host-loaded registry snapshot.
+fn registry_method(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    let handled = |v: Value| Some(BuiltinResult::Handled(v));
+    match (class_name, method_name) {
+        ("net/minecraft/server/MinecraftServer", "registryAccess") => {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/core/RegistryAccess$Frozen".into(),
+                fields: HashMap::new(),
+            });
+            handled(Value::Object(Some(id)))
+        }
+        (
+            "net/minecraft/core/RegistryAccess$Frozen"
+            | "net/minecraft/core/RegistryAccess"
+            | "net/minecraft/core/HolderLookup$Provider",
+            "lookupOrThrow" | "registryOrThrow",
+        ) => {
+            let kind = registry_kind(heap, args.get(1)?)?;
+            let mut fields = HashMap::new();
+            fields.insert(
+                "kind".to_string(),
+                Value::Object(Some(heap.alloc_string(kind))),
+            );
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/core/DefaultedRegistry".into(),
+                fields,
+            });
+            handled(Value::Object(Some(id)))
+        }
+        ("net/minecraft/tags/TagKey", "create") if args.len() >= 2 => {
+            let registry = registry_kind(heap, &args[0])?;
+            let id = identifier_text(heap, &args[1])?;
+            let tag = heap.alloc_native(TagKey { registry, id });
+            handled(Value::Object(Some(tag)))
+        }
+        (
+            "net/minecraft/core/DefaultedRegistry"
+            | "net/minecraft/core/Registry"
+            | "net/minecraft/core/MappedRegistry"
+            | "net/minecraft/core/DefaultedMappedRegistry",
+            "containsKey" | "getTagOrEmpty" | "get" | "getValue" | "getOptional",
+        ) => {
+            let kind = registry_kind(heap, args.first()?)?;
+            match method_name {
+                "containsKey" => {
+                    let id = identifier_text(heap, args.get(1)?)?;
+                    handled(Value::from_bool(heap.registries.contains(&kind, &id)))
+                }
+                "getTagOrEmpty" => {
+                    let tag = args
+                        .get(1)
+                        .and_then(|v| v.as_obj())
+                        .and_then(|id| heap.get_native::<TagKey>(id))
+                        .map(|t| t.id.clone())?;
+                    let tag = if tag.contains(':') {
+                        tag
+                    } else {
+                        format!("minecraft:{tag}")
+                    };
+                    let members = heap.registries.tag_members(&kind, &tag);
+                    let holders: Vec<Value> = members
+                        .into_iter()
+                        .map(|member| {
+                            let object = if kind == "BLOCK" {
+                                heap.alloc_native(BlockState::new(&member).block)
+                            } else {
+                                heap.alloc_native(Item { id: member })
+                            };
+                            let mut fields = HashMap::new();
+                            fields.insert("value".to_string(), Value::Object(Some(object)));
+                            Value::Object(Some(heap.alloc(JavaObject::Instance {
+                                class_name: "net/minecraft/core/Holder$Reference".into(),
+                                fields,
+                            })))
+                        })
+                        .collect();
+                    let list = heap.alloc_list(holders);
+                    handled(Value::Object(Some(list)))
+                }
+                _ => None,
+            }
+        }
+        ("net/minecraft/core/Holder" | "net/minecraft/core/Holder$Reference", "value") => {
+            let id = args.first()?.as_obj()?;
+            match heap.get(id)? {
+                JavaObject::Instance { fields, .. } => handled(fields.get("value")?.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn dispatch_builtin(
     heap: &mut Heap,
     class_name: &str,
@@ -732,7 +882,102 @@ pub fn dispatch_builtin(
     args: &[Value],
     virtual_dispatch: bool,
 ) -> BuiltinResult {
+    // A native list or set reached through `Collection` is still that list or set.
+    if matches!(
+        class_name,
+        "java/util/Collection" | "java/util/SequencedCollection"
+    ) {
+        let concrete = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::List(_)) => Some("java/util/List"),
+                Some(JavaObject::Set(_)) => Some("java/util/Set"),
+                _ => None,
+            });
+        if let Some(concrete) = concrete {
+            return dispatch_builtin(
+                heap,
+                concrete,
+                method_name,
+                descriptor,
+                args,
+                virtual_dispatch,
+            );
+        }
+    }
+
+    // A String reached through the CharSequence interface is still a String.
+    if class_name == "java/lang/CharSequence"
+        && args
+            .first()
+            .and_then(|v| v.as_obj())
+            .is_some_and(|id| heap.get_string(id).is_some())
+    {
+        return dispatch_builtin(
+            heap,
+            "java/lang/String",
+            method_name,
+            descriptor,
+            args,
+            virtual_dispatch,
+        );
+    }
+
     if let Some(result) = field_updater_method(heap, class_name, method_name, args) {
+        return result;
+    }
+
+    // Kotlin's null checks. The runtime has no exceptions that cross frames,
+    // and the real failure path builds a message by walking a Java stack trace
+    // the runtime does not have (it never terminates). Report the null, which
+    // is the information that matters, and carry on.
+    if class_name == "kotlin/jvm/internal/Intrinsics" {
+        let reported = match method_name {
+            "checkNotNullParameter"
+            | "checkNotNullExpressionValue"
+            | "checkNotNull"
+            | "checkParameterIsNotNull"
+            | "checkExpressionValueIsNotNull" => {
+                if args.first().is_some_and(Value::is_null) {
+                    let what = args
+                        .get(1)
+                        .and_then(|v| v.as_obj())
+                        .and_then(|id| heap.get_string(id))
+                        .unwrap_or("value")
+                        .to_string();
+                    Some(what)
+                } else {
+                    return BuiltinResult::Handled(Value::NULL);
+                }
+            }
+            "throwParameterIsNullNPE"
+            | "throwNpe"
+            | "throwUninitializedPropertyAccessException" => Some(
+                args.first()
+                    .and_then(|v| v.as_obj())
+                    .and_then(|id| heap.get_string(id))
+                    .unwrap_or("value")
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        if let Some(what) = reported {
+            log::warn!("Kotlin null check failed for `{what}`; a JVM would throw here");
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+    if let Some(result) =
+        crate::fs_builtins::file_system_method(heap, class_name, method_name, args)
+    {
+        return result;
+    }
+    if let Some(result) =
+        crate::num_builtins::numeric_method(heap, class_name, method_name, descriptor, args)
+    {
+        return result;
+    }
+    if let Some(result) = crate::text_io::text_method(heap, class_name, method_name, args) {
         return result;
     }
 
@@ -991,7 +1236,12 @@ pub fn dispatch_builtin(
             let cid = heap.alloc_class(name);
             return BuiltinResult::Handled(Value::Object(Some(cid)));
         } else if method_name == "getClassLoader" {
-            return BuiltinResult::Handled(Value::NULL);
+            // One loader for every mod class, as Fabric's does.
+            let loader = heap.alloc(JavaObject::Instance {
+                class_name: "java/lang/ClassLoader".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(loader)));
         } else if method_name == "getComponentType" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(JavaObject::Class(c)) = heap.get(id) {
@@ -1503,6 +1753,16 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::NULL);
     }
 
+    if method_name == "compareTo" && descriptor == "(Ljava/lang/Enum;)I" && args.len() >= 2 {
+        let ordinal = |v: &Value| match v.as_obj().and_then(|id| heap.get(id)) {
+            Some(JavaObject::Instance { fields, .. }) => fields.get("ordinal").map(Value::as_int),
+            _ => None,
+        };
+        if let (Some(a), Some(b)) = (ordinal(&args[0]), ordinal(&args[1])) {
+            return BuiltinResult::Handled(Value::Int(a - b));
+        }
+    }
+
     if class_name == "java/lang/Enum" || method_name == "ordinal" {
         if method_name == "ordinal" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -1553,6 +1813,14 @@ pub fn dispatch_builtin(
     }
 
     if class_name == "java/lang/Boolean" {
+        if method_name == "toString" && descriptor.starts_with("(Z)") && !args.is_empty() {
+            let sid = heap.alloc_string(if args[0].as_int() != 0 {
+                "true"
+            } else {
+                "false"
+            });
+            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
         if (method_name == "valueOf" || method_name == "booleanValue") && !args.is_empty() {
             return BuiltinResult::Handled(Value::from_bool(args[0].as_bool()));
         }
@@ -1840,6 +2108,10 @@ pub fn dispatch_builtin(
     if class_name == "java/lang/String" {
         if method_name == "valueOf" && !args.is_empty() {
             let s = match &args[0] {
+                Value::Int(i) if descriptor.starts_with("(Z)") => (*i != 0).to_string(),
+                Value::Int(i) if descriptor.starts_with("(C)") => char::from_u32(*i as u32)
+                    .map(String::from)
+                    .unwrap_or_default(),
                 Value::Int(i) => i.to_string(),
                 Value::Long(l) => l.to_string(),
                 Value::Float(f) => f.to_string(),
@@ -2331,7 +2603,61 @@ pub fn dispatch_builtin(
 
     // java.util.Arrays
     if class_name == "java/util/Arrays" {
-        if method_name == "stream" && !args.is_empty() {
+        if matches!(method_name, "copyOf" | "copyOfRange") && args.len() >= 2 {
+            let Some(id) = args[0].as_obj() else {
+                return BuiltinResult::Handled(Value::NULL);
+            };
+            let Some(JavaObject::Array {
+                elem_type,
+                elements,
+            }) = heap.get(id)
+            else {
+                return BuiltinResult::NotHandled;
+            };
+            let elem_type = elem_type.clone();
+            let pad = match elem_type.as_str() {
+                "boolean" | "byte" | "short" | "char" | "int" => Value::Int(0),
+                "long" => Value::Long(0),
+                "float" => Value::Float(0.0),
+                "double" => Value::Double(0.0),
+                _ => Value::NULL,
+            };
+            let (from, to) = if method_name == "copyOf" {
+                (0, args[1].as_int().max(0) as usize)
+            } else {
+                (
+                    args[1].as_int().max(0) as usize,
+                    args.get(2).map_or(0, |v| v.as_int().max(0) as usize),
+                )
+            };
+            let copy: Vec<Value> = (from..to)
+                .map(|i| elements.get(i).cloned().unwrap_or_else(|| pad.clone()))
+                .collect();
+            let nid = heap.alloc(JavaObject::Array {
+                elem_type,
+                elements: copy,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(nid)));
+        } else if method_name == "fill" && args.len() >= 2 {
+            let (from, to, value) = if args.len() >= 4 {
+                (
+                    args[1].as_int().max(0) as usize,
+                    args[2].as_int().max(0) as usize,
+                    args[3].clone(),
+                )
+            } else {
+                (0, usize::MAX, args[1].clone())
+            };
+            if let Some(JavaObject::Array { elements, .. }) =
+                args[0].as_obj().and_then(|id| heap.get_mut(id))
+            {
+                let to = to.min(elements.len());
+                for slot in elements.iter_mut().take(to).skip(from) {
+                    *slot = value.clone();
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "stream" && !args.is_empty() {
             let items = if let Some(id) = args[0].as_obj() {
                 match heap.get(id) {
                     Some(JavaObject::Array { elements, .. }) => elements.clone(),
@@ -2388,6 +2714,12 @@ pub fn dispatch_builtin(
             fields,
         });
         return BuiltinResult::Handled(Value::Object(Some(cid)));
+    }
+
+    // ConcurrentHashMap.newKeySet(): a set; the interpreter is single-threaded.
+    if class_name == "java/util/concurrent/ConcurrentHashMap" && method_name == "newKeySet" {
+        let sid = heap.alloc_set(Vec::new());
+        return BuiltinResult::Handled(Value::Object(Some(sid)));
     }
 
     // Map & HashMap & LinkedHashMap & ConcurrentHashMap
@@ -2555,9 +2887,19 @@ pub fn dispatch_builtin(
         || class_name == "java/util/TreeSet"
     {
         if method_name == "<init>" {
+            let mut initial: Vec<Value> = Vec::new();
+            if let Some(src) = args.get(1) {
+                if src.as_obj().is_some() {
+                    for item in collection_items(heap, src) {
+                        if !initial.contains(&item) {
+                            initial.push(item);
+                        }
+                    }
+                }
+            }
             if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
                 if let Some(obj) = heap.get_mut(this_id) {
-                    *obj = JavaObject::Set(Vec::new());
+                    *obj = JavaObject::Set(initial);
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
@@ -2612,6 +2954,40 @@ pub fn dispatch_builtin(
                 }
             }
             return BuiltinResult::Handled(Value::from_bool(true));
+        } else if matches!(
+            method_name,
+            "addAll" | "removeAll" | "retainAll" | "containsAll"
+        ) && args.len() >= 2
+        {
+            let other = collection_items(heap, &args[1]);
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
+                    let changed = match method_name {
+                        "addAll" => {
+                            let before = items.len();
+                            for item in other {
+                                if !items.contains(&item) {
+                                    items.push(item);
+                                }
+                            }
+                            items.len() != before
+                        }
+                        "removeAll" => {
+                            let before = items.len();
+                            items.retain(|item| !other.contains(item));
+                            items.len() != before
+                        }
+                        "retainAll" => {
+                            let before = items.len();
+                            items.retain(|item| other.contains(item));
+                            items.len() != before
+                        }
+                        _ => other.iter().all(|item| items.contains(item)),
+                    };
+                    return BuiltinResult::Handled(Value::from_bool(changed));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
         } else if method_name == "iterator" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(JavaObject::Set(items)) = heap.get(id) {
@@ -2960,15 +3336,7 @@ pub fn dispatch_builtin(
             } else {
                 ("minecraft".to_string(), "".to_string())
             };
-            let mut fields = HashMap::new();
-            let ns_id = heap.alloc_string(ns);
-            let p_id = heap.alloc_string(path);
-            fields.insert("namespace".into(), Value::Object(Some(ns_id)));
-            fields.insert("path".into(), Value::Object(Some(p_id)));
-            let id = heap.alloc(JavaObject::Instance {
-                class_name: "net/minecraft/resources/Identifier".into(),
-                fields,
-            });
+            let id = heap.alloc_identifier(&ns, &path);
             return BuiltinResult::Handled(Value::Object(Some(id)));
         } else if method_name == "getNamespace" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -3082,6 +3450,8 @@ pub fn dispatch_builtin(
                 .unwrap_or("");
             let loaded = heap.is_mod_loaded(mod_id);
             return BuiltinResult::Handled(Value::from_bool(loaded));
+        } else if let Some(dir) = crate::fs_builtins::loader_dir(heap, method_name) {
+            return BuiltinResult::Handled(dir);
         } else if method_name == "getConfigDir" || method_name == "getGameDir" {
             let mut fields = HashMap::new();
             let sid = heap.alloc_string("config");
@@ -4357,7 +4727,40 @@ pub fn dispatch_builtin(
 
     // BlockState
     if class_name == "net/minecraft/world/level/block/state/BlockState" {
-        if method_name == "getBlock" && !args.is_empty() {
+        if method_name == "getProperties" && !args.is_empty() {
+            // One property object per block-state property the runtime carries.
+            let names: Vec<String> = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockState>(id))
+                .map(|state| state.properties.keys().cloned().collect())
+                .unwrap_or_default();
+            let props: Vec<Value> = names
+                .into_iter()
+                .map(|name| {
+                    let mut fields = HashMap::new();
+                    fields.insert(
+                        "name".to_string(),
+                        Value::Object(Some(heap.alloc_string(name))),
+                    );
+                    Value::Object(Some(
+                        heap.alloc(JavaObject::Instance {
+                            class_name:
+                                "net/minecraft/world/level/block/state/properties/IntegerProperty"
+                                    .into(),
+                            fields,
+                        }),
+                    ))
+                })
+                .collect();
+            let lid = heap.alloc_list(props);
+            return BuiltinResult::Handled(Value::Object(Some(lid)));
+        } else if method_name == "isAir" && !args.is_empty() {
+            let air = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockState>(id))
+                .is_none_or(|state| state.block.id == "minecraft:air");
+            return BuiltinResult::Handled(Value::from_bool(air));
+        } else if method_name == "getBlock" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(state) = heap.get_native::<BlockState>(id) {
                     let bid = heap.alloc_native(state.block.clone());
@@ -4386,6 +4789,17 @@ pub fn dispatch_builtin(
                 if let Some(state) = heap.get_native::<BlockState>(id) {
                     if let Some(tag_id) = args[1].as_obj() {
                         if let Some(tag) = heap.get_native::<TagKey>(tag_id) {
+                            let full = if tag.id.contains(':') {
+                                tag.id.clone()
+                            } else {
+                                format!("minecraft:{}", tag.id)
+                            };
+                            let members = heap.registries.tag_members("BLOCK", &full);
+                            if !members.is_empty() {
+                                return BuiltinResult::Handled(Value::from_bool(
+                                    members.contains(&state.block.id),
+                                ));
+                            }
                             let matches = match tag.id.as_str() {
                                 "crops" => state.block.is_crop,
                                 "blacklist" | "radius_harvest_blacklist" => false,
@@ -4552,15 +4966,122 @@ pub fn dispatch_builtin(
                     }
                 }
             }
-        } else if method_name == "removeBlock" && args.len() >= 2 {
-            return BuiltinResult::Handled(Value::from_bool(true));
+        } else if (method_name == "removeBlock" || method_name == "destroyBlock") && args.len() >= 2
+        {
+            if let (Some(id), Some(pos_id)) = (args[0].as_obj(), args[1].as_obj()) {
+                if let Some(pos) = heap.get_native::<BlockPos>(pos_id).cloned() {
+                    if let Some(level) = heap.get_native_mut::<Level>(id) {
+                        return BuiltinResult::Handled(Value::from_bool(level.destroy_block(&pos)));
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(false));
+        }
+    }
+
+    // `player.gameMode.destroyBlock(pos)` breaks the block in the player's level.
+    if class_name == "net/minecraft/server/level/ServerPlayerGameMode"
+        && method_name == "destroyBlock"
+        && args.len() >= 2
+    {
+        let level_id = match args[0].as_obj().and_then(|id| heap.get(id)) {
+            Some(JavaObject::Instance { fields, .. }) => {
+                fields.get("level").and_then(|v| v.as_obj())
+            }
+            _ => None,
+        };
+        let pos = args[1]
+            .as_obj()
+            .and_then(|id| heap.get_native::<BlockPos>(id))
+            .cloned();
+        if let (Some(level_id), Some(pos)) = (level_id, pos) {
+            if let Some(level) = heap.get_native_mut::<Level>(level_id) {
+                return BuiltinResult::Handled(Value::from_bool(level.destroy_block(&pos)));
+            }
+        }
+        return BuiltinResult::Handled(Value::from_bool(false));
+    }
+
+    if let Some(result) = registry_method(heap, class_name, method_name, args) {
+        return result;
+    }
+
+    // A registry maps an object back to its identifier.
+    if matches!(
+        class_name,
+        "net/minecraft/core/DefaultedRegistry"
+            | "net/minecraft/core/Registry"
+            | "net/minecraft/core/MappedRegistry"
+            | "net/minecraft/core/DefaultedMappedRegistry"
+    ) && method_name == "getKey"
+        && args.len() >= 2
+    {
+        let id = args[1].as_obj().and_then(|id| {
+            heap.get_native::<Block>(id)
+                .map(|block| block.id.clone())
+                .or_else(|| heap.get_native::<Item>(id).map(|item| item.id.clone()))
+        });
+        if let Some(id) = id {
+            let (ns, path) = id.split_once(':').unwrap_or(("minecraft", &id));
+            let ident = heap.alloc_identifier(ns, path);
+            return BuiltinResult::Handled(Value::Object(Some(ident)));
         }
     }
 
     // Player
-    if class_name == "net/minecraft/world/entity/player/Player" {
-        if method_name == "isSpectator" || method_name == "isCrouching" {
-            return BuiltinResult::Handled(Value::from_bool(false));
+    if class_name == "net/minecraft/world/entity/player/Player"
+        || class_name == "net/minecraft/server/level/ServerPlayer"
+    {
+        if method_name == "getUUID" && !args.is_empty() {
+            // One object per player, so a Set or Map keyed by it matches.
+            if let Some(pid) = args[0].as_obj() {
+                if let Some(existing) = heap.get_native::<Player>(pid).and_then(|p| p.uuid) {
+                    return BuiltinResult::Handled(Value::Object(Some(existing)));
+                }
+                let mut fields = HashMap::new();
+                fields.insert("msb".to_string(), Value::Long(0));
+                fields.insert("lsb".to_string(), Value::Long(pid as i64 + 1));
+                let uuid = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/UUID".into(),
+                    fields,
+                });
+                if let Some(player) = heap.get_native_mut::<Player>(pid) {
+                    player.uuid = Some(uuid);
+                }
+                return BuiltinResult::Handled(Value::Object(Some(uuid)));
+            }
+        } else if method_name == "gameMode" {
+            let mut fields = HashMap::new();
+            fields.insert(
+                "name".to_string(),
+                Value::Object(Some(heap.alloc_string("SURVIVAL"))),
+            );
+            fields.insert("ordinal".to_string(), Value::Int(0));
+            let mode = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/world/level/GameType".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(mode)));
+        } else if method_name == "getAttribute" {
+            // No attribute system: a mod's modifier calls are no-ops.
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getMainHandItem" {
+            let held = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_native::<Player>(id))
+                .and_then(|p| p.hand_item.clone())
+                .unwrap_or_else(ItemStack::empty);
+            let stack_id = heap.alloc_item_stack(held);
+            return BuiltinResult::Handled(Value::Object(Some(stack_id)));
+        } else if method_name == "isSpectator" || method_name == "isCrouching" {
+            let crouching = method_name == "isCrouching"
+                && args
+                    .first()
+                    .and_then(|v| v.as_obj())
+                    .and_then(|id| heap.get_native::<Player>(id))
+                    .is_some_and(|p| p.is_crouching);
+            return BuiltinResult::Handled(Value::from_bool(crouching));
         } else if method_name == "getItemInHand" {
             let stack_id = heap.alloc_item_stack(ItemStack::empty());
             return BuiltinResult::Handled(Value::Object(Some(stack_id)));
@@ -4612,6 +5133,131 @@ pub fn dispatch_builtin(
     }
 
     // ItemStack
+    // The runtime carries no block hardness/tool data and no enchantments:
+    // report "no requirement" and "no enchantments" instead of dropping the
+    // call, and keep the gap visible in docs/architecture/fabric-runtime.md.
+    if class_name == "net/minecraft/world/level/block/state/BlockState"
+        && method_name == "requiresCorrectToolForDrops"
+    {
+        return BuiltinResult::Handled(Value::from_bool(false));
+    }
+    if class_name == "net/minecraft/world/item/ItemStack"
+        && matches!(method_name, "getMaxDamage" | "getDamageValue")
+    {
+        // No item durability data: report an item that takes no damage.
+        return BuiltinResult::Handled(Value::Int(0));
+    }
+    if class_name == "net/minecraft/world/item/ItemStack" && method_name == "getEnchantments" {
+        let list: Vec<(String, i32)> = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| heap.get_native::<ItemStack>(id))
+            .map(|stack| stack.enchantments.clone())
+            .unwrap_or_default();
+        let mut entries = Vec::new();
+        for (enchantment, level) in list {
+            let (ns, path) = enchantment
+                .split_once(':')
+                .unwrap_or(("minecraft", &enchantment));
+            let location = heap.alloc_identifier(ns, path);
+            let key = resource_key(heap, "ENCHANTMENT", location);
+            let mut holder = HashMap::new();
+            holder.insert("key".to_string(), key);
+            let holder = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/core/Holder$Reference".into(),
+                fields: holder,
+            });
+            let mut entry = HashMap::new();
+            entry.insert("key".to_string(), Value::Object(Some(holder)));
+            entry.insert("value".to_string(), Value::Int(level));
+            entries.push(Value::Object(Some(heap.alloc(JavaObject::Instance {
+                class_name: "it/unimi/dsi/fastutil/objects/Object2IntMap$Entry".into(),
+                fields: entry,
+            }))));
+        }
+        let mut fields = HashMap::new();
+        fields.insert(
+            "entries".to_string(),
+            Value::Object(Some(heap.alloc(JavaObject::Set(entries)))),
+        );
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/world/item/enchantment/ItemEnchantments".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+    if class_name == "net/minecraft/world/item/enchantment/ItemEnchantments"
+        && matches!(method_name, "entrySet" | "keySet")
+    {
+        let entries = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => fields.get("entries").cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(|| Value::Object(Some(heap.alloc(JavaObject::Set(Vec::new())))));
+        return BuiltinResult::Handled(entries);
+    }
+    if class_name == "it/unimi/dsi/fastutil/objects/Object2IntMap$Entry"
+        && matches!(method_name, "getKey" | "getIntValue" | "getValue")
+    {
+        let field = if method_name == "getKey" {
+            "key"
+        } else {
+            "value"
+        };
+        if let Some(JavaObject::Instance { fields, .. }) = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| heap.get(id))
+        {
+            if let Some(v) = fields.get(field) {
+                return BuiltinResult::Handled(v.clone());
+            }
+        }
+    }
+    if matches!(
+        class_name,
+        "net/minecraft/core/Holder" | "net/minecraft/core/Holder$Reference"
+    ) && method_name == "is"
+        && args.len() >= 2
+    {
+        let own = args[0].as_obj().and_then(|id| match heap.get(id) {
+            Some(JavaObject::Instance { fields, .. }) => fields.get("key").cloned(),
+            _ => None,
+        });
+        if let Some(own) = own {
+            let same = match (
+                resource_key_text(heap, &own),
+                resource_key_text(heap, &args[1]),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            return BuiltinResult::Handled(Value::from_bool(same));
+        }
+    }
+    if class_name == "net/minecraft/resources/ResourceKey" {
+        match method_name {
+            "create" if args.len() >= 2 => {
+                let kind = registry_kind(heap, &args[0]).unwrap_or_default();
+                if let Some(location) = args[1].as_obj() {
+                    return BuiltinResult::Handled(resource_key(heap, &kind, location));
+                }
+            }
+            "location" | "identifier" if !args.is_empty() => {
+                if let Some(JavaObject::Instance { fields, .. }) =
+                    args[0].as_obj().and_then(|id| heap.get(id))
+                {
+                    if let Some(v) = fields.get("location") {
+                        return BuiltinResult::Handled(v.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     if class_name == "net/minecraft/world/item/ItemStack" {
         if method_name == "getItem" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -5012,15 +5658,6 @@ pub fn dispatch_builtin(
                 }
             }
             return BuiltinResult::Handled(Value::Int(0xFFFFFF));
-        }
-    }
-
-    // Fabric PlayerBlockBreakEvents
-    if class_name.contains("PlayerBlockBreakEvents") || method_name == "beforeBlockBreak" {
-        if method_name == "beforeBlockBreak" {
-            // boolean beforeBlockBreak(Level, Player, BlockPos, BlockState, BlockEntity)
-            // Return true (1) to indicate the block break is allowed (not cancelled).
-            return BuiltinResult::Handled(Value::Int(1));
         }
     }
 

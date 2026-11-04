@@ -15,6 +15,11 @@ fn test_rch_initialize() {
     let jamlib_path = root.join("test-mods/jamlib-fabric-2.3.1+26.3.x.jar");
     let rch_path = root.join("test-mods/rightclickharvest-fabric-4.6.2+26.3.x.jar");
 
+    // RightClickHarvest posts Fabric's PlayerBlockBreakEvents.BEFORE, whose
+    // empty-listener result comes from Fabric API's own event factory.
+    bridge
+        .load_mod_jar(&root.join("test-mods/fabric-api-0.165.0+26.3.jar"))
+        .expect("load fabric api");
     bridge.load_mod_jar(&jamlib_path).expect("load jamlib");
     bridge.load_mod_jar(&rch_path).expect("load rch");
     // `init` reads the mods' mixin configs (the accessor interfaces) and runs
@@ -77,6 +82,11 @@ fn test_rch_harvest_crop_dynamically() {
     let jamlib_path = root.join("test-mods/jamlib-fabric-2.3.1+26.3.x.jar");
     let rch_path = root.join("test-mods/rightclickharvest-fabric-4.6.2+26.3.x.jar");
 
+    // RightClickHarvest posts Fabric's PlayerBlockBreakEvents.BEFORE, whose
+    // empty-listener result comes from Fabric API's own event factory.
+    bridge
+        .load_mod_jar(&root.join("test-mods/fabric-api-0.165.0+26.3.jar"))
+        .expect("load fabric api");
     bridge.load_mod_jar(&jamlib_path).expect("load jamlib");
     bridge.load_mod_jar(&rch_path).expect("load rch");
     // `init` reads the mods' mixin configs (the accessor interfaces) and runs

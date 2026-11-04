@@ -18,6 +18,11 @@ pub struct Heap {
     /// Textures mods registered with `TextureManager.register`, by identifier.
     /// The host draws them from the PNG bytes; the runtime never uploads.
     pub textures: HashMap<String, crate::minecraft::PngImage>,
+    /// What `java.nio.file` sees: the game directory on disk, or memory.
+    pub fs: crate::vfs::Vfs,
+    identifiers: HashMap<String, usize>,
+    /// Block and item registries and tags, loaded by the host.
+    pub registries: crate::registry::Registries,
 }
 
 impl Heap {
@@ -30,6 +35,9 @@ impl Heap {
             translations: HashMap::new(),
             singletons: HashMap::new(),
             textures: HashMap::new(),
+            fs: crate::vfs::Vfs::default(),
+            identifiers: HashMap::new(),
+            registries: crate::registry::Registries::default(),
         }
     }
 
@@ -82,6 +90,27 @@ impl Heap {
     /// Allocate a native object.
     pub fn alloc_native<T: NativeObject + 'static>(&mut self, obj: T) -> usize {
         self.alloc(JavaObject::Native(Box::new(obj)))
+    }
+
+    /// The one `Identifier` object for `namespace:path`. Identifiers are values:
+    /// two with the same text must compare equal in a Set or Map, which the
+    /// runtime's collections decide by object identity.
+    pub fn alloc_identifier(&mut self, namespace: &str, path: &str) -> usize {
+        let key = format!("{namespace}:{path}");
+        if let Some(id) = self.identifiers.get(&key) {
+            return *id;
+        }
+        let mut fields = HashMap::new();
+        let ns = self.alloc_string(namespace);
+        let p = self.alloc_string(path);
+        fields.insert("namespace".to_string(), Value::Object(Some(ns)));
+        fields.insert("path".to_string(), Value::Object(Some(p)));
+        let id = self.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/resources/Identifier".into(),
+            fields,
+        });
+        self.identifiers.insert(key, id);
+        id
     }
 
     /// Intern a string and return its heap ID.

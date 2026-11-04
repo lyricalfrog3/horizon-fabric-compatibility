@@ -18,6 +18,21 @@ pub trait HostBridge {
     fn block_property(&self, pos: [i32; 3], key: &str) -> Option<String>;
     fn set_block_property(&mut self, pos: [i32; 3], key: &str, value: &str) -> bool;
     fn give(&mut self, item: &str, count: u32) -> std::result::Result<(), String>;
+    /// Remove the block at `pos` the way a player breaking it would (drops
+    /// included). Returns whether a block was removed. Hosts that cannot
+    /// break blocks leave the default, which reports nothing was removed.
+    fn break_block(&mut self, pos: [i32; 3]) -> bool {
+        let _ = pos;
+        false
+    }
+    /// The item id in the player's main hand, if the host knows it.
+    fn held_item(&self) -> Option<String> {
+        None
+    }
+    /// Enchantment ids and levels on the main-hand item.
+    fn held_enchantments(&self) -> Vec<(String, i32)> {
+        Vec::new()
+    }
     fn drop_item(&mut self, pos: [i32; 3], item: &str, count: u32) {
         let _ = pos;
         let _ = self.give(item, count);
@@ -145,6 +160,20 @@ mod screen;
 mod textures;
 
 impl FabricBridge {
+    /// Load the block/item registries and tags from a Horizon resources
+    /// directory, so mods can resolve ids and tags.
+    pub fn load_registries(&mut self, resources: &std::path::Path) {
+        let mut loaded = crate::registry::Registries::load(resources);
+        loaded.absorb_tags(std::mem::take(&mut self.interp.heap.registries));
+        self.interp.heap.registries = loaded;
+    }
+
+    /// Let mods read and write files under `dir` (the game directory) on disk.
+    /// Until this is called, mod file access stays in memory.
+    pub fn set_game_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.interp.heap.fs.set_root(dir);
+    }
+
     pub fn new() -> Self {
         Self {
             interp: Interpreter::new(),
@@ -162,6 +191,25 @@ impl FabricBridge {
             menu_cache: HashMap::new(),
             menu_screen: None,
             gui_texture_cache: HashMap::new(),
+        }
+    }
+
+    /// Register the tags a mod jar (and the jars inside it) carry in their data packs.
+    fn add_jar_tags(&mut self, path: &Path) {
+        let mut nested = Vec::new();
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(archive) = zip::ZipArchive::new(file) {
+                nested = archive
+                    .file_names()
+                    .filter_map(|n| n.ok().map(|n| n.to_string()))
+                    .filter(|n| n.starts_with("META-INF/jars/") && n.ends_with(".jar"))
+                    .collect();
+            }
+        }
+        let registries = &mut self.interp.heap.registries;
+        registries.add_jar_tags(path, None);
+        for entry in nested {
+            registries.add_jar_tags(path, Some(&entry));
         }
     }
 
@@ -263,6 +311,7 @@ impl FabricBridge {
     pub fn load_mod_jar(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         self.interp.loader.add_jar(path)?;
+        self.add_jar_tags(path);
 
         if let Ok(file) = std::fs::File::open(path) {
             if let Ok(mut archive) = zip::ZipArchive::new(file) {

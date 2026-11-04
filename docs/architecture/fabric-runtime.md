@@ -90,6 +90,8 @@ the server applies the harvest.
 | Path | Status | Notes |
 |---|---|---|
 | Right Click Harvest | **works** | JamLib `InteractionEvent.USE_BLOCK`; the mod's replant and drops are replayed into the host |
+| Fabric `PlayerBlockBreakEvents.BEFORE` | dispatched by the runtime (`FabricBridge::block_break_before`) | Veinminer's listener runs end to end in a test: it breaks the connected ore through `ServerPlayerGameMode.destroyBlock`, and the bridge hands each broken position to `HostBridge::break_block`. **The Horizon client does not call it yet**, so nothing vein-mines in the game. |
+| Fabric `ServerLifecycleEvents.SERVER_STARTING` | dispatched (`FabricBridge::server_starting`) | runs with an empty `MinecraftServer`; the client does not call it yet |
 | Fabric `ItemTooltipCallback` | dispatched | text lines can be added/changed |
 | Iceberg `RenderTooltipEvents.COLOREXT` | dispatched | background/border colors and gradient flags |
 | Iceberg `GATHER` / `POSTEXT` | **not dispatched** | Legendary Tooltips needs these for its frame |
@@ -245,6 +247,24 @@ horizon-ctl fabric-key key.modmenu.open_menu
 
 This is a generic binding action: it looks up any Fabric mapping by its registered name and
 does not know which mod owns it.
+
+## Server-side boundaries (Veinminer path)
+
+Kotlin server mods run through the same interpreter. What they needed, and where each piece
+lives:
+
+| Boundary | Where | Behaviour |
+|---|---|---|
+| Config files | `vfs.rs`, `fs_builtins.rs`, `text_io.rs` | `Files`, `Path`, readers and writers go to a root-restricted filesystem under the game directory (`FabricBridge::set_game_dir`); with no game directory they stay in memory. `getResourceAsStream` reads the mod's own jar. |
+| Registries and tags | `registry.rs`, `FabricBridge::load_registries` | Block and item ids come from the client's `registries.json`, tags from `block-tags.json`, `data/*/tags` and the loaded mod jars. `Registry.containsKey`, `getTagOrEmpty`, `TagKey.create` and `Holder.value` answer from that snapshot. |
+| Level | `events.rs` | A snapshot of the host blocks within a radius of the broken block. Breaks made by the mod are recorded and replayed through `HostBridge::break_block` when the event returns. |
+| Held item | `HostBridge::held_item`, `held_enchantments` | The main-hand item and its enchantments. Durability and block hardness are **not** modelled: `getMaxDamage` is 0 and `requiresCorrectToolForDrops` is false. |
+| Server tasks | `Interpreter::server_tasks` | `MinecraftServer.execute` queues; the dispatcher runs the queue after the listeners return, as a running server task defers new ones. |
+| Coroutines | `interp.rs` | `Dispatchers.Default`/`IO` resolve to `Dispatchers.Unconfined`, so a launched coroutine runs on the dispatching thread until its first real suspension. Delays are not timed: `TimeUnit.convert` is not implemented, so tick-based cooldowns evaluate to 0. |
+| Kotlin null checks | `builtins.rs` | `Intrinsics.check*` log a warning and continue rather than throw. |
+
+Known gaps: no durability, hunger, drops, particles or sound (`Block.getId`, `levelEvent` are
+unresolved no-ops), no real threads, and a mod's network handshake (`NetworkRouter`) never runs.
 
 ## Tests
 

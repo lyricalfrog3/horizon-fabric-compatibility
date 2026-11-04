@@ -407,6 +407,8 @@ pub struct ItemStack {
     pub item: Item,
     pub count: i32,
     pub damage: i32,
+    /// Enchantment id and level pairs, as the host reports them.
+    pub enchantments: Vec<(String, i32)>,
 }
 
 impl ItemStack {
@@ -415,6 +417,7 @@ impl ItemStack {
             item: Item { id: id.into() },
             count,
             damage: 0,
+            enchantments: Vec::new(),
         }
     }
 
@@ -490,6 +493,8 @@ pub struct Level {
     pub blocks: HashMap<[i32; 3], BlockState>,
     pub dropped_stacks: Vec<(BlockPos, String, i32)>,
     pub replanted: Vec<(BlockPos, BlockState)>,
+    /// Positions a mod removed with `destroyBlock`/`removeBlock`, in order.
+    pub broken: Vec<BlockPos>,
 }
 
 impl Level {
@@ -500,7 +505,22 @@ impl Level {
             blocks: HashMap::new(),
             dropped_stacks: Vec::new(),
             replanted: Vec::new(),
+            broken: Vec::new(),
         }
+    }
+
+    /// Remove the block at `pos`; false when there was nothing to remove.
+    pub fn destroy_block(&mut self, pos: &BlockPos) -> bool {
+        let key = [pos.x, pos.y, pos.z];
+        let existed = self
+            .blocks
+            .get(&key)
+            .is_some_and(|state| state.block.id != "minecraft:air");
+        if existed {
+            self.blocks.insert(key, BlockState::new("minecraft:air"));
+            self.broken.push(pos.clone());
+        }
+        existed
     }
 
     pub fn get_block_state(&self, pos: &BlockPos) -> BlockState {
@@ -542,6 +562,10 @@ pub struct Player {
     pub hand_item: Option<ItemStack>,
     pub experience_points: i32,
     pub food_exhaustion: f32,
+    /// The player's `java.util.UUID` object, made on first use.
+    pub uuid: Option<usize>,
+    /// A server-side player: its class is `ServerPlayer`, as seen by mods.
+    pub server_side: bool,
 }
 
 impl Player {
@@ -553,13 +577,19 @@ impl Player {
             hand_item: None,
             experience_points: 0,
             food_exhaustion: 0.0,
+            uuid: None,
+            server_side: false,
         }
     }
 }
 
 impl NativeObject for Player {
     fn class_name(&self) -> &str {
-        "net/minecraft/world/entity/player/Player"
+        if self.server_side {
+            "net/minecraft/server/level/ServerPlayer"
+        } else {
+            "net/minecraft/world/entity/player/Player"
+        }
     }
     fn as_any(&self) -> &dyn Any {
         self

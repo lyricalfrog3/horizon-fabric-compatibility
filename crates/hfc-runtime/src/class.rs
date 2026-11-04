@@ -1034,7 +1034,7 @@ fn convert_opcode(raw: &RawOpcode<'_>) -> Option<Opcode> {
         },
 
         RawOpcode::New(c) => Opcode::New(c.to_string()),
-        RawOpcode::Newarray(t) => Opcode::Newarray(format!("{t:?}")),
+        RawOpcode::Newarray(t) => Opcode::Newarray(format!("{t:?}").to_lowercase()),
         RawOpcode::Anewarray(c) => Opcode::Anewarray(obj_arr_to_string(c)),
         RawOpcode::Arraylength => Opcode::Arraylength,
         RawOpcode::Aaload => Opcode::Aaload,

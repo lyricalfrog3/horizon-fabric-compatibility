@@ -24,7 +24,42 @@ fn has_synthetic_statics(class_name: &str) -> bool {
             | "net/minecraft/core/component/DataComponents"
             | "net/minecraft/core/registries/Registries"
             | "net/minecraft/stats/Stats"
+            | "net/minecraft/core/registries/BuiltInRegistries"
     )
+}
+
+/// The first byte of each parameter's type in a method descriptor
+/// (`I`, `J`, `L`, `[` ...), in order.
+fn parameter_kinds(descriptor: &str) -> Vec<u8> {
+    let bytes = descriptor.as_bytes();
+    let mut kinds = Vec::new();
+    let mut i = 1;
+    while i < bytes.len() && bytes[i] != b')' {
+        let start = bytes[i];
+        while bytes[i] == b'[' {
+            i += 1;
+        }
+        if bytes[i] == b'L' {
+            while bytes[i] != b';' {
+                i += 1;
+            }
+        }
+        i += 1;
+        // An array of anything is a reference.
+        kinds.push(if start == b'[' { b'[' } else { start });
+    }
+    kinds
+}
+
+/// The value a field of the given descriptor holds before anything writes it.
+fn default_for_descriptor(descriptor: &str) -> Value {
+    match descriptor.as_bytes().first() {
+        Some(b'Z' | b'B' | b'C' | b'S' | b'I') => Value::Int(0),
+        Some(b'J') => Value::Long(0),
+        Some(b'F') => Value::Float(0.0),
+        Some(b'D') => Value::Double(0.0),
+        _ => Value::NULL,
+    }
 }
 
 /// The bytecode interpreter running loaded mod classes and Minecraft shims.
@@ -37,6 +72,8 @@ pub struct Interpreter {
     /// touching their API surface show up as entries in this list.
     pub trace_missing: bool,
     pub missing: Vec<String>,
+    /// Tasks given to `MinecraftServer.execute`, run by [`Self::run_server_tasks`].
+    pub server_tasks: std::collections::VecDeque<Value>,
     /// Optional instruction budget. `None` runs without a limit, as a JVM does.
     /// A finite budget keeps a mis-decoded branch from hanging the host.
     pub step_budget: Option<u64>,
@@ -72,6 +109,7 @@ impl Interpreter {
             heap: Heap::new(),
             static_singletons: HashMap::new(),
             trace_missing: false,
+            server_tasks: std::collections::VecDeque::new(),
             missing: Vec::new(),
             step_budget: None,
             call_depth: 0,
@@ -90,6 +128,7 @@ impl Interpreter {
             heap: Heap::new(),
             static_singletons: HashMap::new(),
             trace_missing: false,
+            server_tasks: std::collections::VecDeque::new(),
             missing: Vec::new(),
             step_budget: None,
             call_depth: 0,
@@ -105,10 +144,12 @@ impl Interpreter {
     fn note_missing(&mut self, what: String) {
         if self.trace_missing {
             let caller = if self.trace_calls {
-                self.call_stack
-                    .last()
+                let n = self.call_stack.len();
+                self.call_stack[n.saturating_sub(3)..]
+                    .iter()
+                    .rev()
                     .map(|frame| format!(" <- {frame}"))
-                    .unwrap_or_default()
+                    .collect::<String>()
             } else {
                 String::new()
             };
@@ -224,6 +265,13 @@ impl Interpreter {
             JavaObject::Native(n) => {
                 let c = n.class_name();
                 c == target_type
+                    || (c == "net/minecraft/server/level/ServerPlayer"
+                        && matches!(
+                            target_type,
+                            "net/minecraft/world/entity/player/Player"
+                                | "net/minecraft/world/entity/LivingEntity"
+                                | "net/minecraft/world/entity/Entity"
+                        ))
                     || c.contains(target_type)
                     || (target_type.contains("CropBlock")
                         && (c.contains("CropBlock")
@@ -236,6 +284,41 @@ impl Interpreter {
             }
             _ => false,
         }
+    }
+
+    /// Run the tasks queued through `MinecraftServer.execute`, including the
+    /// ones they queue in turn.
+    pub fn run_server_tasks(&mut self) {
+        let mut ran = 0;
+        while let Some(task) = self.server_tasks.pop_front() {
+            ran += 1;
+            if ran > 100_000 {
+                log::warn!("server task queue not draining; dropping the rest");
+                self.server_tasks.clear();
+                break;
+            }
+            if let Err(error) = self.execute_method("java/lang/Runnable", "run", "()V", &[task]) {
+                log::warn!("server task failed: {error}");
+            }
+        }
+    }
+
+    /// Public fields of host-backed objects that mods read directly.
+    fn native_field(&mut self, id: usize, field_name: &str) -> Value {
+        if field_name == "gameMode" {
+            if let Some(player) = self.heap.get_native::<Player>(id) {
+                let level_id = player.level_id;
+                let mut fields = HashMap::new();
+                fields.insert("level".to_string(), Value::Object(Some(level_id)));
+                fields.insert("player".to_string(), Value::Object(Some(id)));
+                let mode = self.heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/server/level/ServerPlayerGameMode".into(),
+                    fields,
+                });
+                return Value::Object(Some(mode));
+            }
+        }
+        Value::NULL
     }
 
     /// Check if `from_class` is assignable to `to_type` traversing class hierarchy.
@@ -523,6 +606,64 @@ impl Interpreter {
                     }
                 }
             }
+        }
+
+        // `Event.invoker()` of an event made by `EventFactory.createArrayBacked`
+        // is the combined callback its factory builds from the listeners
+        // (for a Fabric event that is "all listeners, short-circuiting"), so a
+        // call with no listener registered still gets the factory's empty
+        // result.
+        if method_name == "invoker"
+            && args.len() == 1
+            && matches!(
+                class_name,
+                "net/fabricmc/fabric/api/event/Event"
+                    | "net/fabricmc/fabric/impl/base/event/ArrayBackedEvent"
+            )
+        {
+            let parts = args[0].as_obj().and_then(|id| match self.heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => Some((
+                    fields.get("invokerFactory").cloned(),
+                    fields.get("listeners").cloned(),
+                )),
+                _ => None,
+            });
+            if let Some((Some(factory), Some(listeners))) = parts {
+                if !factory.is_null() && !listeners.is_null() {
+                    return self.execute_method(
+                        "java/util/function/Function",
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[factory, listeners],
+                    );
+                }
+            }
+        }
+
+        // A task given to the server executor while the server is already
+        // running a task (an event dispatch is one) is queued, not run inline:
+        // the dispatcher runs the queue when the event returns.
+        if class_name == "net/minecraft/server/MinecraftServer"
+            && matches!(method_name, "execute" | "submit" | "tell" | "submitAsync")
+            && args.len() >= 2
+        {
+            self.server_tasks.push_back(args[1].clone());
+            return Ok(Value::NULL);
+        }
+
+        // The interpreter has no threads. Coroutines launched on a pooled
+        // dispatcher run on the dispatching thread instead, through the
+        // library's own Unconfined dispatcher: they run eagerly until their
+        // first real suspension.
+        if class_name == "kotlinx/coroutines/Dispatchers"
+            && matches!(method_name, "getDefault" | "getIO")
+        {
+            return self.execute_method(
+                "kotlinx/coroutines/Dispatchers",
+                "getUnconfined",
+                "()Lkotlinx/coroutines/CoroutineDispatcher;",
+                &[],
+            );
         }
 
         // Optional combinators run a modifier's own lambda. A heap builtin
@@ -996,12 +1137,23 @@ impl Interpreter {
         // second parameter over the high half of the first and leave every
         // following argument in the wrong slot, so hit-tests and other
         // double-taking methods compare against zero.
+        // The descriptor, not the Rust value's type, says how wide a parameter is:
+        // a builtin or an untyped constant may hand a `double` parameter an Int.
+        let params = parameter_kinds(descriptor);
+        let skip = args.len().saturating_sub(params.len());
         let mut slot = 0usize;
-        for arg in args.iter() {
+        for (index, arg) in args.iter().enumerate() {
+            let kind = index.checked_sub(skip).and_then(|i| params.get(i)).copied();
+            let value = match (kind, arg) {
+                (Some(b'D'), v) if !matches!(v, Value::Double(_)) => Value::Double(v.as_double()),
+                (Some(b'J'), v) if !matches!(v, Value::Long(_)) => Value::Long(v.as_long()),
+                (Some(b'F'), v) if !matches!(v, Value::Float(_)) => Value::Float(v.as_float()),
+                _ => arg.clone(),
+            };
             if slot < locals.len() {
-                locals[slot] = arg.clone();
+                locals[slot] = value;
             }
-            slot += if matches!(arg, Value::Long(_) | Value::Double(_)) {
+            slot += if matches!(kind, Some(b'J' | b'D')) {
                 2
             } else {
                 1
@@ -1787,13 +1939,22 @@ impl Interpreter {
                         c.static_fields.insert(field_name.clone(), val);
                     }
                 }
-                Opcode::Getfield { field_name, .. } => {
+                Opcode::Getfield {
+                    field_name,
+                    descriptor,
+                    ..
+                } => {
                     let obj_ref = stack.pop().unwrap_or(Value::NULL);
                     let val = if let Some(id) = obj_ref.as_obj() {
                         if let Some(JavaObject::Instance { fields, .. }) = self.heap.get(id) {
-                            fields.get(field_name).cloned().unwrap_or(Value::NULL)
+                            // A field nothing has written reads as its type's
+                            // zero, as in a JVM (an `int` is 0, not null).
+                            fields
+                                .get(field_name)
+                                .cloned()
+                                .unwrap_or_else(|| default_for_descriptor(descriptor))
                         } else {
-                            Value::NULL
+                            self.native_field(id, field_name)
                         }
                     } else {
                         Value::NULL
@@ -1818,7 +1979,7 @@ impl Interpreter {
                 Opcode::Newarray(elem) | Opcode::Anewarray(elem) => {
                     let count = stack.pop().unwrap_or(Value::Int(0)).as_int().max(0) as usize;
                     let default_val = match elem.as_str() {
-                        "boolean" | "byte" | "short" | "int" => Value::Int(0),
+                        "boolean" | "byte" | "short" | "char" | "int" => Value::Int(0),
                         "long" => Value::Long(0),
                         "float" => Value::Float(0.0),
                         "double" => Value::Double(0.0),
@@ -2168,11 +2329,8 @@ impl Interpreter {
             return Value::Object(Some(arr_id));
         }
 
-        if field_name == "NEXT"
-            || field_name == "PREV"
-            || field_name == "HEAD"
-            || field_name == "TAIL"
-            || field_name == "ITEM"
+        if class_name.starts_with("java/")
+            && matches!(field_name, "NEXT" | "PREV" | "HEAD" | "TAIL" | "ITEM")
         {
             let fname = field_name.to_lowercase();
             let fid = self.heap.alloc_string(fname);
@@ -2248,6 +2406,17 @@ impl Interpreter {
 
         if class_name == "net/minecraft/core/Direction$Axis" {
             let id = self.heap.alloc_string(field_name);
+            return Value::Object(Some(id));
+        }
+
+        if class_name == "net/minecraft/core/registries/BuiltInRegistries" {
+            let mut fields = HashMap::new();
+            let kind = self.heap.alloc_string(field_name);
+            fields.insert("kind".to_string(), Value::Object(Some(kind)));
+            let id = self.heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/core/DefaultedRegistry".into(),
+                fields,
+            });
             return Value::Object(Some(id));
         }
 

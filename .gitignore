@@ -8,7 +8,6 @@
 
 # Local game and runtime state
 /.horizon-cache/
-/.freebuff/
 /.cloud-attachments/
 /command_history.txt
 /horizon-graphics.txt

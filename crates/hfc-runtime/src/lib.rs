@@ -6,6 +6,7 @@ pub mod class;
 pub mod fs_builtins;
 pub mod heap;
 pub mod interp;
+pub mod item_builtins;
 pub mod jimage;
 pub mod loader;
 pub mod minecraft;

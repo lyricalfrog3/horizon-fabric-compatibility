@@ -782,7 +782,7 @@ fn format_translation(template: &str, args: &[String]) -> String {
 
 /// Try to dispatch a method call to built-in handlers.
 /// The registry kind ("BLOCK", "ITEM") a `Registry` object or `ResourceKey` stands for.
-fn registry_kind(heap: &Heap, value: &Value) -> Option<String> {
+pub(crate) fn registry_kind(heap: &Heap, value: &Value) -> Option<String> {
     let id = value.as_obj()?;
     match heap.get(id)? {
         JavaObject::String(s) => Some(s.clone()),
@@ -816,7 +816,7 @@ fn resource_key_text(heap: &Heap, key: &Value) -> Option<String> {
     Some(format!("{kind}/{}", identifier_text(heap, &location)?))
 }
 
-fn identifier_text(heap: &Heap, value: &Value) -> Option<String> {
+pub(crate) fn identifier_text(heap: &Heap, value: &Value) -> Option<String> {
     let id = value.as_obj()?;
     match heap.get(id)? {
         JavaObject::Instance { fields, .. } => {
@@ -1214,6 +1214,13 @@ pub fn dispatch_builtin(
     }
 
     if let Some(result) = field_updater_method(heap, class_name, method_name, args) {
+        return result;
+    }
+
+    // `Item` and `Item.Properties` record what a mod registers.
+    if let Some(result) =
+        crate::item_builtins::item_method(heap, class_name, method_name, descriptor, args)
+    {
         return result;
     }
 

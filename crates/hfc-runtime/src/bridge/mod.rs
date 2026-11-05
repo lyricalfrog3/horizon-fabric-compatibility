@@ -12,6 +12,8 @@ use hfc_core::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use items::RegisteredItem;
+
 /// A desktop action a mod asked for; the runtime cannot reach the desktop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRequest {
@@ -198,6 +200,7 @@ impl Default for FabricBridge {
 }
 
 mod events;
+pub(crate) mod items;
 mod menu;
 mod screen;
 mod textures;

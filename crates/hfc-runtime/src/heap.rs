@@ -33,6 +33,10 @@ pub struct Heap {
     /// The text `ClipboardManager.getClipboard` answers: the last text a mod
     /// copied, or what the host put there.
     pub clipboard: String,
+    /// Items mods registered in `BuiltInRegistries.ITEM`, in registration order.
+    pub(crate) registered_items: Vec<crate::item_builtins::RegisteredRecord>,
+    /// `Item.Properties` methods the runtime does not model, each logged once.
+    pub unsupported_item_properties: Vec<String>,
 }
 
 impl Heap {
@@ -51,6 +55,8 @@ impl Heap {
             registries: crate::registry::Registries::default(),
             host_requests: Vec::new(),
             clipboard: String::new(),
+            registered_items: Vec::new(),
+            unsupported_item_properties: Vec::new(),
         }
     }
 

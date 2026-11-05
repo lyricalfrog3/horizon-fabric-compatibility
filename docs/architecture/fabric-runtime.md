@@ -332,6 +332,68 @@ lives:
 Known gaps: no durability, hunger, drops, particles or sound (`Block.getId`, `levelEvent` are
 unresolved no-ops), no real threads, and a mod's network handshake (`NetworkRouter`) never runs.
 
+## Registered items
+
+Items a mod registers in code (`Registry.register(BuiltInRegistries.ITEM, key, item)`) reach
+the host as data: `FabricBridge::registered_items()` returns, in registration order, a
+`RegisteredItem { id, template, components, max_stack_size, rarity }` for each. That is the
+shape of a Horizon `data/<ns>/horizon/item/<path>.json` file: a vanilla `template` plus a
+data component patch (`"minecraft:<type>"` sets one, `"!minecraft:<type>"` with `{}` removes
+it). The client turns the list into such files.
+
+How it works. `Item$Properties` is a class the runtime replaces (`item_builtins.rs`): each
+method records into a native `ItemProperties` (`bridge/items.rs`) the components vanilla
+would set, with vanilla's formulas read from `Item$Properties` and `ToolMaterial`:
+`durability` sets `max_damage`, a stack of one and `damage` 0; `pickaxe`/`axe`/`hoe`/
+`shovel`/`tool` set `repairable` (`#<repair tag>`), `enchantable`, `tool` (the
+incorrect-for-drops rule with `correct_for_drops: false`, then the mineable tag with the
+material's speed), `attribute_modifiers` (`base_attack_damage` = damage + the material's
+bonus in `f32`, `base_attack_speed`) and `weapon` (2 damage per attack; the axe also disables
+blocking for 5 s); `axe`/`hoe`/`shovel` add `block_transformer`; `sword` sets vanilla's
+cobweb/sword-tag `tool` rules (`damage_per_block` 2, no creative breaking) and an empty
+`weapon`. `Item.<init>(Properties)` copies the record onto the item object (a mod subclass
+calls it through `super`), and `Registry.register` stores id and record and returns the
+value.
+
+Modelled `Properties` methods: `setId`, `stacksTo`, `durability`, `rarity`, `fireResistant`
+(`damage_resistant: #minecraft:is_fire`), `enchantable`, `repairable` (tag or a vanilla
+item), `tool`, `pickaxe`, `axe`, `hoe`, `shovel`, `sword`. Every other method (`food`,
+`component`, `attributes`, `spear`, `equippable`, armor, `requiredFeatures`, ...) is recorded
+as unsupported and logged once; `FabricBridge::unsupported_item_properties()` lists them.
+The exported item lacks what they would have set.
+
+Templates. The vanilla tool of the same kind, so the item keeps vanilla's behaviour class
+(an axe strips logs, a hoe tills): `diamond_pickaxe` for pickaxes and `tool`,
+`diamond_axe`, `diamond_shovel`, `diamond_hoe`, `diamond_sword`. A plain item uses
+`minecraft:flint`, which vanilla builds with `new Item(new Properties())` and which carries
+only the components every item has (no fuel value, trim material or food). The patch sets
+every component the properties determine and removes (`!minecraft:x`) a component the
+template carries that they did not set. `item_model` and `item_name` are not set: Horizon
+renames the template's id inside the copied item, which rewrites both. `max_stack_size` and
+`rarity` are the struct's own fields; a tool template whose item never set a stack size
+reports 64.
+
+Not exported:
+
+- **Behaviour.** A custom `Item` subclass's overrides (`use`, `useOn`, `inventoryTick`, ...)
+  do not run in Horizon; only data crosses. A pickaxe or sword needs none (its behaviour is
+  its components), an axe, hoe and shovel get vanilla's through their template.
+- **Items extending a vanilla item class** (`BlockItem`, `BowItem`, ...): their behaviour has
+  no data form, so they are logged and not exported.
+- **Creative-tab placement** (`CreativeModeTabEvents.modifyOutput` listeners).
+- Registration of anything other than items (blocks, entity types, ...).
+
+Also changed: `BlockTags.X`/`ItemTags.X` constants now carry their real id
+(`minecraft:mineable/pickaxe`), read from the tag class's initializer, instead of the
+lower-cased field name.
+
+Verified by `tests/registered_items.rs`: Emerald Tools (the mod's `PandoricalApi.isAvailable()`
+is an unresolved call that returns false like any missing class) registers five items whose
+components match values read from its bytecode; and vanilla's own arguments for six tools
+(`Items.<clinit>`: the diamond tools and the fire-resistant netherite sword) produce the
+same `tool`, `attribute_modifiers`, `max_damage`, `enchantable`, `repairable`, `weapon`,
+`block_transformer` and `damage_resistant` as the client's `items.json`.
+
 ## Reflection and config files
 
 Mods that write a config file usually do it by reflecting over a config class

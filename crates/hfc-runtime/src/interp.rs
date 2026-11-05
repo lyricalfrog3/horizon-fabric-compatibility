@@ -210,7 +210,9 @@ impl Interpreter {
                 // `Language` is replaced wholesale (translations come from the
                 // host), so its initializer, which reads en_us.json through JDK
                 // stream decoders, must not run.
+                // `Item$Properties` is replaced wholesale too (`item_builtins.rs`).
                 if class_name != "net/minecraft/locale/Language"
+                    && class_name != "net/minecraft/world/item/Item$Properties"
                     && class
                         .methods
                         .contains_key(&("<clinit>".into(), "()V".into()))
@@ -1472,6 +1474,10 @@ impl Interpreter {
                 }
             };
             return Ok(Value::Object(Some(pose)));
+        }
+
+        if let Some(value) = self.register_item(class_name, method_name, args) {
+            return Ok(value);
         }
 
         // 1. Built-in shims
@@ -2857,6 +2863,34 @@ impl Interpreter {
         None
     }
 
+    /// The tag path a vanilla tag class binds `field_name` to: its initializer
+    /// is `ldc "<path>"; invokestatic create/bind; putstatic FIELD`.
+    fn vanilla_tag_path(&mut self, class_name: &str, field_name: &str) -> Option<String> {
+        let _ = self.loader.get_or_load(class_name);
+        let code = self
+            .loader
+            .get(class_name)?
+            .methods
+            .get(&("<clinit>".to_string(), "()V".to_string()))?
+            .code
+            .clone()?;
+        let mut path: Option<&str> = None;
+        for (_, opcode) in &code.opcodes {
+            match opcode {
+                Opcode::LdcString(text) => path = Some(text),
+                Opcode::Putstatic {
+                    class_name: owner,
+                    field_name: name,
+                    ..
+                } if owner == class_name && name == field_name => {
+                    return path.map(str::to_string);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Resolve static field value or create fallback singleton.
     pub fn resolve_static_field(&mut self, class_name: &str, field_name: &str) -> Value {
         let owner = self
@@ -3066,9 +3100,15 @@ impl Interpreter {
         if class_name == "net/minecraft/tags/ItemTags"
             || class_name == "net/minecraft/tags/BlockTags"
         {
+            // The real tag id is the string the class's initializer binds the
+            // field to (`MINEABLE_WITH_PICKAXE` is `mineable/pickaxe`).
+            let id = self.vanilla_tag_path(class_name, field_name).map_or_else(
+                || field_name.to_lowercase(),
+                |path| format!("minecraft:{path}"),
+            );
             let id = self.heap.alloc_native(TagKey {
                 registry: class_name.to_string(),
-                id: field_name.to_lowercase(),
+                id,
             });
             return Value::Object(Some(id));
         }

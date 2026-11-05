@@ -440,3 +440,100 @@ fn properties_match_vanilla_items() {
         );
     }
 }
+
+/// Emerald Armor registers four pieces through `Properties.humanoidArmor`.
+///
+/// Numbers from `Main.<clinit>` (javap): `ArmorMaterial(37, {HELMET 3,
+/// CHESTPLATE 8, LEGGINGS 6, BOOTS 3}, 20, ARMOR_EQUIP_DIAMOND, 2.0f, 0.0f,
+/// #emerald-armor-justfatlard:emerald_armor_repair_items,
+/// minecraft:emerald)`. Vanilla's `ArmorType` unit durabilities are HELMET 11,
+/// CHESTPLATE 16, LEGGINGS 15, BOOTS 13, and `humanoidArmor` sets
+/// `durability(unit * material.durability)`.
+#[test]
+fn emerald_armor_is_wearable_and_not_stackable() {
+    let jars = [
+        "fabric-api-0.165.0+26.3.jar",
+        "emerald-armor-justfatlard-2.1.1.jar",
+    ]
+    .map(|name| root().join("test-mods").join(name));
+    if jars.iter().any(|jar| !jar.exists()) {
+        eprintln!("skipped: test-mods jars are not present");
+        return;
+    }
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        return;
+    };
+    for jar in &jars {
+        bridge.load_mod_jar(jar).unwrap();
+    }
+    bridge.init().unwrap();
+    assert!(
+        bridge.unsupported_item_properties().is_empty(),
+        "unmodelled Properties methods: {:?}",
+        bridge.unsupported_item_properties()
+    );
+    let items = bridge.registered_items();
+    assert_eq!(items.len(), 4, "{items:?}");
+
+    // (piece, vanilla unit durability, defense, slot)
+    let pieces = [
+        ("helmet", 11, 3.0, "head"),
+        ("chestplate", 16, 8.0, "chest"),
+        ("leggings", 15, 6.0, "legs"),
+        ("boots", 13, 3.0, "feet"),
+    ];
+    for (item, (piece, unit, defense, slot)) in items.iter().zip(pieces) {
+        let id = &item.id;
+        assert_eq!(id, &format!("emerald-armor-justfatlard:emerald_{piece}"));
+        assert_eq!(item.template, format!("minecraft:diamond_{piece}"), "{id}");
+        assert_eq!(item.max_stack_size, Some(1), "{id}");
+        assert_eq!(
+            item.components["minecraft:max_damage"],
+            json!(37 * unit),
+            "{id}"
+        );
+        assert_eq!(item.components["minecraft:damage"], json!(0), "{id}");
+        assert_eq!(
+            item.components["minecraft:enchantable"],
+            json!({ "value": 20 }),
+            "{id}"
+        );
+        assert_eq!(
+            item.components["minecraft:repairable"],
+            json!({ "items": "#emerald-armor-justfatlard:emerald_armor_repair_items" }),
+            "{id}"
+        );
+        assert_eq!(
+            item.components["minecraft:equippable"],
+            json!({
+                "slot": slot,
+                "asset_id": "minecraft:emerald",
+                "equip_sound": "minecraft:item.armor.equip_diamond",
+            }),
+            "{id}"
+        );
+        // Toughness 2.0; knockback resistance 0.0 adds no modifier.
+        let modifier = |attribute: &str, amount: f64| {
+            json!({
+                "type": attribute,
+                "id": format!("minecraft:armor.{piece}"),
+                "amount": amount,
+                "operation": "add_value",
+                "slot": slot,
+            })
+        };
+        assert_eq!(
+            item.components["minecraft:attribute_modifiers"],
+            json!([
+                modifier("minecraft:armor", defense),
+                modifier("minecraft:armor_toughness", 2.0),
+            ]),
+            "{id}"
+        );
+        assert!(
+            !item.components.keys().any(|key| key.starts_with('!')),
+            "nothing the template carries is removed: {:?}",
+            item.components.keys().collect::<Vec<_>>()
+        );
+    }
+}

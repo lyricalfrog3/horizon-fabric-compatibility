@@ -6,12 +6,14 @@
 //! object, and `Registry.register(ITEM, ...)` remembers the item under its id.
 //! `FabricBridge::registered_items` hands the result to the host.
 
-use crate::bridge::items::{ItemProperties, ToolKind, ToolMaterial};
+use crate::bridge::items::{ArmorMaterial, ArmorType, ItemProperties, ToolKind, ToolMaterial};
 use crate::builtins::{BuiltinResult, identifier_text, registry_kind};
 use crate::heap::Heap;
 use crate::interp::Interpreter;
 use crate::minecraft::{Item, TagKey};
 use crate::value::{JavaObject, Value};
+use serde_json::Value as Json;
+use std::collections::HashMap;
 
 const PROPERTIES: &str = "net/minecraft/world/item/Item$Properties";
 const ITEM: &str = "net/minecraft/world/item/Item";
@@ -70,6 +72,59 @@ fn tool_material(heap: &Heap, value: &Value) -> Option<ToolMaterial> {
         attack_damage_bonus: fields.get("attackDamageBonus")?.as_float(),
         enchantment_value: fields.get("enchantmentValue")?.as_int(),
         repair_items: tag_id(heap, fields.get("repairItems")?)?,
+    })
+}
+
+fn string_field(heap: &Heap, fields: &HashMap<String, Value>, name: &str) -> Option<String> {
+    heap.get_string(fields.get(name)?.as_obj()?)
+        .map(str::to_string)
+}
+
+/// An `ArmorType` constant, as `Properties.humanoidArmor` reads it.
+fn armor_type(heap: &Heap, value: &Value) -> Option<ArmorType> {
+    let JavaObject::Instance { fields, .. } = heap.get(value.as_obj()?)? else {
+        return None;
+    };
+    let JavaObject::Instance { fields: slot, .. } = heap.get(fields.get("slot")?.as_obj()?)? else {
+        return None;
+    };
+    Some(ArmorType {
+        name: string_field(heap, fields, "name")?,
+        slot: string_field(heap, slot, "name")?,
+        unit_durability: fields.get("unitDurability")?.as_int(),
+    })
+}
+
+/// An `ArmorMaterial` record, with the `defense` entry for `armor_type`.
+fn armor_material(heap: &Heap, value: &Value, armor_type: &Value) -> Option<ArmorMaterial> {
+    let JavaObject::Instance { fields, .. } = heap.get(value.as_obj()?)? else {
+        return None;
+    };
+    let JavaObject::Map(defense) = heap.get(fields.get("defense")?.as_obj()?)? else {
+        return None;
+    };
+    let wanted = armor_type.as_obj()?;
+    let defense = defense
+        .iter()
+        .find(|(key, _)| key.as_obj() == Some(wanted))
+        .map_or(0, |(_, amount)| amount.as_int());
+    // `ResourceKey.location` is the asset's identifier.
+    let asset_id = match fields.get("assetId").and_then(Value::as_obj) {
+        Some(key) => match heap.get(key)? {
+            JavaObject::Instance { fields, .. } => identifier_text(heap, fields.get("location")?),
+            _ => None,
+        },
+        None => None,
+    };
+    Some(ArmorMaterial {
+        durability: fields.get("durability")?.as_int(),
+        defense,
+        enchantment_value: fields.get("enchantmentValue")?.as_int(),
+        equip_sound_constant: string_field(heap, fields, "equipSound"),
+        toughness: fields.get("toughness")?.as_float(),
+        knockback_resistance: fields.get("knockbackResistance")?.as_float(),
+        repair_items: tag_id(heap, fields.get("repairIngredient")?)?,
+        asset_id,
     })
 }
 
@@ -140,6 +195,8 @@ fn properties_method(
 
     // Read every argument before borrowing the record.
     let material = tool_material(heap, &arg(1));
+    let armor = armor_type(heap, &arg(2));
+    let armor_material = armor_material(heap, &arg(1), &arg(2));
     let tag = tag_id(heap, &arg(1));
     let tool_tag = tag_id(heap, &arg(2));
     let name = enum_name(heap, &arg(1));
@@ -199,6 +256,20 @@ fn properties_method(
                 }
             }
             None => modelled = false,
+        },
+        "humanoidArmor" => match (armor_material, armor) {
+            (Some(material), Some(armor)) => {
+                // `BODY` has no vanilla armor item with a matching behaviour.
+                properties.kind = match armor.name.as_str() {
+                    "helmet" => Some(ToolKind::Helmet),
+                    "chestplate" => Some(ToolKind::Chestplate),
+                    "leggings" => Some(ToolKind::Leggings),
+                    "boots" => Some(ToolKind::Boots),
+                    _ => None,
+                };
+                properties.humanoid_armor(&material, &armor);
+            }
+            _ => modelled = false,
         },
         "sword" => match material {
             Some(material) => {
@@ -283,10 +354,28 @@ impl Interpreter {
             log::warn!("item {id} is registered twice; the first registration is kept");
             return Some(value.clone());
         }
-        let properties = snapshot
+        let mut properties = snapshot
             .and_then(|id| self.heap.get_native::<ItemProperties>(id))
             .cloned()
             .unwrap_or_default();
+        // The sound constant's id is the string its initializer registers.
+        if let Some(constant) = properties.equip_sound_constant.take() {
+            match self.vanilla_tag_path("net/minecraft/sounds/SoundEvents", &constant) {
+                Some(path) => {
+                    if let Some(Json::Object(equippable)) =
+                        properties.components.get_mut("minecraft:equippable")
+                    {
+                        equippable.insert(
+                            "equip_sound".into(),
+                            Json::from(format!("minecraft:{path}")),
+                        );
+                    }
+                }
+                None => log::warn!(
+                    "SoundEvents.{constant} has no registered id; item {id} keeps the default equip sound"
+                ),
+            }
+        }
         self.heap.registered_items.push(RegisteredRecord {
             id,
             properties,

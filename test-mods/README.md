@@ -14,6 +14,8 @@ running the runtime tests:
 | `modmenu-21.0.0.jar` | Mod Menu |
 | `placeholder-api-3.2.0+26.3.jar` | Placeholder API |
 | `rightclickharvest-fabric-4.6.2+26.3.x.jar` | Right Click Harvest |
+| `emerald-tools-justfatlard-2.2.1.jar` | Emerald Tools |
+| `emerald-armor-justfatlard-2.1.1.jar` | Emerald Armor |
 
 The bridge and RCH tests also need a Minecraft installation at
 `~/.local/share/horizon-launcher/minecraft` (or `HORIZON_MINECRAFT_DIR`). The real-classpath

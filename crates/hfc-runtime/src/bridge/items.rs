@@ -67,6 +67,11 @@ pub(crate) enum ToolKind {
     Shovel,
     Hoe,
     Sword,
+    /// `Properties.humanoidArmor(material, ArmorType.HELMET)`.
+    Helmet,
+    Chestplate,
+    Leggings,
+    Boots,
     /// `Properties.tool(...)`: vanilla's pickaxe is a plain `Item`, so the
     /// pickaxe is the template that carries nothing beyond the tool components.
     Generic,
@@ -85,12 +90,45 @@ pub(crate) struct ToolMaterial {
     pub repair_items: String,
 }
 
+/// An `ArmorMaterial` record, reduced to what `Properties.humanoidArmor` reads
+/// for one `ArmorType`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ArmorMaterial {
+    pub durability: i32,
+    /// `defense.getOrDefault(type, 0)`.
+    pub defense: i32,
+    pub enchantment_value: i32,
+    /// The `SoundEvents` constant of `equipSound` (`ARMOR_EQUIP_DIAMOND`).
+    pub equip_sound_constant: Option<String>,
+    pub toughness: f32,
+    pub knockback_resistance: f32,
+    /// The `repairIngredient` item tag, `namespace:path`.
+    pub repair_items: String,
+    /// The `assetId` key's identifier, `namespace:path`.
+    pub asset_id: Option<String>,
+}
+
+/// An `ArmorType` enum constant's fields.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ArmorType {
+    /// `getName()`: `helmet`, `chestplate`, `leggings`, `boots` or `body`.
+    pub name: String,
+    /// The slot's serialized name: `head`, `chest`, `legs`, `feet` or `body`.
+    pub slot: String,
+    /// `unitDurability`, the multiplier `getDurability` applies.
+    pub unit_durability: i32,
+}
+
 /// What a mod's `Item.Properties` accumulated: the data components vanilla's
 /// methods would have set, and the tool kind.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ItemProperties {
     pub components: Map<String, Value>,
     pub kind: Option<ToolKind>,
+    /// The `SoundEvents` constant named by an `equippable` component's
+    /// `equip_sound`. Its id lives in the class's initializer, so
+    /// `Registry.register` resolves it into the component.
+    pub equip_sound_constant: Option<String>,
     /// `Properties` methods this runtime does not model, as `name + descriptor`.
     pub unsupported: Vec<String>,
 }
@@ -180,6 +218,46 @@ impl ItemProperties {
     /// `Properties.repairable(Item)`: a single item.
     pub fn repairable_item(&mut self, item: &str) {
         self.set("minecraft:repairable", json!({ "items": item }));
+    }
+
+    /// `Properties.humanoidArmor(material, type)`: durability scaled by the
+    /// type, the material's attribute modifiers, enchantability, an
+    /// `equippable` for the type's slot and the repair tag.
+    pub fn humanoid_armor(&mut self, material: &ArmorMaterial, armor: &ArmorType) {
+        self.durability(armor.unit_durability.wrapping_mul(material.durability));
+        // `ArmorMaterial.createAttributes`: armor and toughness always, knockback
+        // resistance only when positive, all under `armor.<type>`.
+        let modifier = |attribute: &str, amount: f64| {
+            json!({
+                "type": attribute,
+                "id": format!("minecraft:armor.{}", armor.name),
+                "amount": double(amount),
+                "operation": "add_value",
+                "slot": armor.slot,
+            })
+        };
+        let mut modifiers = vec![
+            modifier("minecraft:armor", f64::from(material.defense)),
+            modifier("minecraft:armor_toughness", f64::from(material.toughness)),
+        ];
+        if material.knockback_resistance > 0.0 {
+            modifiers.push(modifier(
+                "minecraft:knockback_resistance",
+                f64::from(material.knockback_resistance),
+            ));
+        }
+        self.set("minecraft:attribute_modifiers", Value::Array(modifiers));
+        self.enchantable(material.enchantment_value);
+        // `Equippable.builder(slot)`: swappable, dispensable and damage-on-hurt
+        // default to true, which the codec's defaults already say.
+        let mut equippable = Map::new();
+        equippable.insert("slot".into(), json!(armor.slot));
+        if let Some(asset) = &material.asset_id {
+            equippable.insert("asset_id".into(), json!(asset));
+        }
+        self.set("minecraft:equippable", Value::Object(equippable));
+        self.equip_sound_constant = material.equip_sound_constant.clone();
+        self.repairable_tag(&material.repair_items);
     }
 
     /// `ToolMaterial.applyCommonProperties`.
@@ -336,6 +414,16 @@ const TRANSFORMING_TOOL_COMPONENTS: &[&str] = &[
     "minecraft:weapon",
 ];
 
+/// The components `humanoidArmor` sets, which the vanilla armor templates carry.
+const ARMOR_COMPONENTS: &[&str] = &[
+    "minecraft:attribute_modifiers",
+    "minecraft:damage",
+    "minecraft:enchantable",
+    "minecraft:equippable",
+    "minecraft:max_damage",
+    "minecraft:repairable",
+];
+
 fn template(kind: Option<ToolKind>) -> Template {
     let tool = |id, specific| Template {
         id,
@@ -350,6 +438,10 @@ fn template(kind: Option<ToolKind>) -> Template {
         Some(ToolKind::Axe) => tool("minecraft:diamond_axe", TRANSFORMING_TOOL_COMPONENTS),
         Some(ToolKind::Shovel) => tool("minecraft:diamond_shovel", TRANSFORMING_TOOL_COMPONENTS),
         Some(ToolKind::Hoe) => tool("minecraft:diamond_hoe", TRANSFORMING_TOOL_COMPONENTS),
+        Some(ToolKind::Helmet) => tool("minecraft:diamond_helmet", ARMOR_COMPONENTS),
+        Some(ToolKind::Chestplate) => tool("minecraft:diamond_chestplate", ARMOR_COMPONENTS),
+        Some(ToolKind::Leggings) => tool("minecraft:diamond_leggings", ARMOR_COMPONENTS),
+        Some(ToolKind::Boots) => tool("minecraft:diamond_boots", ARMOR_COMPONENTS),
         // Vanilla builds flint with `registerItem(key)`, i.e. `new Item(new
         // Properties())`: no item-specific behaviour class, and only the
         // components every item has (no fuel value, trim material or food).

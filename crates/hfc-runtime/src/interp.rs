@@ -2863,9 +2863,13 @@ impl Interpreter {
         None
     }
 
-    /// The tag path a vanilla tag class binds `field_name` to: its initializer
-    /// is `ldc "<path>"; invokestatic create/bind; putstatic FIELD`.
-    fn vanilla_tag_path(&mut self, class_name: &str, field_name: &str) -> Option<String> {
+    /// The string a vanilla class's initializer binds `field_name` to (a tag path,
+    /// or a sound id): `ldc "<path>"; invokestatic create/bind; putstatic FIELD`.
+    pub(crate) fn vanilla_tag_path(
+        &mut self,
+        class_name: &str,
+        field_name: &str,
+    ) -> Option<String> {
         let _ = self.loader.get_or_load(class_name);
         let code = self
             .loader

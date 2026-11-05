@@ -57,6 +57,17 @@ pub enum Flow {
     Cancel,
 }
 
+/// The identifier of a GUI texture entry in a mod jar:
+/// `assets/<namespace>/textures/gui/<path>.png` is
+/// `<namespace>:textures/gui/<path>.png`, the name a mod passes to
+/// `TextureManager.getTexture`.
+fn gui_texture_key(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("assets/")?;
+    let (namespace, path) = rest.split_once('/')?;
+    (path.starts_with("textures/gui/") && path.ends_with(".png"))
+        .then(|| format!("{namespace}:{path}"))
+}
+
 /// Metadata for a discovered Fabric mod.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricModMetadata {
@@ -379,6 +390,24 @@ impl FabricBridge {
                     }
                 }
 
+                // 2b. The real sizes of the GUI textures the jar ships, for
+                // `TextureManager.getTexture(id).getTexture()` readers.
+                for i in 0..archive.len() {
+                    if let Ok(mut entry) = archive.by_index(i) {
+                        if let Ok(name) = entry.name() {
+                            let name = name.to_string();
+                            if let Some(key) = gui_texture_key(&name) {
+                                let mut head = [0u8; 24];
+                                if std::io::Read::read_exact(&mut entry, &mut head).is_ok()
+                                    && let Some(size) = crate::builtins::png_size(&head)
+                                {
+                                    self.interp.heap.gui_texture_sizes.insert(key, size);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 3. Scan nested JARs for fabric.mod.json and translations
                 let mut nested_jars = Vec::new();
                 for i in 0..archive.len() {
@@ -430,6 +459,21 @@ impl FabricBridge {
                                                                 .extend(entries);
                                                         }
                                                     }
+                                                }
+                                            } else if let Some(key) = gui_texture_key(&name) {
+                                                let mut head = [0u8; 24];
+                                                if std::io::Read::read_exact(
+                                                    &mut sub_entry,
+                                                    &mut head,
+                                                )
+                                                .is_ok()
+                                                    && let Some(size) =
+                                                        crate::builtins::png_size(&head)
+                                                {
+                                                    self.interp
+                                                        .heap
+                                                        .gui_texture_sizes
+                                                        .insert(key, size);
                                                 }
                                             }
                                         }

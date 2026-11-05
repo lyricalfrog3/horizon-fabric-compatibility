@@ -93,8 +93,9 @@ the server applies the harvest.
 | Fabric `PlayerBlockBreakEvents.BEFORE` | dispatched by the runtime (`FabricBridge::block_break_before`) | Veinminer's listener runs end to end in a test: it breaks the connected ore through `ServerPlayerGameMode.destroyBlock`, and the bridge hands each broken position to `HostBridge::break_block`. The client calls it from `native_destroy_block`; a live run broke a 5-block coal row with one break and a pickaxe carrying the mod's enchantment (offscreen run, no durability or drops for the extra blocks beyond what `Game::break_block` does). |
 | Fabric `ServerLifecycleEvents.SERVER_STARTING` | dispatched (`FabricBridge::server_starting`) | runs with an empty `MinecraftServer`; the client calls it once after `init` |
 | Fabric `ItemTooltipCallback` | dispatched | text lines can be added/changed |
-| Iceberg `RenderTooltipEvents.COLOREXT` | dispatched | background/border colors and gradient flags |
-| Iceberg `GATHER` / `POSTEXT` | **not dispatched** | Legendary Tooltips needs these for its frame |
+| Iceberg `RenderTooltipEvents.COLOREXT` | dispatched | background/border colors; the callback gets the real client level's registry access and the host's item rarity |
+| Iceberg `RenderTooltipEvents.POSTEXT` | dispatched | returns a `GuiDraw` list the host replays after the tooltip text; this is where Legendary Tooltips draws its frame and shadow |
+| Iceberg `RenderTooltipEvents.GATHER` | **not dispatched** | it adds the item-model and padding components, which the host does not render yet |
 | Fabric `ScreenEvents.AFTER_INIT` | dispatched | runs for every initialized mod screen |
 | Fabric `ClientTickEvents` | dispatched | runs once per host tick, before the screen tick |
 | Fabric key mappings | supported | `KeyMapping`, `KeyMappingHelper` and `consumeClick`; the host binds by translation key or physical key |
@@ -208,25 +209,57 @@ off a library such as Fabric API leaves the mods that need it to fail.
 
 ### Legendary Tooltips
 
-Initialization and `COLOREXT` dispatch work, but the callback depends on
-`Minecraft.getInstance().level` and registry access; the runtime does not provide a live
-client level, so the callback returns the incoming colors. The visible frame is also a
-nine-slice texture produced through `GATHER`/`POSTEXT`, and Horizon's tooltip renderer draws
-only a solid background plus top/bottom border colors. Mod tooltip textures are not loaded.
-Until a textured tooltip renderer, those two events and a live client level exist, the mod's
-frame will not be visible even though its listener runs.
+The mod's own frame is rendered. Iceberg fires `RenderTooltipEvents.POSTEXT` at the tail of
+Minecraft's tooltip pass; Legendary's `TooltipDecor.drawBorder` slices
+`legendarytooltips:textures/gui/tooltip_borders.png` into 8 px corners and edges and blits
+each part. The bridge dispatches `POSTEXT` with a real `GuiGraphicsExtractor` display list,
+`ItemStack`, font and tooltip geometry, and the client replays the returned draws after the
+tooltip text.
+
+What the frame path needed:
+
+- `COLOREXT` reads `Minecraft.getInstance().level.registryAccess()`. The runtime answers
+  `Level.registryAccess()` from the host-loaded registry snapshot, so the listener no longer
+  returns the incoming colors.
+- `Selectors.itemMatches` compares `ItemStack.getRarity()` with `Rarity.EPIC`; the runtime
+  resolves the real enum field from the item's host-reported rarity, so `!epic` / `!rare`
+  selectors work. Reference equality with `Rarity.EPIC` holds because both names resolve to
+  the same enum constant.
+- `TextureManager.getTexture(id).getTexture().getWidth()` reports the real size of a PNG the
+  mod ships. `load_mod_jar` records the IHDR size of every `assets/*/textures/gui/*.png`.
+- `GuiGraphicsExtractor.blit(texture, x, y, w, h, u0, u1, v0, v1)` records the sampled
+  sub-rectangle, and the host applies it to the texture's atlas region. Without that, a
+  nine-slice frame would stretch the whole sheet into every corner.
+- The host keeps its own tooltip background when the mod returns a fully transparent one.
+  Legendary uses transparent level-0 colors because Iceberg's background-cancelling mixin
+  supplies the surface; that mixin is not applied here, so the host box stays.
+
+Verified live: hovering an enchanted netherite pickaxe shows the gold frame with readable
+text; a common item keeps the normal dark tooltip and no frame. `tests/legendary_tooltips.rs`
+asserts the epic frame blits (sub-rectangles) and non-zero common colors.
+
+Still partial: the centred title comes from Legendary's `GuiGraphicsMixin` (a mixin
+callback, not an event), the name separator needs a `ClientTooltipComponent` list (the bridge
+passes an empty one), `GATHER` is not dispatched, and the 3D item model and shine animation
+are not rendered.
 
 ## GUI replay
 
 `GuiGraphicsExtractor` calls are recorded into a `GuiDraw` display list
 (`crates/hfc-runtime/src/minecraft.rs`) instead of touching the GPU:
 `fill`, `fillGradient`, `text`, `centeredText`, `blit`, `blitSprite`, and scissor bounds.
+`fillGradient` is recorded as `GuiDraw::Gradient` (both colours) and replayed with
+`HudBatch::fill_gradient`. A blit carries the normalised `u0..u1`/`v0..v1` it samples, so a
+nine-slice frame can blit one corner of a larger sheet; the host crops the texture's atlas
+region to that sub-rectangle.
+
 `FabricBridge::render_screen(width, height, partial_tick)` runs the real
 `Screen.extractRenderStateWithTooltipAndSubtitles` and returns that list. The host
-(`Game::draw_fabric_screen`) replays fills, text and scissor clipping through `HudBatch`; it
-draws a blit from the HUD atlas when the sprite is packed there, or from a texture the mod
-registered (`TextureManager.register`) after decoding its PNG into the atlas's run-time region.
-`Screen::init` runs whenever the screen object or GUI size changes.
+(`Game::draw_fabric_screen`) replays fills, gradients, text and scissor clipping through
+`HudBatch`; it draws a blit from the HUD atlas when the sprite is packed there, or from a
+texture the mod registered (`TextureManager.register`) or ships in its jar after decoding its
+PNG into the atlas's run-time region. `Screen::init` runs whenever the screen object or GUI
+size changes.
 
 Input is a host boundary too. `FabricBridge` builds real `KeyEvent`, `CharacterEvent` and
 `MouseButtonEvent` objects (with their 26.3 field layouts) and dispatches to the screen's
@@ -297,6 +330,18 @@ metadata drives this in `reflect.rs`, ahead of the builtins:
   appended to a `StringBuilder` contributes its `toString()`.
 - A mod's own static field that nothing assigned is `null`; only platform classes
   get synthesized statics.
+- An inherited static field resolves to the class that declares it: `getstatic
+  Subclass.field` and `putstatic Subclass.field` use the superclass's storage, as a JVM
+  does. Iceberg's `LegendaryTooltipsConfig.getInstance()` reads the config map through a
+  field inherited from `IcebergConfig`.
+- `List.of`/`Set.of`/`Map.of` and their `copyOf` forms return the runtime's own
+  list/set/map, not a JDK-internal class the heap cannot model. A class that extends a
+  modeled collection (an anonymous `HashMap` subclass calling its inherited `put`) also
+  dispatches to that storage.
+- Library adapters implement mixin-added interfaces where the project applies no general
+  mixins. Prism's `TextColorMixin` makes `TextColor` an `IColor`; the runtime answers
+  `IColor.getIntValue/getName/isAnimated` for `TextColor` receivers, which is what
+  tooltip color derivation reads.
 - File watchers (`WatchService`, `Path.register`) are inert: nothing changes on disk
   while the game runs, so a config is not reloaded live.
 

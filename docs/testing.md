@@ -37,8 +37,8 @@ mod's id or class name is not coverage and must not be added.
 | `hfc-cache` (keying, commit, recovery, prune, stats) | 6 |
 | `hfc-bootstrap` unit (config, state, report, install, ids, carry verification) | 12 |
 | `hfc-bootstrap` end to end | 5 |
-| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, mixin menu widgets, Mod Menu screen) | 17 |
-| **HFC total** | **61** |
+| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, mixin menu widgets, Mod Menu screen, Legendary tooltip frame) | 19 |
+| **HFC total** | **63** |
 | Launcher `fabric_compat` (`cargo test --lib fabric_compat`) | 3 |
 
 `cargo test --workspace` also runs the tests of the path-dependency crates under
@@ -52,6 +52,13 @@ click Done, and scroll an overflowing list with both the wheel and a scrollbar d
 further tests run the widget-adding mixin callbacks for the title and pause menus, assert each
 produces a `Mods` widget, that the widget renders, and that clicking it installs `ModsScreen`.
 Those tests skip when the pinned jars or a Minecraft install are absent.
+
+`tests/legendary_tooltips.rs` loads Fabric API, Iceberg, Prism and Legendary Tooltips, lets
+the mod write and load its default config, then drives the tooltip colour and post-render
+calls the client makes. It asserts that an epic item returns at least the frame's four
+corner blits, each sampling a sub-rectangle of `legendarytooltips:textures/gui/tooltip_borders.png`,
+and that a common item selects no frame but still returns non-transparent background and
+border colours.
 
 The end-to-end tests cover:
 

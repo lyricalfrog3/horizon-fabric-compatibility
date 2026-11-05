@@ -199,7 +199,7 @@ fn identifier_argument(heap: &Heap, args: &[Value], from: usize) -> String {
 
 /// The size in a PNG's IHDR chunk. `NativeImage.read` only needs the header;
 /// the host decodes the pixels when it draws the registered texture.
-fn png_size(data: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn png_size(data: &[u8]) -> Option<(u32, u32)> {
     const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if data.len() >= 24 && &data[..8] == SIGNATURE {
         let width = u32::from_be_bytes(data[16..20].try_into().ok()?);
@@ -790,7 +790,15 @@ fn registry_method(
 ) -> Option<BuiltinResult> {
     let handled = |v: Value| Some(BuiltinResult::Handled(v));
     match (class_name, method_name) {
-        ("net/minecraft/server/MinecraftServer", "registryAccess") => {
+        (
+            "net/minecraft/server/MinecraftServer"
+            | "net/minecraft/world/level/Level"
+            | "net/minecraft/client/multiplayer/ClientLevel"
+            | "net/minecraft/server/level/ServerLevel",
+            "registryAccess",
+        ) => {
+            // The client level's registry access is the host's registry
+            // snapshot, the same one `lookupOrThrow`/`Registry` answer from.
             let id = heap.alloc(JavaObject::Instance {
                 class_name: "net/minecraft/core/RegistryAccess$Frozen".into(),
                 fields: HashMap::new(),
@@ -950,6 +958,27 @@ pub fn dispatch_builtin(
                 args,
                 virtual_dispatch,
             );
+        }
+    }
+
+    // A class that extends a modeled collection has the runtime's own list,
+    // map or set storage (its superclass constructor installed it). The call
+    // site names the subclass — an anonymous `HashMap` subclass calling its
+    // inherited `put`, for example — so dispatch by what the receiver holds.
+    if virtual_dispatch && !class_name.starts_with("java/") {
+        let concrete = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::Map(_)) => Some("java/util/HashMap"),
+                Some(JavaObject::List(_)) => Some("java/util/ArrayList"),
+                Some(JavaObject::Set(_)) => Some("java/util/HashSet"),
+                Some(JavaObject::Iterator { .. }) => Some("java/util/Iterator"),
+                Some(JavaObject::Stream(_)) => Some("java/util/stream/Stream"),
+                _ => None,
+            });
+        if let Some(concrete) = concrete {
+            return dispatch_builtin(heap, concrete, method_name, descriptor, args, false);
         }
     }
 
@@ -2946,6 +2975,67 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::Object(Some(sid)));
     }
 
+    // The immutable collection factories (`List.of`, `Set.of`, `Map.of`,
+    // `List.copyOf`, ...). They return JDK-internal classes the heap does not
+    // model, so a caller that later invokes `size`/`get` on the result would
+    // see an empty collection. Prism builds its `DynamicColor` values list
+    // with `List.of`, so a tooltip color derived from it would be transparent.
+    if matches!(class_name, "java/util/List" | "java/util/Set")
+        && matches!(method_name, "of" | "copyOf")
+    {
+        let items = if method_name == "copyOf" {
+            collection_items(heap, args.first().unwrap_or(&Value::NULL))
+        } else if descriptor.contains("[Ljava/lang/Object;") {
+            args.first()
+                .and_then(|value| value.as_obj())
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Array { elements, .. }) => Some(elements.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        } else {
+            args.to_vec()
+        };
+        let id = if class_name == "java/util/Set" {
+            heap.alloc_set(items)
+        } else {
+            heap.alloc_list(items)
+        };
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
+    if class_name == "java/util/Map" && matches!(method_name, "of" | "ofEntries" | "copyOf") {
+        let entries: Vec<(Value, Value)> = if method_name == "copyOf" {
+            match args
+                .first()
+                .and_then(|value| value.as_obj())
+                .and_then(|id| heap.get(id))
+            {
+                Some(JavaObject::Map(entries)) => entries.clone(),
+                _ => Vec::new(),
+            }
+        } else if method_name == "ofEntries" {
+            collection_items(heap, &args[0])
+                .into_iter()
+                .filter_map(|entry| {
+                    let id = entry.as_obj()?;
+                    match heap.get(id)? {
+                        JavaObject::Instance { fields, .. } => {
+                            Some((fields.get("key")?.clone(), fields.get("value")?.clone()))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        } else {
+            args.chunks_exact(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .collect()
+        };
+        let id = heap.alloc(JavaObject::Map(entries));
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
     // Map & HashMap & LinkedHashMap & ConcurrentHashMap
     if class_name == "java/util/Map"
         || class_name == "java/util/HashMap"
@@ -4420,6 +4510,70 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::NULL);
     }
 
+    // A texture a mod asks the manager for (Legendary Tooltips measures its
+    // frame sheet before slicing it). The runtime has no GPU texture, but the
+    // loaded mod jars do hold the PNG, so the size it answers is the image's
+    // real size. `AbstractTexture.getTexture()` carries that to `GpuTexture`.
+    if class_name == "net/minecraft/client/renderer/texture/TextureManager"
+        && method_name == "getTexture"
+        && args.len() >= 2
+    {
+        let mut fields = HashMap::new();
+        fields.insert("identifier".to_string(), args[1].clone());
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/client/renderer/texture/AbstractTexture".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
+    if class_name == "net/minecraft/client/renderer/texture/AbstractTexture"
+        && method_name == "getTexture"
+    {
+        let identifier = args
+            .first()
+            .and_then(|value| value.as_obj())
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => fields.get("identifier").cloned(),
+                _ => None,
+            })
+            .map(|value| identifier_of(heap, &value))
+            .unwrap_or_default();
+        let (width, height) = heap
+            .gui_texture_sizes
+            .get(&identifier)
+            .copied()
+            .unwrap_or((0, 0));
+        let mut fields = HashMap::new();
+        fields.insert("width".to_string(), Value::Int(width as i32));
+        fields.insert("height".to_string(), Value::Int(height as i32));
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "com/mojang/renderpearl/api/textures/GpuTexture".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+
+    if class_name == "com/mojang/renderpearl/api/textures/GpuTexture"
+        && matches!(method_name, "getWidth" | "getHeight")
+    {
+        let field = if method_name == "getWidth" {
+            "width"
+        } else {
+            "height"
+        };
+        let size = args
+            .first()
+            .and_then(|value| value.as_obj())
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => fields.get(field),
+                _ => None,
+            })
+            .map(|value| value.as_int())
+            .unwrap_or(0);
+        return BuiltinResult::Handled(Value::Int(size));
+    }
+
     if class_name == "net/minecraft/client/renderer/texture/TextureManager"
         && method_name == "register"
         && args.len() >= 3
@@ -4782,7 +4936,18 @@ pub fn dispatch_builtin(
             return BuiltinResult::Handled(args[0].clone());
         }
         let mut draw = None;
-        if method_name == "fill" && args.len() >= 6 {
+        let pipeline =
+            descriptor.starts_with("(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;");
+        if method_name == "fill" && args.len() >= 7 && pipeline && descriptor.contains("IIIII)") {
+            // `fill(pipeline, x1, y1, x2, y2, color)`.
+            draw = Some(GuiDraw::Fill {
+                x1: args[2].as_int(),
+                y1: args[3].as_int(),
+                x2: args[4].as_int(),
+                y2: args[5].as_int(),
+                color: args[6].as_int(),
+            });
+        } else if method_name == "fill" && args.len() >= 6 && !pipeline {
             draw = Some(GuiDraw::Fill {
                 x1: args[1].as_int(),
                 y1: args[2].as_int(),
@@ -4791,12 +4956,24 @@ pub fn dispatch_builtin(
                 color: args[5].as_int(),
             });
         } else if method_name == "fillGradient" && args.len() >= 7 {
-            draw = Some(GuiDraw::Fill {
-                x1: args[1].as_int(),
-                y1: args[2].as_int(),
-                x2: args[3].as_int(),
-                y2: args[4].as_int(),
-                color: args[5].as_int(),
+            let (from, to) = (args[5].as_int(), args[6].as_int());
+            draw = Some(if from == to {
+                GuiDraw::Fill {
+                    x1: args[1].as_int(),
+                    y1: args[2].as_int(),
+                    x2: args[3].as_int(),
+                    y2: args[4].as_int(),
+                    color: from,
+                }
+            } else {
+                GuiDraw::Gradient {
+                    x1: args[1].as_int(),
+                    y1: args[2].as_int(),
+                    x2: args[3].as_int(),
+                    y2: args[4].as_int(),
+                    color_from: from,
+                    color_to: to,
+                }
             });
         } else if (method_name == "horizontalLine" || method_name == "verticalLine")
             && args.len() >= 5
@@ -4843,47 +5020,94 @@ pub fn dispatch_builtin(
         } else if (method_name == "blit" || method_name == "blitSprite") && args.len() >= 5 {
             // Pipeline-taking overloads carry the pipeline before the texture.
             let texture = identifier_argument(heap, args, 1);
-            // `blitSprite(pipeline, texture, x, y, width, height, ...)` keeps
-            // the texture before x. `blit` has a direct
-            // `(Identifier, x, y, width, height, ...)` overload and pipeline
-            // overloads shaped `(pipeline, texture, x, y, u, v, width, height, ...)`.
-            let pipeline =
-                descriptor.starts_with("(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;");
             // `args[0]` is the receiver, so every Java parameter is one higher
             // than its descriptor slot.
-            let (x, y, width, height) = if method_name == "blitSprite" {
+            let direct_uv = descriptor.starts_with("(Lnet/minecraft/resources/Identifier;")
+                && descriptor.ends_with("FFFF)V")
+                && args.len() >= 10;
+            let (x, y, width, height, u0, u1, v0, v1) = if method_name == "blitSprite" {
                 (
                     args.get(3).map(Value::as_int).unwrap_or(0),
                     args.get(4).map(Value::as_int).unwrap_or(0),
                     args.get(5).map(Value::as_int).unwrap_or(16).max(1),
                     args.get(6).map(Value::as_int).unwrap_or(16).max(1),
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0,
                 )
-            } else if pipeline {
+            } else if pipeline && args.len() >= 11 {
+                // `blit(pipeline, texture, x, y, u, v, uWidth, vHeight,
+                // texWidth, texHeight)`: `u`/`v` are texels and the destination
+                // keeps the sampled size.
+                let u = args[5].as_float();
+                let v = args[6].as_float();
+                let u_width = args[7].as_int() as f32;
+                let v_height = args[8].as_int() as f32;
+                let tex_width = args[9].as_int() as f32;
+                let tex_height = args[10].as_int() as f32;
+                let (u0, u1) = if tex_width > 0.0 {
+                    (u / tex_width, (u + u_width) / tex_width)
+                } else {
+                    (0.0, 1.0)
+                };
+                let (v0, v1) = if tex_height > 0.0 {
+                    (v / tex_height, (v + v_height) / tex_height)
+                } else {
+                    (0.0, 1.0)
+                };
                 (
-                    args.get(3).map(Value::as_int).unwrap_or(0),
-                    args.get(4).map(Value::as_int).unwrap_or(0),
-                    args.get(7).map(Value::as_int).unwrap_or(16).max(1),
-                    args.get(8).map(Value::as_int).unwrap_or(16).max(1),
+                    args[3].as_int(),
+                    args[4].as_int(),
+                    u_width as i32,
+                    v_height as i32,
+                    u0,
+                    u1,
+                    v0,
+                    v1,
+                )
+            } else if direct_uv {
+                // `blit(texture, x, y, width, height, u0, u1, v0, v1)`: the
+                // corners are already normalised, which is how a mod draws a
+                // nine-slice frame (one corner or edge of a larger sheet).
+                (
+                    args[2].as_int(),
+                    args[3].as_int(),
+                    args[4].as_int(),
+                    args[5].as_int(),
+                    args[6].as_float(),
+                    args[7].as_float(),
+                    args[8].as_float(),
+                    args[9].as_float(),
                 )
             } else {
-                // The direct overload takes a bounding box: `x0, y0, x1, y1`.
-                let x0 = args.get(2).map(Value::as_int).unwrap_or(0);
-                let y0 = args.get(3).map(Value::as_int).unwrap_or(0);
-                let x1 = args.get(4).map(Value::as_int).unwrap_or(x0 + 16);
-                let y1 = args.get(5).map(Value::as_int).unwrap_or(y0 + 16);
                 (
-                    x0.min(x1),
-                    y0.min(y1),
-                    (x1 - x0).abs().max(1),
-                    (y1 - y0).abs().max(1),
+                    args.get(2).map(Value::as_int).unwrap_or(0),
+                    args.get(3).map(Value::as_int).unwrap_or(0),
+                    args.get(4).map(Value::as_int).unwrap_or(16),
+                    args.get(5).map(Value::as_int).unwrap_or(16),
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0,
                 )
+            };
+            let finite = [u0, u1, v0, v1].iter().all(|value| value.is_finite());
+            let (u0, u1, v0, v1) = if finite {
+                (u0, u1, v0, v1)
+            } else {
+                (0.0, 1.0, 0.0, 1.0)
             };
             draw = Some(GuiDraw::Blit {
                 texture,
                 x,
                 y,
-                width,
-                height,
+                width: width.max(1),
+                height: height.max(1),
+                u0,
+                u1,
+                v0,
+                v1,
             });
         } else if method_name == "enableScissor" && args.len() >= 5 {
             draw = Some(GuiDraw::Scissor {
@@ -5877,6 +6101,35 @@ pub fn dispatch_builtin(
             }
             let list_id = heap.alloc_list(Vec::new());
             return BuiltinResult::Handled(Value::Object(Some(list_id)));
+        }
+    }
+
+    // Prism's `TextColorMixin` makes Minecraft's `TextColor` implement its
+    // `IColor` interface by reading the color's value and name. The runtime
+    // does not apply general mixins, so the library's interface methods are
+    // answered here for `TextColor` receivers; `DynamicColor` (a TextColor
+    // subclass) keeps its own animated implementation.
+    if class_name == "com/anthonyhilyard/prism/util/IColor"
+        && let Some(JavaObject::Instance {
+            class_name: actual,
+            fields,
+        }) = args
+            .first()
+            .and_then(|value| value.as_obj())
+            .and_then(|id| heap.get(id))
+        && actual == "net/minecraft/network/chat/TextColor"
+    {
+        match method_name {
+            "getIntValue" => {
+                return BuiltinResult::Handled(
+                    fields.get("value").cloned().unwrap_or(Value::Int(0)),
+                );
+            }
+            "getName" => {
+                return BuiltinResult::Handled(fields.get("name").cloned().unwrap_or(Value::NULL));
+            }
+            "isAnimated" => return BuiltinResult::Handled(Value::from_bool(false)),
+            _ => {}
         }
     }
 

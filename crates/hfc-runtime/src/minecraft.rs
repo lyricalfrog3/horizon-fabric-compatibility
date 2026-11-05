@@ -17,18 +17,36 @@ pub enum GuiDraw {
         y2: i32,
         color: i32,
     },
+    /// A rectangle shading from `color_from` at the top to `color_to` at the
+    /// bottom, as `GuiGraphicsExtractor.fillGradient`.
+    Gradient {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        color_from: i32,
+        color_to: i32,
+    },
     Text {
         text: String,
         x: i32,
         y: i32,
         color: i32,
     },
+    /// A texture rectangle. `u0..u1` and `v0..v1` are the part of the texture
+    /// to sample, normalised to its size (`0..1` is the whole image), so a mod
+    /// that draws a nine-slice frame from one texture keeps its corners and
+    /// edges rather than stretching the sheet.
     Blit {
         texture: String,
         x: i32,
         y: i32,
         width: i32,
         height: i32,
+        u0: f32,
+        u1: f32,
+        v0: f32,
+        v1: f32,
     },
     Scissor {
         x1: i32,
@@ -409,6 +427,9 @@ pub struct ItemStack {
     pub damage: i32,
     /// Enchantment id and level pairs, as the host reports them.
     pub enchantments: Vec<(String, i32)>,
+    /// The item's rarity (`common`, `uncommon`, `rare`, `epic`) as the host's
+    /// item data reports it. Mods read it through `ItemStack.getRarity()`.
+    pub rarity: Option<String>,
 }
 
 impl ItemStack {
@@ -418,7 +439,13 @@ impl ItemStack {
             count,
             damage: 0,
             enchantments: Vec::new(),
+            rarity: None,
         }
+    }
+
+    pub fn with_rarity(mut self, rarity: Option<&str>) -> Self {
+        self.rarity = rarity.map(str::to_string);
+        self
     }
 
     pub fn empty() -> Self {

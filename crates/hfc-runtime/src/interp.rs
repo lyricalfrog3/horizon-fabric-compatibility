@@ -1318,6 +1318,27 @@ impl Interpreter {
             return result;
         }
 
+        // `ItemStack.getRarity()` reads the item's `DataComponents.RARITY`
+        // component, which comes from the host's item data here. Resolving the
+        // enum field (rather than allocating a look-alike) keeps reference
+        // comparison with `Rarity.EPIC` in mod code working, which is how
+        // selectors such as Iceberg's `!epic` choose a tooltip frame.
+        if class_name == "net/minecraft/world/item/ItemStack" && method_name == "getRarity" {
+            let rarity = args
+                .first()
+                .and_then(|value| value.as_obj())
+                .and_then(|id| self.heap.get_native::<ItemStack>(id))
+                .and_then(|stack| stack.rarity.clone());
+            let field = match rarity.as_deref() {
+                Some("uncommon") => "UNCOMMON",
+                Some("rare") => "RARE",
+                Some("epic") => "EPIC",
+                _ => "COMMON",
+            };
+            let _ = self.ensure_initialized("net/minecraft/world/item/Rarity");
+            return Ok(self.resolve_static_field("net/minecraft/world/item/Rarity", field));
+        }
+
         // 1. Built-in shims
         match dispatch_builtin(
             &mut self.heap,
@@ -2251,7 +2272,13 @@ impl Interpreter {
                 } => {
                     self.ensure_initialized(class_name)?;
                     let val = stack.pop().unwrap_or(Value::NULL);
-                    if let Some(c) = self.loader.get_mut(class_name) {
+                    // An inherited static field belongs to the class that
+                    // declares it; writing it through the subclass must not
+                    // create a second slot.
+                    let owner = self
+                        .static_field_owner(class_name, field_name)
+                        .unwrap_or_else(|| class_name.clone());
+                    if let Some(c) = self.loader.get_mut(&owner) {
                         c.static_fields.insert(field_name.clone(), val);
                     }
                 }
@@ -2652,8 +2679,45 @@ impl Interpreter {
         crate::builtins::value_to_string(&self.heap, value)
     }
 
+    /// The class that declares `field_name` as a static field, following the
+    /// superclass chain. A JVM resolves `getstatic Subclass.inheritedField`
+    /// against the class that actually declares it, so both `Subclass.x` and
+    /// `Superclass.x` name one storage slot.
+    fn static_field_owner(&mut self, class_name: &str, field_name: &str) -> Option<String> {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(class_name.to_string());
+        let mut visited = std::collections::HashSet::new();
+        while let Some(curr) = queue.pop_front() {
+            if !visited.insert(curr.clone()) {
+                continue;
+            }
+            let _ = self.loader.get_or_load(&curr);
+            let Some(class) = self.loader.get(&curr) else {
+                continue;
+            };
+            if class
+                .fields
+                .get(field_name)
+                .is_some_and(|field| field.is_static)
+            {
+                return Some(curr);
+            }
+            if let Some(super_name) = &class.super_class {
+                queue.push_back(super_name.clone());
+            }
+            for iface in &class.interfaces {
+                queue.push_back(iface.clone());
+            }
+        }
+        None
+    }
+
     /// Resolve static field value or create fallback singleton.
     pub fn resolve_static_field(&mut self, class_name: &str, field_name: &str) -> Value {
+        let owner = self
+            .static_field_owner(class_name, field_name)
+            .unwrap_or_else(|| class_name.to_string());
+        let class_name = owner.as_str();
         let key = (class_name.to_string(), field_name.to_string());
         if let Some(val) = self.static_singletons.get(&key) {
             return val.clone();
@@ -2750,6 +2814,24 @@ impl Interpreter {
             let id = self.heap.alloc(JavaObject::Instance {
                 class_name: class_name.into(),
                 fields: f,
+            });
+            return Value::Object(Some(id));
+        }
+
+        if class_name == "net/minecraft/world/item/Rarity" {
+            let ordinal = match field_name {
+                "UNCOMMON" => 1,
+                "RARE" => 2,
+                "EPIC" => 3,
+                _ => 0,
+            };
+            let fid = self.heap.alloc_string(field_name);
+            let mut fields = HashMap::new();
+            fields.insert("name".to_string(), Value::Object(Some(fid)));
+            fields.insert("ordinal".to_string(), Value::Int(ordinal));
+            let id = self.heap.alloc(JavaObject::Instance {
+                class_name: class_name.into(),
+                fields,
             });
             return Value::Object(Some(id));
         }

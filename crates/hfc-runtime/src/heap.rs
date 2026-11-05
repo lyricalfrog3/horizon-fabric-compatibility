@@ -18,6 +18,10 @@ pub struct Heap {
     /// Textures mods registered with `TextureManager.register`, by identifier.
     /// The host draws them from the PNG bytes; the runtime never uploads.
     pub textures: HashMap<String, crate::minecraft::PngImage>,
+    /// Sizes of the GUI textures the loaded mod jars ship, by identifier. A mod
+    /// reading `TextureManager.getTexture(id).getTexture().getWidth()` gets the
+    /// real size of the PNG in its jar, which is what Minecraft reports.
+    pub gui_texture_sizes: HashMap<String, (u32, u32)>,
     /// What `java.nio.file` sees: the game directory on disk, or memory.
     pub fs: crate::vfs::Vfs,
     identifiers: HashMap<String, usize>,
@@ -41,6 +45,7 @@ impl Heap {
             translations: HashMap::new(),
             singletons: HashMap::new(),
             textures: HashMap::new(),
+            gui_texture_sizes: HashMap::new(),
             fs: crate::vfs::Vfs::default(),
             identifiers: HashMap::new(),
             registries: crate::registry::Registries::default(),

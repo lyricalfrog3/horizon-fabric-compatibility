@@ -251,6 +251,7 @@ fn test_item_tooltip_and_color_dispatch() {
     let mut border_bottom = 0x5028007f;
     bridge.item_tooltip_color(
         Some("minecraft:diamond_sword"),
+        Some("common"),
         &mut bg,
         &mut border_top,
         &mut border_bottom,

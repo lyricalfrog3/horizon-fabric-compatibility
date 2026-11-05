@@ -415,90 +415,170 @@ impl FabricBridge {
         }
     }
 
+    /// The client's `Font`, as `Minecraft.getInstance().font`.
+    fn minecraft_font(&mut self) -> Value {
+        let minecraft = self
+            .interp
+            .execute_method(
+                "net/minecraft/client/Minecraft",
+                "getInstance",
+                "()Lnet/minecraft/client/Minecraft;",
+                &[],
+            )
+            .ok();
+        minecraft
+            .and_then(|value| value.as_obj())
+            .and_then(|id| match self.interp.heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => fields.get("font").cloned(),
+                _ => None,
+            })
+            .unwrap_or(Value::NULL)
+    }
+
     /// Dispatches tooltip color queries to Iceberg `RenderTooltipEvents.COLOREXT` listeners.
     pub fn item_tooltip_color(
         &mut self,
         item_id: Option<&str>,
+        rarity: Option<&str>,
         background: &mut u32,
         border_top: &mut u32,
         border_bottom: &mut u32,
     ) {
-        let color_event = self.interp.resolve_static_field(
+        let listeners = self.event_listeners(
             "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents",
             "COLOREXT",
         );
-        if let Some(event_id) = color_event.as_obj() {
-            if let Some(JavaObject::Instance { fields, .. }) = self.interp.heap.get(event_id) {
-                if let Some(Value::Object(Some(arr_id))) = fields.get("listeners") {
-                    let arr_id = *arr_id;
-                    let listeners = if let Some(JavaObject::Array { elements, .. }) =
-                        self.interp.heap.get(arr_id)
-                    {
-                        elements.clone()
-                    } else {
-                        Vec::new()
-                    };
+        if listeners.is_empty() {
+            return;
+        }
+        let stack_val = if let Some(id) = item_id {
+            let sid = self
+                .interp
+                .heap
+                .alloc_item_stack(ItemStack::new(id, 1).with_rarity(rarity));
+            Value::Object(Some(sid))
+        } else {
+            Value::NULL
+        };
 
-                    if !listeners.is_empty() {
-                        let stack_val = if let Some(id) = item_id {
-                            let sid = self.interp.heap.alloc_item_stack(ItemStack::new(id, 1));
-                            Value::Object(Some(sid))
-                        } else {
-                            Value::NULL
-                        };
+        let bg_start = Value::Int(*background as i32);
+        let bg_end = Value::Int(*background as i32);
+        let border_start = Value::Int(*border_top as i32);
+        let border_end = Value::Int(*border_bottom as i32);
 
-                        let bg_start = Value::Int(*background as i32);
-                        let bg_end = Value::Int(*background as i32);
-                        let border_start = Value::Int(*border_top as i32);
-                        let border_end = Value::Int(*border_bottom as i32);
+        for listener in listeners {
+            let res = self.interp.execute_method(
+                "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents$ColorExt",
+                "onColor",
+                "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/client/gui/GuiGraphicsExtractor;IILnet/minecraft/client/gui/Font;IIIILjava/util/List;ZILnet/minecraft/resources/Identifier;ZZ)Lcom/anthonyhilyard/iceberg/events/client/RenderTooltipEvents$ColorExtResult;",
+                &[
+                    listener,
+                    stack_val.clone(),
+                    Value::NULL,
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::NULL,
+                    bg_start.clone(),
+                    bg_end.clone(),
+                    border_start.clone(),
+                    border_end.clone(),
+                    Value::NULL,
+                    Value::from_bool(false),
+                    Value::Int(0),
+                    Value::NULL,
+                    Value::from_bool(false),
+                    Value::from_bool(false),
+                ],
+            );
 
-                        for listener in listeners {
-                            let res = self.interp.execute_method(
-                                "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents$ColorExt",
-                                "onColor",
-                                "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/client/gui/GuiGraphicsExtractor;IILnet/minecraft/client/gui/Font;IIIILjava/util/List;ZILnet/minecraft/resources/Identifier;ZZ)Lcom/anthonyhilyard/iceberg/events/client/RenderTooltipEvents$ColorExtResult;",
-                                &[
-                                    listener,
-                                    stack_val.clone(),
-                                    Value::NULL,
-                                    Value::Int(0),
-                                    Value::Int(0),
-                                    Value::NULL,
-                                    bg_start.clone(),
-                                    bg_end.clone(),
-                                    border_start.clone(),
-                                    border_end.clone(),
-                                    Value::NULL,
-                                    Value::from_bool(false),
-                                    Value::Int(0),
-                                    Value::NULL,
-                                    Value::from_bool(false),
-                                    Value::from_bool(false),
-                                ],
-                            );
-
-                            if let Ok(Value::Object(Some(res_id))) = res {
-                                if let Some(JavaObject::Instance { fields, .. }) =
-                                    self.interp.heap.get(res_id)
-                                {
-                                    if let Some(bg) =
-                                        fields.get("backgroundStart").map(|v| v.as_int())
-                                    {
-                                        *background = bg as u32;
-                                    }
-                                    if let Some(bt) = fields.get("borderStart").map(|v| v.as_int())
-                                    {
-                                        *border_top = bt as u32;
-                                    }
-                                    if let Some(bb) = fields.get("borderEnd").map(|v| v.as_int()) {
-                                        *border_bottom = bb as u32;
-                                    }
-                                }
-                            }
-                        }
+            if let Ok(Value::Object(Some(res_id))) = res {
+                if let Some(JavaObject::Instance { fields, .. }) = self.interp.heap.get(res_id) {
+                    if let Some(bg) = fields.get("backgroundStart").map(|v| v.as_int()) {
+                        *background = bg as u32;
+                    }
+                    if let Some(bt) = fields.get("borderStart").map(|v| v.as_int()) {
+                        *border_top = bt as u32;
+                    }
+                    if let Some(bb) = fields.get("borderEnd").map(|v| v.as_int()) {
+                        *border_bottom = bb as u32;
                     }
                 }
             }
         }
+    }
+
+    /// Dispatches the tooltip's post-render draw to Iceberg
+    /// `RenderTooltipEvents.POSTEXT` listeners and returns what they recorded
+    /// into a `GuiGraphicsExtractor` display list. Minecraft calls this at the
+    /// tail of its tooltip pass, after the background, frame and text, which is
+    /// where a mod draws a custom frame (`TooltipDecor.drawBorder`) and shadow.
+    /// `x`/`y` are the tooltip positioner's text origin and `width`/`height`
+    /// the tooltip's text extent, the same values vanilla passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn item_tooltip_frame(
+        &mut self,
+        item_id: &str,
+        rarity: Option<&str>,
+        screen_width: i32,
+        screen_height: i32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Vec<GuiDraw> {
+        if !self.initialized {
+            let _ = self.init();
+        }
+        let listeners = self.event_listeners(
+            "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents",
+            "POSTEXT",
+        );
+        if listeners.is_empty() {
+            return Vec::new();
+        }
+        let stack = self
+            .interp
+            .heap
+            .alloc_item_stack(ItemStack::new(item_id, 1).with_rarity(rarity));
+        let graphics = self
+            .interp
+            .heap
+            .alloc_native(GuiGraphics::new(screen_width, screen_height));
+        let font = self.minecraft_font();
+        let components = self.interp.heap.alloc_list(Vec::new());
+
+        let prev_budget = self.interp.step_budget;
+        self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+        for listener in listeners {
+            self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+            let result = self.interp.execute_method(
+                "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents$PostExt",
+                "onPost",
+                "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/client/gui/GuiGraphicsExtractor;IILnet/minecraft/client/gui/Font;IILjava/util/List;ZIZ)V",
+                &[
+                    listener,
+                    Value::Object(Some(stack)),
+                    Value::Object(Some(graphics)),
+                    Value::Int(x),
+                    Value::Int(y),
+                    font.clone(),
+                    Value::Int(width),
+                    Value::Int(height),
+                    Value::Object(Some(components)),
+                    Value::from_bool(false),
+                    Value::Int(0),
+                    Value::from_bool(false),
+                ],
+            );
+            if let Err(error) = result {
+                log::warn!("RenderTooltipEvents.POSTEXT listener failed: {error}");
+            }
+        }
+        self.interp.step_budget = prev_budget;
+        self.interp
+            .heap
+            .get_native::<GuiGraphics>(graphics)
+            .map(|g| g.draws.clone())
+            .unwrap_or_default()
     }
 }

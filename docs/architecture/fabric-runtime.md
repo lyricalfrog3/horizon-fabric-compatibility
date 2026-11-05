@@ -252,8 +252,18 @@ What the path needed:
   time since the previous tooltip frame, which is what `TooltipDecor.updateTimer` and
   `ItemModelComponent.updateTimer` read.
 
-Verified live (frame): hovering an enchanted netherite pickaxe shows the gold frame with
-readable text; a common item keeps the normal dark tooltip and no frame.
+GUI pose: `GuiGraphicsExtractor.pose()` returns a real JOML `Matrix3x2fStack` (one per
+graphics object; push/pop/translate/rotate/scale run as JOML bytecode, with
+`joml.nounsafe=true` so JOML copies fields instead of using `Unsafe`). Every recorded draw
+is transformed by the current matrix: fills, gradients and scissors by both corners, a
+gradient under a quarter turn is recorded `horizontal`, and text, blits and items move and
+scale with it (their rotation is not applied). The item size starts from Iceberg's 16 px
+model square, and the host scales its GUI item draw to the recorded size.
+
+Verified live: hovering an enchanted netherite pickaxe shows the gold frame, the item in
+its model panel, the title beside it and the horizontal name separator under it; a common
+item keeps the normal dark tooltip and no frame. `rotated_gradients_land_inside_the_tooltip`
+checks the rotated gradients' placement.
 `tests/legendary_tooltips.rs` now also asserts that GATHER adds the item-model and padding
 components, that Legendary's HEAD injector padded (centred) the title, that the name
 separator fills were drawn, that the model component recorded a `GuiDraw::Item`, and that
@@ -261,8 +271,8 @@ the shine timer advances with real time.
 
 Still partial: the model is drawn through the GUI item renderer, so its recorded Y rotation
 is not applied (the HUD has no 3D model transform), and `model_rotation_speed = 0` (the
-current config) keeps it still. The shine's horizontal gradients are recorded as vertical
-ones because GUI pose rotation is not applied. A component type other than text or an image
+current config) keeps it still. The shine is recorded with the pose applied but has not
+been checked live. A component type other than text or an image
 component is only drawn if it implements `extractText`/`extractImage`.
 
 ## GUI replay

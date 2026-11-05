@@ -17,8 +17,10 @@ pub enum GuiDraw {
         y2: i32,
         color: i32,
     },
-    /// A rectangle shading from `color_from` at the top to `color_to` at the
-    /// bottom, as `GuiGraphicsExtractor.fillGradient`.
+    /// A rectangle shading from `color_from` to `color_to`, as
+    /// `GuiGraphicsExtractor.fillGradient`. When `horizontal` is false the
+    /// shade runs top to bottom; when true, `color_from` is on the left and
+    /// `color_to` on the right (the pose turned the vertical gradient).
     Gradient {
         x1: i32,
         y1: i32,
@@ -26,6 +28,7 @@ pub enum GuiDraw {
         y2: i32,
         color_from: i32,
         color_to: i32,
+        horizontal: bool,
     },
     Text {
         text: String,
@@ -72,6 +75,8 @@ pub struct GuiGraphics {
     pub width: i32,
     pub height: i32,
     pub draws: Vec<GuiDraw>,
+    /// The `org/joml/Matrix3x2fStack` returned by `pose()`, created on first use.
+    pub pose: Option<usize>,
 }
 
 /// A PNG a mod read through `NativeImage.read`. The runtime never decodes or
@@ -184,6 +189,7 @@ impl GuiGraphics {
             width,
             height,
             draws: Vec::new(),
+            pose: None,
         }
     }
 }

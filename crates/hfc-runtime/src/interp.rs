@@ -1435,6 +1435,40 @@ impl Interpreter {
             return Ok(Value::from_bool(true));
         }
 
+        // `GuiGraphicsExtractor.pose()` is a real JOML `Matrix3x2fStack`, built
+        // once per graphics object so its push/translate/rotate run as JOML
+        // bytecode. The recorder reads its matrix when a draw is pushed.
+        if class_name == "net/minecraft/client/gui/GuiGraphicsExtractor"
+            && method_name == "pose"
+            && let Some(graphics) = args.first().and_then(|v| v.as_obj())
+            && self.heap.get_native::<GuiGraphics>(graphics).is_some()
+        {
+            let existing = self
+                .heap
+                .get_native::<GuiGraphics>(graphics)
+                .and_then(|g| g.pose);
+            let pose = match existing {
+                Some(pose) => pose,
+                None => {
+                    const STACK: &str = "org/joml/Matrix3x2fStack";
+                    self.ensure_initialized(STACK)?;
+                    let id = self.alloc_uninitialized(STACK);
+                    let object = Value::Object(Some(id));
+                    self.execute_special_method(
+                        STACK,
+                        "<init>",
+                        "(I)V",
+                        &[object, Value::Int(64)],
+                    )?;
+                    if let Some(g) = self.heap.get_native_mut::<GuiGraphics>(graphics) {
+                        g.pose = Some(id);
+                    }
+                    id
+                }
+            };
+            return Ok(Value::Object(Some(pose)));
+        }
+
         // 1. Built-in shims
         match dispatch_builtin(
             &mut self.heap,

@@ -950,6 +950,168 @@ fn descriptor_object_params(descriptor: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// The pose matrix `[m00, m01, m10, m11, m20, m21]` of a graphics object's
+/// `Matrix3x2fStack`, identity when `pose()` was never called. JOML maps
+/// `x' = m00*x + m10*y + m20`, `y' = m01*x + m11*y + m21`.
+fn gui_pose_matrix(heap: &Heap, graphics: usize) -> [f32; 6] {
+    const IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let Some(pose) = heap
+        .get_native::<GuiGraphics>(graphics)
+        .and_then(|g| g.pose)
+    else {
+        return IDENTITY;
+    };
+    let Some(JavaObject::Instance { fields, .. }) = heap.get(pose) else {
+        return IDENTITY;
+    };
+    let mut m = IDENTITY;
+    for (slot, name) in ["m00", "m01", "m10", "m11", "m20", "m21"]
+        .iter()
+        .enumerate()
+    {
+        if let Some(value) = fields.get(*name) {
+            m[slot] = value.as_float();
+        }
+    }
+    if m.iter().all(|v| v.is_finite()) {
+        m
+    } else {
+        IDENTITY
+    }
+}
+
+/// Apply the GUI pose to a draw in the recording graphics, then record it.
+/// Rectangles (fill, gradient, scissor) transform both corners and take the
+/// bounds. Text, blits and items move and scale but are not rotated: the host
+/// has no rotated text or sprite path, so rotation is not applied to them.
+fn push_gui_draw(heap: &mut Heap, graphics: usize, draw: GuiDraw) {
+    let m = gui_pose_matrix(heap, graphics);
+    let [m00, m01, m10, m11, m20, m21] = m;
+    let point = |x: i32, y: i32| -> (f32, f32) {
+        let (x, y) = (x as f32, y as f32);
+        (m00 * x + m10 * y + m20, m01 * x + m11 * y + m21)
+    };
+    let rect = |x1: i32, y1: i32, x2: i32, y2: i32| -> (i32, i32, i32, i32) {
+        let (ax, ay) = point(x1, y1);
+        let (bx, by) = point(x2, y2);
+        (
+            ax.min(bx).round() as i32,
+            ay.min(by).round() as i32,
+            ax.max(bx).round() as i32,
+            ay.max(by).round() as i32,
+        )
+    };
+    let scale_x = m00.hypot(m01);
+    let scale_y = m10.hypot(m11);
+    let scaled = |value: i32, scale: f32| -> i32 { (value as f32 * scale).round() as i32 };
+    let draw = match draw {
+        GuiDraw::Fill {
+            x1,
+            y1,
+            x2,
+            y2,
+            color,
+        } => {
+            let (x1, y1, x2, y2) = rect(x1, y1, x2, y2);
+            GuiDraw::Fill {
+                x1,
+                y1,
+                x2,
+                y2,
+                color,
+            }
+        }
+        GuiDraw::Gradient {
+            x1,
+            y1,
+            x2,
+            y2,
+            color_from,
+            color_to,
+            horizontal: _,
+        } => {
+            let (x1, y1, x2, y2) = rect(x1, y1, x2, y2);
+            // The local direction is +y, which the pose maps to (m10, m11).
+            let (horizontal, flip) = if m10.abs() > m11.abs() {
+                (true, m10 < 0.0)
+            } else {
+                (false, m11 < 0.0)
+            };
+            let (color_from, color_to) = if flip {
+                (color_to, color_from)
+            } else {
+                (color_from, color_to)
+            };
+            GuiDraw::Gradient {
+                x1,
+                y1,
+                x2,
+                y2,
+                color_from,
+                color_to,
+                horizontal,
+            }
+        }
+        GuiDraw::Scissor { x1, y1, x2, y2 } => {
+            let (x1, y1, x2, y2) = rect(x1, y1, x2, y2);
+            GuiDraw::Scissor { x1, y1, x2, y2 }
+        }
+        GuiDraw::Text { text, x, y, color } => {
+            let (x, y) = point(x, y);
+            GuiDraw::Text {
+                text,
+                x: x.round() as i32,
+                y: y.round() as i32,
+                color,
+            }
+        }
+        GuiDraw::Blit {
+            texture,
+            x,
+            y,
+            width,
+            height,
+            u0,
+            u1,
+            v0,
+            v1,
+        } => {
+            let (x, y) = point(x, y);
+            GuiDraw::Blit {
+                texture,
+                x: x.round() as i32,
+                y: y.round() as i32,
+                width: scaled(width, scale_x).max(1),
+                height: scaled(height, scale_y).max(1),
+                u0,
+                u1,
+                v0,
+                v1,
+            }
+        }
+        GuiDraw::Item {
+            item,
+            x,
+            y,
+            size,
+            rotation,
+        } => {
+            let (x, y) = point(x, y);
+            GuiDraw::Item {
+                item,
+                x: x.round() as i32,
+                y: y.round() as i32,
+                size: scaled(size, scale_x).max(1),
+                rotation,
+            }
+        }
+        other => other,
+    };
+    if let Some(g) = heap.get_native_mut::<GuiGraphics>(graphics) {
+        g.draws.push(draw);
+    }
+}
+
 pub fn dispatch_builtin(
     heap: &mut Heap,
     class_name: &str,
@@ -1796,6 +1958,9 @@ pub fn dispatch_builtin(
                 "line.separator" => Some("\n".to_string()),
                 "file.separator" => Some("/".to_string()),
                 "user.home" => std::env::var("HOME").ok(),
+                // The interpreter has no `sun.misc.Unsafe`, so JOML must take
+                // its plain-field matrix copies rather than raw memory ones.
+                "joml.nounsafe" => Some("true".to_string()),
                 _ => None,
             };
             if let Some(value) = value {
@@ -1992,6 +2157,27 @@ pub fn dispatch_builtin(
                 "false"
             });
             return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+        // `Boolean.parseBoolean` / `valueOf(String)`: true only for "true"
+        // ignoring case; null and anything else is false.
+        if (method_name == "parseBoolean" || method_name == "valueOf")
+            && descriptor.starts_with("(Ljava/lang/String;)")
+            && !args.is_empty()
+        {
+            let parsed = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .is_some_and(|text| text.eq_ignore_ascii_case("true"));
+            if method_name == "parseBoolean" {
+                return BuiltinResult::Handled(Value::from_bool(parsed));
+            }
+            let mut fields = HashMap::new();
+            fields.insert("value".to_string(), Value::from_bool(parsed));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/lang/Boolean".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
         }
         if method_name == "valueOf" && descriptor.starts_with("(Z)") && !args.is_empty() {
             // Boxing: a plain int could not be told from an `Integer`.
@@ -4657,7 +4843,9 @@ pub fn dispatch_builtin(
                 args[2].as_int(),
                 args[3].as_int(),
                 args[4].clone(),
-                22,
+                // `drawAndBlit` projects the model onto a 16x16 GUI square
+                // (`setupOrtho(.., 16, 16)`); the caller's pose scales it.
+                16,
             )),
             "renderItemIntoGUI" if args.len() >= 7 => Some((
                 args[1].clone(),
@@ -4685,17 +4873,18 @@ pub fn dispatch_builtin(
                 .unwrap_or_default();
             if !item.is_empty() {
                 let rotation = quaternion_y_degrees(heap, &rotation);
-                if let Some(graphics) = graphics
-                    .as_obj()
-                    .and_then(|id| heap.get_native_mut::<GuiGraphics>(id))
-                {
-                    graphics.draws.push(GuiDraw::Item {
-                        item,
-                        x,
-                        y,
-                        size,
-                        rotation,
-                    });
+                if let Some(id) = graphics.as_obj() {
+                    push_gui_draw(
+                        heap,
+                        id,
+                        GuiDraw::Item {
+                            item,
+                            x,
+                            y,
+                            size,
+                            rotation,
+                        },
+                    );
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
@@ -5066,14 +5255,16 @@ pub fn dispatch_builtin(
             _ => (0, 0),
         };
         if let Some(graphics) = args.first().and_then(|v| v.as_obj()) {
-            if let Some(g) = heap.get_native_mut::<GuiGraphics>(graphics) {
-                g.draws.push(GuiDraw::Text {
+            push_gui_draw(
+                heap,
+                graphics,
+                GuiDraw::Text {
                     text,
                     x,
                     y,
                     color: 0xFFFF_FFFFu32 as i32,
-                });
-            }
+                },
+            );
         }
         return BuiltinResult::Handled(Value::NULL);
     }
@@ -5122,6 +5313,7 @@ pub fn dispatch_builtin(
                     y2: args[4].as_int(),
                     color_from: from,
                     color_to: to,
+                    horizontal: false,
                 }
             });
         } else if (method_name == "horizontalLine" || method_name == "verticalLine")
@@ -5312,11 +5504,8 @@ pub fn dispatch_builtin(
             return BuiltinResult::Handled(Value::NULL);
         }
         if let Some(draw) = draw {
-            if let Some(graphics) = args[0]
-                .as_obj()
-                .and_then(|id| heap.get_native_mut::<GuiGraphics>(id))
-            {
-                graphics.draws.push(draw);
+            if let Some(id) = args[0].as_obj() {
+                push_gui_draw(heap, id, draw);
             }
             return BuiltinResult::Handled(if method_name == "containsPointInScissor" {
                 Value::from_bool(true)

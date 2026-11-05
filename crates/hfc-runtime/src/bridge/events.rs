@@ -189,9 +189,9 @@ impl FabricBridge {
                 if let Some(JavaObject::Instance { fields, .. }) =
                     self.interp.heap.get_mut(sequence)
                 {
-                    fields
-                        .entry("color".to_string())
-                        .or_insert(Value::Int(color));
+                    // The host's line color wins: a recomposed title carries a
+                    // zero style color, which would draw black on the dark box.
+                    fields.insert("color".to_string(), Value::Int(color));
                 }
             }
             line += 1;

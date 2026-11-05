@@ -136,15 +136,21 @@ fn epic_item_draws_the_legendary_frame_and_title() {
 
     // The title component is centred by Legendary's tooltip HEAD injector:
     // Iceberg pads it with spaces to the tooltip's width.
-    let title = draws
+    let (title, title_color) = draws
         .iter()
         .find_map(|draw| match draw {
-            GuiDraw::Text { text, .. } if text.contains("Diamond Sword") => Some(text.as_str()),
+            GuiDraw::Text { text, color, .. } if text.contains("Diamond Sword") => {
+                Some((text.as_str(), *color))
+            }
             _ => None,
         })
         .expect("the title line was not drawn");
     assert_ne!(title, "Diamond Sword", "the title was not padded");
     assert_eq!(title.trim(), "Diamond Sword");
+    assert_eq!(
+        title_color, 0xFF55FFFFu32 as i32,
+        "the title lost its color"
+    );
 
     // `drawShadow` draws five one-pixel gradient rectangles; the name
     // separator adds two more, so seven fills means it was drawn.
@@ -235,4 +241,42 @@ fn common_item_has_no_custom_frame_but_real_colors() {
         "the common tooltip border is fully transparent"
     );
     assert_ne!(tooltip.border_bottom, 0);
+}
+
+#[test]
+fn rotated_gradients_land_inside_the_tooltip() {
+    let Some(tooltip) = tooltip("epic") else {
+        return;
+    };
+    let render = &tooltip.render;
+    let gradients: Vec<_> = render
+        .draws
+        .iter()
+        .filter_map(|draw| match draw {
+            GuiDraw::Gradient {
+                x1,
+                y1,
+                x2,
+                y2,
+                horizontal,
+                ..
+            } => Some((*x1, *y1, *x2, *y2, *horizontal)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        gradients.iter().any(|g| g.4),
+        "no horizontal gradient was recorded: {gradients:?}"
+    );
+    for &(x1, y1, x2, y2, horizontal) in &gradients {
+        assert!(x2 > 0, "gradient left of the tooltip: {gradients:?}");
+        if horizontal {
+            assert!(
+                x1 >= -6 && x2 <= render.width + 6 && y1 >= -6 && y2 <= render.height + 6,
+                "horizontal gradient {x1},{y1},{x2},{y2} outside the {}x{} frame",
+                render.width,
+                render.height
+            );
+        }
+    }
 }

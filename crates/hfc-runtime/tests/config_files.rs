@@ -70,6 +70,15 @@ fn jamlib_mod_writes_its_json5_config_with_comments() {
 /// Load `names` from `test-mods/` into a fresh bridge, run `init`, and return
 /// the game directory the mods wrote into.
 fn run_mods(names: &[&str], tag: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("hfc-config-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    launch_mods(names, &dir)?;
+    Some(dir)
+}
+
+/// Load `names` into a fresh bridge on `dir` (kept as is) and run `init`, as a
+/// new game launch does. Returns the bridge so a test can inspect mod state.
+fn launch_mods(names: &[&str], dir: &std::path::Path) -> Option<hfc_runtime::bridge::FabricBridge> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -87,11 +96,76 @@ fn run_mods(names: &[&str], tag: &str) -> Option<PathBuf> {
     for jar in &jars {
         bridge.load_mod_jar(jar).unwrap();
     }
-    let dir = std::env::temp_dir().join(format!("hfc-config-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    bridge.set_game_dir(Some(dir.clone()));
+    bridge.set_game_dir(Some(dir.to_path_buf()));
     bridge.init().unwrap();
-    Some(dir)
+    Some(bridge)
+}
+
+const LEGENDARY_MODS: [&str; 4] = [
+    "fabric-api-0.165.0+26.3.jar",
+    "Iceberg-26.3-fabric-1.4.3.1.jar",
+    "Prism-26.3-fabric-1.1.3.jar",
+    "LegendaryTooltips-26.3-fabric-1.6.3.jar",
+];
+
+/// `LegendaryTooltipsConfig.getInstance().modelRotationSpeed.get()`.
+fn model_rotation_speed(bridge: &mut hfc_runtime::bridge::FabricBridge) -> f64 {
+    use hfc_runtime::value::{JavaObject, Value};
+    const CONFIG: &str = "com/anthonyhilyard/legendarytooltips/config/LegendaryTooltipsConfig";
+    let instance = bridge
+        .interp
+        .execute_special_method(CONFIG, "getInstance", &format!("()L{CONFIG};"), &[])
+        .unwrap();
+    let id = instance.as_obj().expect("config instance");
+    let supplier = match bridge.interp.heap.get(id) {
+        Some(JavaObject::Instance { fields, .. }) => fields["modelRotationSpeed"].clone(),
+        other => panic!("config is not an instance: {}", other.is_some()),
+    };
+    assert!(matches!(supplier, Value::Object(Some(_))));
+    let value = bridge
+        .interp
+        .execute_method(
+            "java/util/function/Supplier",
+            "get",
+            "()Ljava/lang/Object;",
+            &[supplier],
+        )
+        .unwrap();
+    match value {
+        Value::Double(d) => d,
+        other => panic!("the supplier did not return a Double: {other:?}"),
+    }
+}
+
+#[test]
+fn existing_toml_config_is_read_back_without_corruption() {
+    let dir = std::env::temp_dir().join(format!("hfc-config-reread-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("config/legendarytooltips.toml");
+    if launch_mods(&LEGENDARY_MODS, &dir).is_none() {
+        return;
+    }
+    let first = std::fs::read_to_string(&path).unwrap();
+    assert!(first.contains("model_rotation_speed = 12\n"), "{first}");
+
+    let mut second_launch = launch_mods(&LEGENDARY_MODS, &dir).unwrap();
+    let second = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(first, second, "relaunch rewrote the config");
+    let speed = model_rotation_speed(&mut second_launch);
+    assert_eq!(speed, 12.0);
+
+    std::fs::write(
+        &path,
+        first.replace("model_rotation_speed = 12", "model_rotation_speed = 20"),
+    )
+    .unwrap();
+    let mut third_launch = launch_mods(&LEGENDARY_MODS, &dir).unwrap();
+    let speed = model_rotation_speed(&mut third_launch);
+    let third = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(speed, 20.0, "{third}");
+    assert!(third.contains("model_rotation_speed = 20\n"), "{third}");
+    assert_eq!(third.matches("name_separator").count(), 1, "{third}");
 }
 
 #[test]

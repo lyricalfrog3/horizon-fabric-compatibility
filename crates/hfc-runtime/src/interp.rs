@@ -900,24 +900,29 @@ impl Interpreter {
             if let Some(map_id) = args[0].as_obj() {
                 if let Some(JavaObject::Map(entries)) = self.heap.get(map_id) {
                     let entries = entries.clone();
-                    let existing = |key: &Value| {
-                        entries
-                            .iter()
-                            .find(|(k, _)| k == key)
-                            .map(|(_, v)| v.clone())
-                            .filter(|v| !v.is_null())
+                    let existing = |interp: &Self, key: &Value| {
+                        let pos = crate::builtins::map_key_position(&interp.heap, map_id, key)?;
+                        match interp.heap.get(map_id) {
+                            Some(JavaObject::Map(entries)) => Some(entries[pos].1.clone()),
+                            _ => None,
+                        }
+                        .filter(|v| !v.is_null())
                     };
                     let store = |interp: &mut Self, key: Value, value: Value| {
+                        let pos = crate::builtins::map_key_position(&interp.heap, map_id, &key);
                         if let Some(JavaObject::Map(entries)) = interp.heap.get_mut(map_id) {
-                            match entries.iter_mut().find(|(k, _)| *k == key) {
-                                Some((_, v)) => *v = value,
+                            match pos {
+                                Some(pos) => entries[pos].1 = value,
                                 None => entries.push((key, value)),
                             }
                         }
                     };
                     let remove = |interp: &mut Self, key: &Value| {
-                        if let Some(JavaObject::Map(entries)) = interp.heap.get_mut(map_id) {
-                            entries.retain(|(k, _)| k != key);
+                        let pos = crate::builtins::map_key_position(&interp.heap, map_id, key);
+                        if let (Some(pos), Some(JavaObject::Map(entries))) =
+                            (pos, interp.heap.get_mut(map_id))
+                        {
+                            entries.remove(pos);
                         }
                     };
                     const FUNCTION: &str = "(Ljava/lang/Object;)Ljava/lang/Object;";
@@ -925,7 +930,7 @@ impl Interpreter {
                         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
                     match method_name {
                         "computeIfAbsent" if args.len() >= 3 => {
-                            if let Some(value) = existing(&args[1]) {
+                            if let Some(value) = existing(self, &args[1]) {
                                 return Ok(value);
                             }
                             let value = self.execute_method(
@@ -940,7 +945,7 @@ impl Interpreter {
                             return Ok(value);
                         }
                         "computeIfPresent" | "compute" if args.len() >= 3 => {
-                            let old = existing(&args[1]);
+                            let old = existing(self, &args[1]);
                             if method_name == "computeIfPresent" && old.is_none() {
                                 return Ok(Value::NULL);
                             }
@@ -958,7 +963,7 @@ impl Interpreter {
                             return Ok(value);
                         }
                         "merge" if args.len() >= 4 => {
-                            let value = match existing(&args[1]) {
+                            let value = match existing(self, &args[1]) {
                                 Some(old) => self.execute_method(
                                     "java/util/function/BiFunction",
                                     "apply",

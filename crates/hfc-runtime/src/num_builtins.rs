@@ -20,6 +20,43 @@ pub fn numeric_method(
     let int = |i: usize| args.get(i).map(Value::as_int);
     let long = |i: usize| args.get(i).map(Value::as_long);
 
+    // Boxed numbers are the plain values (see `Number` below), so boxing returns
+    // its argument and an unboxing accessor converts it. A box that was made by
+    // the JDK's own constructor holds its number in a `value` field; read that.
+    if matches!(
+        class_name,
+        "java/lang/Double"
+            | "java/lang/Float"
+            | "java/lang/Long"
+            | "java/lang/Short"
+            | "java/lang/Byte"
+    ) {
+        let unboxed = |v: &Value| match v.as_obj().and_then(|id| heap.get(id)) {
+            Some(crate::value::JavaObject::Instance { fields, .. }) => {
+                fields.get("value").cloned().unwrap_or_else(|| v.clone())
+            }
+            _ => v.clone(),
+        };
+        match (method_name, descriptor.as_bytes().get(1)) {
+            ("valueOf", Some(b'D' | b'F' | b'J' | b'S' | b'B')) => {
+                return handled(args.first()?.clone());
+            }
+            ("doubleValue", Some(b')')) => {
+                return handled(Value::Double(unboxed(args.first()?).as_double()));
+            }
+            ("floatValue", Some(b')')) => {
+                return handled(Value::Float(unboxed(args.first()?).as_float()));
+            }
+            ("longValue", Some(b')')) => {
+                return handled(Value::Long(unboxed(args.first()?).as_long()));
+            }
+            ("intValue", Some(b')')) => {
+                return handled(Value::Int(unboxed(args.first()?).as_int()));
+            }
+            _ => {}
+        }
+    }
+
     match class_name {
         "java/util/concurrent/TimeUnit" if method_name == "convert" && args.len() == 3 => {
             // convert(duration, sourceUnit): `this` is the target unit.
@@ -187,6 +224,9 @@ pub fn numeric_method(
         "java/lang/Character" => {
             let c = char::from_u32(int(0)? as u32);
             match method_name {
+                // A boxed `Character` is the plain char value, as `Integer` is
+                // the plain int, so boxing and unboxing return the char itself.
+                "valueOf" | "charValue" => handled(Value::Int(int(0)?)),
                 "isDigit" => handled(Value::from_bool(c.is_some_and(|c| c.is_numeric()))),
                 "isLetter" => handled(Value::from_bool(c.is_some_and(|c| c.is_alphabetic()))),
                 "isLetterOrDigit" => {

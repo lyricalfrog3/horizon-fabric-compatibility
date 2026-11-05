@@ -49,6 +49,22 @@ fn collection_items(heap: &Heap, val: &Value) -> Vec<Value> {
 /// Text carried by a string, component, or formatted text object. Components
 /// built by the runtime keep their plain text in a `text` field; formatted
 /// sequences copy it from the component they were made from.
+/// Index of the entry of map `map_id` whose key is `key`: the same value, or a
+/// `String` with equal text (`HashMap` compares keys with `equals`, and a string
+/// built at runtime is a different heap object from an interned literal).
+pub(crate) fn map_key_position(heap: &Heap, map_id: usize, key: &Value) -> Option<usize> {
+    let Some(JavaObject::Map(entries)) = heap.get(map_id) else {
+        return None;
+    };
+    if let Some(pos) = entries.iter().position(|(k, _)| k == key) {
+        return Some(pos);
+    }
+    let text = key.as_obj().and_then(|id| heap.get_string(id))?;
+    entries
+        .iter()
+        .position(|(k, _)| k.as_obj().and_then(|id| heap.get_string(id)) == Some(text))
+}
+
 pub(crate) fn text_of_value(heap: &Heap, val: &Value) -> String {
     if let Some(id) = val.as_obj() {
         if let Some(s) = heap.get_string(id) {
@@ -3313,13 +3329,11 @@ pub fn dispatch_builtin(
             let key = args[1].clone();
             let val = args[2].clone();
             if let Some(id) = args[0].as_obj() {
+                let existing = map_key_position(heap, id, &key);
                 if let Some(JavaObject::Map(entries)) = heap.get_mut(id) {
-                    for (k, v) in entries.iter_mut() {
-                        if k == &key {
-                            let old = v.clone();
-                            *v = val;
-                            return BuiltinResult::Handled(old);
-                        }
+                    if let Some(pos) = existing {
+                        let old = std::mem::replace(&mut entries[pos].1, val);
+                        return BuiltinResult::Handled(old);
                     }
                     entries.push((key, val));
                     return BuiltinResult::Handled(Value::NULL);
@@ -3330,27 +3344,32 @@ pub fn dispatch_builtin(
                 Some(JavaObject::Map(entries)) => entries.clone(),
                 _ => Vec::new(),
             };
-            if let Some(JavaObject::Map(entries)) = args[0].as_obj().and_then(|id| heap.get_mut(id))
-            {
+            if let Some(id) = args[0].as_obj() {
                 for (key, val) in incoming {
-                    match entries.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, v)) => *v = val,
-                        None => entries.push((key, val)),
+                    let existing = map_key_position(heap, id, &key);
+                    if let Some(JavaObject::Map(entries)) = heap.get_mut(id) {
+                        match existing {
+                            Some(pos) => entries[pos].1 = val,
+                            None => entries.push((key, val)),
+                        }
                     }
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "putIfAbsent" && args.len() >= 3 {
-            if let Some(JavaObject::Map(entries)) = args[0].as_obj().and_then(|id| heap.get_mut(id))
-            {
-                if let Some((_, v)) = entries.iter_mut().find(|(k, _)| *k == args[1]) {
-                    if v.is_null() {
-                        *v = args[2].clone();
-                        return BuiltinResult::Handled(Value::NULL);
+            if let Some(id) = args[0].as_obj() {
+                let existing = map_key_position(heap, id, &args[1]);
+                if let Some(JavaObject::Map(entries)) = heap.get_mut(id) {
+                    if let Some(pos) = existing {
+                        let v = &mut entries[pos].1;
+                        if v.is_null() {
+                            *v = args[2].clone();
+                            return BuiltinResult::Handled(Value::NULL);
+                        }
+                        return BuiltinResult::Handled(v.clone());
                     }
-                    return BuiltinResult::Handled(v.clone());
+                    entries.push((args[1].clone(), args[2].clone()));
                 }
-                entries.push((args[1].clone(), args[2].clone()));
             }
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "containsValue" && args.len() >= 2 {
@@ -3367,46 +3386,35 @@ pub fn dispatch_builtin(
                 return BuiltinResult::Handled(Value::Object(Some(id)));
             }
         } else if method_name == "get" && args.len() >= 2 {
-            let key = &args[1];
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Map(entries)) = heap.get(id) {
-                    for (k, v) in entries {
-                        if k == key {
-                            return BuiltinResult::Handled(v.clone());
-                        }
+                if let Some(pos) = map_key_position(heap, id, &args[1]) {
+                    if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                        return BuiltinResult::Handled(entries[pos].1.clone());
                     }
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "getOrDefault" && args.len() >= 3 {
-            let key = &args[1];
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Map(entries)) = heap.get(id) {
-                    for (k, v) in entries {
-                        if k == key {
-                            return BuiltinResult::Handled(v.clone());
-                        }
+                if let Some(pos) = map_key_position(heap, id, &args[1]) {
+                    if let Some(JavaObject::Map(entries)) = heap.get(id) {
+                        return BuiltinResult::Handled(entries[pos].1.clone());
                     }
                 }
             }
             return BuiltinResult::Handled(args[2].clone());
         } else if method_name == "containsKey" && args.len() >= 2 {
-            let key = &args[1];
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Map(entries)) = heap.get(id) {
-                    for (k, _) in entries {
-                        if k == key {
-                            return BuiltinResult::Handled(Value::from_bool(true));
-                        }
-                    }
+                if map_key_position(heap, id, &args[1]).is_some() {
+                    return BuiltinResult::Handled(Value::from_bool(true));
                 }
             }
             return BuiltinResult::Handled(Value::from_bool(false));
         } else if method_name == "remove" && args.len() >= 2 {
-            let key = &args[1];
             if let Some(id) = args[0].as_obj() {
+                let existing = map_key_position(heap, id, &args[1]);
                 if let Some(JavaObject::Map(entries)) = heap.get_mut(id) {
-                    if let Some(pos) = entries.iter().position(|(k, _)| k == key) {
+                    if let Some(pos) = existing {
                         let (_, v) = entries.remove(pos);
                         return BuiltinResult::Handled(v);
                     }

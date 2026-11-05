@@ -390,7 +390,14 @@ Night Config) and Mod Menu's pretty-printed `modmenu.json` (Gson). Known limits:
 throwing `NoSuchMethodException`; `List.subList` is a copy, not a view; a config
 file that already exists is read back through the same reflection path
 (`Field.set` with the parsed value). That works in the live client (an edited
-`modmenu.json` is honoured after a restart) but is not covered by a test yet.
+`modmenu.json` is honoured after a restart). `tests/config_files.rs` covers the TOML
+case: Legendary Tooltips relaunched on its own file leaves it unchanged, and an edited
+`model_rotation_speed` is read back through the mod's `Supplier<Double>`.
+
+Boxing is by plain value: `Character.valueOf/charValue` and `Double/Long/Float.valueOf`
+return the primitive, and `xxxValue()` converts it (a box the JDK constructor made, with
+a `value` field, is unwrapped). `Map` operations match `String` keys by text, since a
+string built at runtime (`new String(char[])`) is not the interned literal.
 
 ## Tests
 

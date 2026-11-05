@@ -208,6 +208,10 @@ fn render_ticks_advance_the_shine_timer() {
             )
             .as_float()
     };
+    // The first frame with time passing is also the first hover of this
+    // stack, which restarts the shine; measure from after that.
+    assert!(render(&mut bridge).is_some());
+    std::thread::sleep(std::time::Duration::from_millis(30));
     assert!(render(&mut bridge).is_some());
     let first_shine = shine(&mut bridge);
     std::thread::sleep(std::time::Duration::from_millis(80));
@@ -279,4 +283,93 @@ fn rotated_gradients_land_inside_the_tooltip() {
             );
         }
     }
+}
+
+/// Legendary restarts its shine when the hovered slot holds a different
+/// stack (`onRenderTick` reads `Gui.screen().hoveredSlot`), and draws the
+/// shine as a white horizontal sweep along the frame's top edge while the
+/// timer runs.
+#[test]
+fn hovering_another_item_restarts_and_draws_the_shine() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .to_path_buf();
+    let jars = [
+        "fabric-api-0.165.0+26.3.jar",
+        "Iceberg-26.3-fabric-1.4.3.1.jar",
+        "Prism-26.3-fabric-1.1.3.jar",
+        "LegendaryTooltips-26.3-fabric-1.6.3.jar",
+    ]
+    .map(|name| root.join("test-mods").join(name));
+    if jars.iter().any(|jar| !jar.exists()) {
+        return;
+    }
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        return;
+    };
+    for jar in &jars {
+        bridge.load_mod_jar(jar).unwrap();
+    }
+    let dir = std::env::temp_dir().join(format!("hfc-legendary-shine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    bridge.set_game_dir(Some(dir.clone()));
+    bridge.init().unwrap();
+    let render = |bridge: &mut hfc_runtime::bridge::FabricBridge, item: &str, name: &str| {
+        bridge
+            .item_tooltip_render(
+                item,
+                Some("epic"),
+                1561,
+                &[(name.to_string(), 0xFF55FFFFu32)],
+                640,
+                360,
+            )
+            .expect("no tooltip render")
+    };
+    let shine = |bridge: &mut hfc_runtime::bridge::FabricBridge| {
+        bridge
+            .interp
+            .resolve_static_field(
+                "com/anthonyhilyard/legendarytooltips/tooltip/TooltipDecor",
+                "shineTimer",
+            )
+            .as_float()
+    };
+    let pause = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+
+    render(&mut bridge, "minecraft:diamond_sword", "Diamond Sword");
+    pause(30);
+    render(&mut bridge, "minecraft:diamond_sword", "Diamond Sword");
+    pause(600);
+    render(&mut bridge, "minecraft:diamond_sword", "Diamond Sword");
+    let before = shine(&mut bridge);
+    pause(30);
+    // The host now shows another item's tooltip: a new hovered stack.
+    render(&mut bridge, "minecraft:diamond_pickaxe", "Diamond Pickaxe");
+    let restarted = shine(&mut bridge);
+    assert!(
+        restarted > before && restarted > 2.0,
+        "hovering another item did not restart the shine: {before} -> {restarted}"
+    );
+    // Same item again: no restart, the timer keeps running down.
+    pause(700);
+    let draws = render(&mut bridge, "minecraft:diamond_pickaxe", "Diamond Pickaxe").draws;
+    let running = shine(&mut bridge);
+    assert!(running < restarted, "the shine restarted on the same stack");
+    let sweep = draws.iter().any(|draw| {
+        matches!(
+            draw,
+            GuiDraw::Gradient { horizontal: true, color_from, color_to, y1, .. }
+                if *y1 == -3
+                    && (*color_from as u32 & 0x00FF_FFFF) == 0x00FF_FFFF
+                    && (*color_to as u32 & 0x00FF_FFFF) == 0x00FF_FFFF
+        )
+    });
+    assert!(
+        sweep,
+        "no shine sweep along the top edge at timer {running}: {draws:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

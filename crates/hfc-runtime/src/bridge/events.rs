@@ -128,7 +128,135 @@ impl FabricBridge {
     /// Dispatch Iceberg's and Prism's `RenderTickEvents.START` with the real
     /// time since the previous tooltip frame, as `DeltaTracker.getRealtimeDeltaTicks`
     /// (20 ticks per second). Legendary's shine timer and model rotation read it.
-    fn dispatch_render_ticks(&mut self) {
+    /// The stack object for the tooltip the host shows, and the container
+    /// screen whose hovered slot holds it. Both are kept while the host keeps
+    /// showing the same tooltip; a different item or text makes new ones, as
+    /// hovering another slot gives vanilla another `ItemStack`.
+    fn hovered_tooltip_stack(
+        &mut self,
+        item_id: &str,
+        rarity: Option<&str>,
+        max_damage: i32,
+        lines: &[(String, u32)],
+    ) -> (usize, Option<usize>) {
+        let key: HoveredTooltipKey = (item_id.to_string(), lines.to_vec());
+        if let Some((held, stack, screen)) = &self.hovered_tooltip
+            && *held == key
+        {
+            return (*stack, *screen);
+        }
+        let stack = self.interp.heap.alloc_item_stack(
+            ItemStack::new(item_id, 1)
+                .with_rarity(rarity)
+                .with_max_damage(max_damage),
+        );
+        let screen = self.hovered_slot_screen(stack);
+        self.hovered_tooltip = Some((key, stack, screen));
+        (stack, screen)
+    }
+
+    /// A container screen whose `hoveredSlot` is a real `Slot` over a real
+    /// one-slot `SimpleContainer` holding `stack`: what `Gui.screen()` is while
+    /// the player hovers an item in an inventory. The screen itself is a host
+    /// stand-in (its menu and player are not modelled); its slot and container
+    /// run their own bytecode. None if the classes cannot be built.
+    fn hovered_slot_screen(&mut self, stack: usize) -> Option<usize> {
+        const CONTAINER: &str = "net/minecraft/world/SimpleContainer";
+        const SLOT: &str = "net/minecraft/world/inventory/Slot";
+        self.interp.ensure_initialized(CONTAINER).ok()?;
+        self.interp.ensure_initialized(SLOT).ok()?;
+        let container = self.interp.alloc_uninitialized(CONTAINER);
+        self.interp
+            .execute_special_method(
+                CONTAINER,
+                "<init>",
+                "(I)V",
+                &[Value::Object(Some(container)), Value::Int(1)],
+            )
+            .ok()?;
+        self.interp
+            .execute_method(
+                CONTAINER,
+                "setItem",
+                "(ILnet/minecraft/world/item/ItemStack;)V",
+                &[
+                    Value::Object(Some(container)),
+                    Value::Int(0),
+                    Value::Object(Some(stack)),
+                ],
+            )
+            .ok()?;
+        let slot = self.interp.alloc_uninitialized(SLOT);
+        self.interp
+            .execute_special_method(
+                SLOT,
+                "<init>",
+                "(Lnet/minecraft/world/Container;III)V",
+                &[
+                    Value::Object(Some(slot)),
+                    Value::Object(Some(container)),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                ],
+            )
+            .ok()?;
+        Some(self.interp.heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen".into(),
+            fields: [("hoveredSlot".to_string(), Value::Object(Some(slot)))].into(),
+        }))
+    }
+
+    /// Set the client's current screen (`Minecraft.screen` and `Gui.screen`)
+    /// and return what it was.
+    fn swap_client_screen(&mut self, screen: Value) -> Option<(Value, Value)> {
+        let minecraft = self
+            .interp
+            .execute_method(
+                "net/minecraft/client/Minecraft",
+                "getInstance",
+                "()Lnet/minecraft/client/Minecraft;",
+                &[],
+            )
+            .ok()?
+            .as_obj()?;
+        let (old_minecraft, gui) = match self.interp.heap.get_mut(minecraft) {
+            Some(JavaObject::Instance { fields, .. }) => (
+                fields
+                    .insert("screen".into(), screen.clone())
+                    .unwrap_or(Value::NULL),
+                fields.get("gui").and_then(|v| v.as_obj()),
+            ),
+            _ => return None,
+        };
+        let old_gui = match gui.and_then(|gui| self.interp.heap.get_mut(gui)) {
+            Some(JavaObject::Instance { fields, .. }) => fields
+                .insert("screen".into(), screen)
+                .unwrap_or(Value::NULL),
+            _ => Value::NULL,
+        };
+        Some((old_minecraft, old_gui))
+    }
+
+    /// Restore what [`Self::swap_client_screen`] returned.
+    fn restore_client_screen(&mut self, old: Option<(Value, Value)>) {
+        let Some((old_minecraft, old_gui)) = old else {
+            return;
+        };
+        self.swap_client_screen(old_gui);
+        if let Some(minecraft) = self
+            .interp
+            .heap
+            .get_singleton("net/minecraft/client/Minecraft")
+            && let Some(JavaObject::Instance { fields, .. }) = self.interp.heap.get_mut(minecraft)
+        {
+            fields.insert("screen".into(), old_minecraft);
+        }
+    }
+
+    /// Render-tick events, with the client's screen set to `screen` (the
+    /// hovered container slot) while they run.
+    fn dispatch_render_ticks(&mut self, screen: Option<usize>) {
         let now = std::time::Instant::now();
         let delta = self
             .last_render_tick
@@ -143,6 +271,8 @@ impl FabricBridge {
             class_name: "net/minecraft/client/DeltaTracker".into(),
             fields: [("delta".to_string(), Value::Float(delta))].into(),
         });
+        let previous =
+            screen.and_then(|screen| self.swap_client_screen(Value::Object(Some(screen))));
         let _ = self.dispatch_event(
             "com/anthonyhilyard/iceberg/events/client/RenderTickEvents",
             "START",
@@ -159,6 +289,7 @@ impl FabricBridge {
             "(Lnet/minecraft/client/DeltaTracker;)V",
             &[Value::Object(Some(tracker))],
         );
+        self.restore_client_screen(previous);
     }
 
     /// Give the component list's text lines the host line colors. A library
@@ -869,7 +1000,8 @@ impl FabricBridge {
         if !self.initialized {
             let _ = self.init();
         }
-        self.dispatch_render_ticks();
+        let (stack, screen) = self.hovered_tooltip_stack(item_id, rarity, max_damage, lines);
+        self.dispatch_render_ticks(screen);
         // COLOREXT also paints the static colors `POSTEXT` reads when it draws
         // the frame, so it must run before the frame is recorded.
         {
@@ -909,11 +1041,6 @@ impl FabricBridge {
             screen_height,
             0,
         )?;
-        let stack = self.interp.heap.alloc_item_stack(
-            ItemStack::new(item_id, 1)
-                .with_rarity(rarity)
-                .with_max_damage(max_damage),
-        );
         let graphics = self
             .interp
             .heap

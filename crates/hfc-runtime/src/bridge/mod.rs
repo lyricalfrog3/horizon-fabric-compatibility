@@ -181,7 +181,15 @@ pub struct FabricBridge {
     /// When the previous render-tick event was dispatched, for the real
     /// `DeltaTracker` a hovered tooltip's shine and model animation read.
     last_render_tick: Option<std::time::Instant>,
+    /// The tooltip the host is showing (item and lines), the stack object
+    /// standing for it, and the container screen whose hovered slot holds
+    /// that stack. Kept while the same tooltip shows, so a mod that compares
+    /// the hovered stack by identity (vanilla keeps one `ItemStack` per slot)
+    /// sees a new hover only when the host shows a different tooltip.
+    hovered_tooltip: Option<(HoveredTooltipKey, usize, Option<usize>)>,
 }
+
+pub(crate) type HoveredTooltipKey = (String, Vec<(String, u32)>);
 
 impl Default for FabricBridge {
     fn default() -> Self {
@@ -227,6 +235,7 @@ impl FabricBridge {
             menu_screen: None,
             gui_texture_cache: HashMap::new(),
             last_render_tick: None,
+            hovered_tooltip: None,
         }
     }
 
@@ -271,6 +280,7 @@ impl FabricBridge {
             menu_screen: None,
             gui_texture_cache: HashMap::new(),
             last_render_tick: None,
+            hovered_tooltip: None,
         }
     }
 

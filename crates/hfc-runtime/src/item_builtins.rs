@@ -26,6 +26,9 @@ const ITEM_FIELD: &str = "$hfc_item_properties";
 pub(crate) struct RegisteredRecord {
     pub id: String,
     pub properties: ItemProperties,
+    /// The item object `Registry.register` stored, which creative-tab calls
+    /// name the item by.
+    pub object: usize,
 }
 
 fn properties_object(heap: &mut Heap, this: &Value) -> Option<usize> {
@@ -284,9 +287,11 @@ impl Interpreter {
             .and_then(|id| self.heap.get_native::<ItemProperties>(id))
             .cloned()
             .unwrap_or_default();
-        self.heap
-            .registered_items
-            .push(RegisteredRecord { id, properties });
+        self.heap.registered_items.push(RegisteredRecord {
+            id,
+            properties,
+            object: value.as_obj()?,
+        });
         Some(value.clone())
     }
 

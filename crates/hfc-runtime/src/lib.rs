@@ -3,6 +3,7 @@
 pub mod bridge;
 pub mod builtins;
 pub mod class;
+pub mod creative_tab_builtins;
 pub mod fs_builtins;
 pub mod heap;
 pub mod interp;

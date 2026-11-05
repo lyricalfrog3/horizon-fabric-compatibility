@@ -17,7 +17,7 @@
 
 mod common;
 
-use hfc_runtime::bridge::{FabricBridge, RegisteredItem};
+use hfc_runtime::bridge::{FabricBridge, RegisteredItem, TabPlacement};
 use hfc_runtime::value::{JavaObject, Value};
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
@@ -78,6 +78,45 @@ fn tool_rules(mineable: &str) -> Json {
         { "blocks": "#minecraft:incorrect_for_diamond_tool", "correct_for_drops": false },
         { "blocks": format!("#minecraft:mineable/{mineable}"), "correct_for_drops": true, "speed": 8.0 },
     ] })
+}
+
+/// `CreativeModeTabEvents.modifyOutputEvent` listeners (Fabric API's own
+/// bytecode makes the per-tab events) record where Emerald Tools puts its items.
+#[test]
+fn emerald_tools_creative_tab_placement() {
+    let Some(bridge) = emerald_tools() else {
+        return;
+    };
+    let additions = bridge.creative_tab_additions();
+    let in_tab = |tab: &str| -> Vec<(String, TabPlacement)> {
+        additions
+            .iter()
+            .filter(|a| a.tab == tab)
+            .map(|a| (a.item.clone(), a.placement.clone()))
+            .collect()
+    };
+    let end = |name: &str| {
+        (
+            format!("emerald-tools-justfatlard:{name}"),
+            TabPlacement::End,
+        )
+    };
+    assert_eq!(
+        in_tab("minecraft:tools_and_utilities"),
+        [
+            end("emerald_pickaxe"),
+            end("emerald_axe"),
+            end("emerald_shovel"),
+            end("emerald_hoe"),
+        ]
+    );
+    assert_eq!(in_tab("minecraft:combat"), [end("emerald_sword")]);
+    assert_eq!(additions.len(), 5, "no other tab: {additions:?}");
+    assert!(
+        bridge.unsupported_creative_tab_calls().is_empty(),
+        "unmodelled calls: {:?}",
+        bridge.unsupported_creative_tab_calls()
+    );
 }
 
 #[test]

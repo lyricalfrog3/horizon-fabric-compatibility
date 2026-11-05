@@ -37,6 +37,10 @@ pub struct Heap {
     pub(crate) registered_items: Vec<crate::item_builtins::RegisteredRecord>,
     /// `Item.Properties` methods the runtime does not model, each logged once.
     pub unsupported_item_properties: Vec<String>,
+    /// Creative-tab placements the tab events' listeners made, in call order.
+    pub(crate) creative_tab_additions: Vec<crate::bridge::items::CreativeTabAddition>,
+    /// Creative-tab output calls the runtime does not model, each logged once.
+    pub unsupported_creative_tab_calls: Vec<String>,
 }
 
 impl Heap {
@@ -57,6 +61,8 @@ impl Heap {
             clipboard: String::new(),
             registered_items: Vec::new(),
             unsupported_item_properties: Vec::new(),
+            creative_tab_additions: Vec::new(),
+            unsupported_creative_tab_calls: Vec::new(),
         }
     }
 

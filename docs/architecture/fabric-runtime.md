@@ -380,8 +380,33 @@ Not exported:
   its components), an axe, hoe and shovel get vanilla's through their template.
 - **Items extending a vanilla item class** (`BlockItem`, `BowItem`, ...): their behaviour has
   no data form, so they are logged and not exported.
-- **Creative-tab placement** (`CreativeModeTabEvents.modifyOutput` listeners).
+- **Tab-wide listeners and tab contents.** `CreativeModeTabEvents.MODIFY_OUTPUT_ALL`
+  listeners (they need a `CreativeModeTab` object) and output calls that read the tab
+  (`getDisplayStacks`, predicate anchors, `getContext`) are logged once and not answered;
+  `FabricBridge::unsupported_creative_tab_calls()` lists them.
 - Registration of anything other than items (blocks, entity types, ...).
+
+### Creative-tab placement
+
+`FabricBridge::creative_tab_additions()` returns, in the order the mod made them,
+`CreativeTabAddition { tab, item, placement }` (tab and item are `namespace:path` ids).
+`TabPlacement` is `End` (`accept`), `Start` (`prepend`; several apply in order, each at the
+front), `After(x)` and `Before(x)`. `insertAfter(x, a, b)` is `After(x)` for `a` and
+`After(a)` for `b`; `insertBefore(x, a, b)` is `Before(x)` for both, applied in order
+(`a, b, x`).
+
+Fabric API's own bytecode runs `CreativeModeTabEvents.modifyOutputEvent` (one `Event` per
+tab key in `CreativeModeTabEventsImpl`, built on the `EventFactory` builtins) and the mod
+registers on it. When `init` has run the entrypoints, `run_creative_tab_events`
+(`creative_tab_builtins.rs`) calls every listener of every tab event with a native
+`FabricCreativeModeTabOutput`, a host boundary standing for the tab's item list, that
+records each `accept`/`prepend`/`insertAfter`/`insertBefore`. Items resolve to ids as a
+mod-registered item object, a vanilla `Items.X` (also as an anchor) or an `ItemStack`'s
+item. Only data crosses: stack components on an `ItemStack` are not exported.
+
+Verified by `emerald_tools_creative_tab_placement`: `tools_and_utilities` gets the pickaxe,
+axe, shovel and hoe with `End`, `combat` gets the sword. No fixture mod uses
+`insertAfter`/`insertBefore`/`prepend`; their ordering is untested.
 
 Also changed: `BlockTags.X`/`ItemTags.X` constants now carry their real id
 (`minecraft:mineable/pickaxe`), read from the tag class's initializer, instead of the

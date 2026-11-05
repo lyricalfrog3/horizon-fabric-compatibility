@@ -1224,6 +1224,13 @@ pub fn dispatch_builtin(
         return result;
     }
 
+    // The item list a creative tab event listener records into.
+    if let Some(result) =
+        crate::creative_tab_builtins::output_method(heap, method_name, descriptor, args)
+    {
+        return result;
+    }
+
     // Kotlin's null checks. The runtime has no exceptions that cross frames,
     // and the real failure path builds a message by walking a Java stack trace
     // the runtime does not have (it never terminates). Report the null, which

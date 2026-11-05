@@ -30,6 +30,33 @@ pub struct RegisteredItem {
     pub rarity: Option<String>,
 }
 
+/// Where an item goes in a creative tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabPlacement {
+    /// Appended after the tab's last item (`accept`).
+    End,
+    /// Inserted at the front of the tab (`prepend`). Several `Start` additions
+    /// apply in order, each at index 0, so the last one ends up first.
+    Start,
+    /// Directly after this item (`insertAfter`). `insertAfter(x, a, b)` is
+    /// `After(x)` for `a` and `After(a)` for `b`, so `a` stays before `b`.
+    After(String),
+    /// Directly before this item (`insertBefore`). `insertBefore(x, a, b)` is
+    /// `Before(x)` for both, applied in order, which gives `a, b, x`.
+    Before(String),
+}
+
+/// One item a mod put in a creative tab through
+/// `CreativeModeTabEvents.modifyOutputEvent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreativeTabAddition {
+    /// The creative tab's id, `namespace:path` (`minecraft:combat`).
+    pub tab: String,
+    /// The item's id, `namespace:path`.
+    pub item: String,
+    pub placement: TabPlacement,
+}
+
 /// Which `Item.Properties` tool method a mod's properties went through. It picks
 /// the template, because vanilla gives the matching item its behaviour class
 /// (an axe strips logs, a hoe tills).
@@ -363,7 +390,7 @@ pub(crate) fn export(id: &str, properties: &ItemProperties) -> RegisteredItem {
 impl super::FabricBridge {
     /// The items mods registered in the item registry, in registration order, as
     /// Horizon content items. Only data crosses: a custom `Item` subclass's
-    /// behaviour does not, and neither does creative-tab placement.
+    /// behaviour does not.
     pub fn registered_items(&self) -> Vec<RegisteredItem> {
         self.interp
             .heap
@@ -371,6 +398,18 @@ impl super::FabricBridge {
             .iter()
             .map(|record| export(&record.id, &record.properties))
             .collect()
+    }
+
+    /// What mods' `CreativeModeTabEvents.modifyOutputEvent` listeners put in
+    /// creative tabs, in the order they made it. Collected when `init` ends.
+    pub fn creative_tab_additions(&self) -> Vec<CreativeTabAddition> {
+        self.interp.heap.creative_tab_additions.clone()
+    }
+
+    /// Creative-tab output calls the runtime does not model; the additions lack
+    /// what those would have done.
+    pub fn unsupported_creative_tab_calls(&self) -> &[String] {
+        &self.interp.heap.unsupported_creative_tab_calls
     }
 
     /// `Item.Properties` methods mods called that the runtime does not model;

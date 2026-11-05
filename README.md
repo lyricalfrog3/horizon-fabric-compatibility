@@ -41,7 +41,7 @@ client where noted. A mod not listed here should be treated as unsupported.
 | **Veinminer** | Breaking one ore breaks the connected vein (Kotlin coroutines, `PlayerBlockBreakEvents.BEFORE`) | ✅ |
 | **Mod Menu** | Title and pause menu buttons, the mod list with icons, search and scrolling; link dialogs that open the browser or copy to the clipboard; `modmenu.json` byte-identical to the real game's | ✅ |
 | **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow; the tooltip body from the mod's real component list (centred title, name separator, item-model request); `legendarytooltips.toml` written with comments, allowed values and ranges | ✅ frame, title, separator, model panel |
-| **Emerald Tools** | Its five tools, registered in code, become Horizon items with vanilla-formula tool stats, textures, names and recipes; `/give` and creative search find them | ✅ (not in a creative tab yet) |
+| **Emerald Tools** | Its five tools, registered in code, become Horizon items with vanilla-formula tool stats, textures, names and recipes; `/give`, creative search and the tabs the mod chose (Fabric `CreativeModeTabEvents`) find them | ✅ (in vanilla's Tools and Combat tabs) |
 | **JamLib, Iceberg, Placeholder API, Fabric API** | Load and initialise as libraries for the mods above | ✅ |
 
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the

@@ -12,7 +12,7 @@ use hfc_core::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
-pub use items::RegisteredItem;
+pub use items::{CreativeTabAddition, RegisteredItem, TabPlacement};
 
 /// A desktop action a mod asked for; the runtime cannot reach the desktop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,6 +726,9 @@ impl FabricBridge {
             }
         }
 
+        // The entrypoints have registered their tab listeners and items.
+        self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+        self.interp.run_creative_tab_events();
         self.interp.step_budget = prev_budget;
 
         self.initialized = true;

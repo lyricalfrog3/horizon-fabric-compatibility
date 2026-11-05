@@ -306,7 +306,8 @@ game writes; it also checks Legendary Tooltips' `legendarytooltips.toml` (Iceber
 Night Config) and Mod Menu's pretty-printed `modmenu.json` (Gson). Known limits: `getMethod` of a missing method returns null instead of
 throwing `NoSuchMethodException`; `List.subList` is a copy, not a view; a config
 file that already exists is read back through the same reflection path
-(`Field.set` with the parsed value), which is not covered by a test yet.
+(`Field.set` with the parsed value). That works in the live client (an edited
+`modmenu.json` is honoured after a restart) but is not covered by a test yet.
 
 ## Tests
 

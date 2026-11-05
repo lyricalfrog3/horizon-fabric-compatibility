@@ -45,9 +45,9 @@ client where noted. A mod not listed here should be treated as unsupported.
 
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the
 [runtime design note](docs/architecture/fabric-runtime.md). Notably: tooltip rendering paths
-(`GATHER`, `POSTEXT`), `ScreenEvents` and `ClientTickEvents` are not dispatched, a config file
-that already exists is not covered by a test when it's read back, and mod log messages print
-their `{}` placeholders unfilled.
+(`GATHER`, `POSTEXT`), `ScreenEvents` and `ClientTickEvents` are not dispatched, and mod log
+messages print their `{}` placeholders unfilled. Editing a config file and restarting works in
+the live client (checked with Mod Menu), but reading an existing file back has no test yet.
 
 ## How it works
 

@@ -537,3 +537,40 @@ fn emerald_armor_is_wearable_and_not_stackable() {
         );
     }
 }
+
+/// The world `right_click_block` sees: one dirt block, nothing changes.
+struct DirtHost;
+
+impl hfc_runtime::bridge::HostBridge for DirtHost {
+    fn block(&self, _: [i32; 3]) -> String {
+        "minecraft:dirt".into()
+    }
+    fn block_property(&self, _: [i32; 3], _: &str) -> Option<String> {
+        None
+    }
+    fn set_block_property(&mut self, _: [i32; 3], _: &str, _: &str) -> bool {
+        false
+    }
+    fn give(&mut self, _: &str, _: u32) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Emerald Tools registers a `UseBlockCallback` that returns vanilla's
+/// `InteractionResult.PASS` (the real `InteractionResult$Pass` record) for a
+/// click it does not handle. That must let vanilla use the block, so placing
+/// a block against dirt with an empty hand goes on.
+#[test]
+fn a_passing_use_block_listener_lets_vanilla_handle_the_click() {
+    let Some(mut bridge) = emerald_tools() else {
+        return;
+    };
+    let event = hfc_runtime::bridge::RightClickBlockEvent {
+        pos: [0, 64, 0],
+        face: [0, 1, 0],
+    };
+    assert_eq!(
+        bridge.right_click_block(&mut DirtHost, &event),
+        hfc_runtime::bridge::Flow::Continue
+    );
+}

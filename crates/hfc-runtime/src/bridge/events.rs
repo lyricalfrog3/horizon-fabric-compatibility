@@ -490,6 +490,26 @@ impl FabricBridge {
         self.interp.step_budget = prev_budget;
     }
 
+    /// Whether an `InteractionResult` a listener returned is `PASS`, which
+    /// lets the next listener and then vanilla handle the click. With
+    /// Minecraft's classes loaded, `InteractionResult.PASS` is vanilla's
+    /// `InteractionResult$Pass` record; without them it is the runtime's
+    /// stand-in constant, named `PASS`.
+    fn interaction_result_passes(&self, val: &Value) -> bool {
+        let Some(id) = val.as_obj() else {
+            return val.is_null();
+        };
+        let Some(JavaObject::Instance { class_name, fields }) = self.interp.heap.get(id) else {
+            return false;
+        };
+        class_name == "net/minecraft/world/InteractionResult$Pass"
+            || fields
+                .get("name")
+                .and_then(|n| n.as_obj())
+                .and_then(|nid| self.interp.heap.get_string(nid))
+                .is_some_and(|s| s == "PASS")
+    }
+
     /// Dispatch a right-click block event into the dynamic Fabric compatibility layer.
     pub fn right_click_block(
         &mut self,
@@ -570,23 +590,7 @@ impl FabricBridge {
                             ],
                         );
                         if let Ok(val) = res {
-                            let is_pass = if let Some(id) = val.as_obj() {
-                                if let Some(JavaObject::Instance { fields, .. }) =
-                                    self.interp.heap.get(id)
-                                {
-                                    fields
-                                        .get("name")
-                                        .and_then(|n| n.as_obj())
-                                        .and_then(|nid| self.interp.heap.get_string(nid))
-                                        .map(|s| s == "PASS")
-                                        .unwrap_or(false)
-                                } else {
-                                    false
-                                }
-                            } else {
-                                val.is_null()
-                            };
-                            if !is_pass {
+                            if !self.interaction_result_passes(&val) {
                                 self.sync_level_to_host(level_id, host);
                                 return Flow::Cancel;
                             }

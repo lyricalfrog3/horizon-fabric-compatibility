@@ -1,0 +1,4 @@
+[submodule "workspace/horizon"]
+	path = workspace/horizon
+	url = https://github.com/lyricalfrog3/horizon.git
+	branch = hfc

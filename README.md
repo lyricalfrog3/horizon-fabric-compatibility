@@ -79,8 +79,11 @@ behind the content-first installer in
 ### Requirements
 
 - A stable Rust toolchain.
-- A checkout of the Horizon client at `workspace/horizon`, at the commit pinned in
-  [docs/research/horizon-current-state.md](docs/research/horizon-current-state.md).
+- The Horizon client, a Git submodule at `workspace/horizon`: the
+  [lyricalfrog3/horizon](https://github.com/lyricalfrog3/horizon) fork, branch `hfc`, which
+  carries the client hooks the runtime needs. Clone with
+  `git clone --recursive git@github.com:lyricalfrog3/horizon-fabric-compatibility.git`, or run
+  `git submodule update --init` in an existing clone.
 - For runtime tests: a local Minecraft 26.3 installation and the pinned Fabric jars in
   `test-mods/` (see [test-mods/README.md](test-mods/README.md)). Neither is committed.
 
@@ -138,7 +141,7 @@ Other commands: `hfc scan`, `hfc status`, `hfc prune`. The launcher finds `hfc` 
 | `crates/hfc-runtime` | Experimental in-client Fabric bytecode interpreter |
 | `docs/` | Architecture, decisions, research, roadmap, testing, compatibility matrix |
 | `test-mods/` | Local pinned Fabric jars for runtime tests (ignored by Git) |
-| `workspace/horizon` | Horizon client checkout (separate repository, ignored) |
+| `workspace/horizon` | Horizon client (submodule: the `lyricalfrog3/horizon` fork, branch `hfc`) |
 
 ## Contributing
 

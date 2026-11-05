@@ -87,8 +87,10 @@ Use a temporary game directory for live tests. Never write into your real worlds
 - Keep pull requests small and focused on one change.
 - Write commit messages that say what changed and why.
 - Commit runtime and installer changes in this repository. Changes to the Horizon client
-  belong in the Horizon checkout (`workspace/horizon`), which has its own history and its
-  own rules in its `AGENTS.md`.
+  belong in the `workspace/horizon` submodule, which has its own history and its own rules
+  in its `AGENTS.md`: open those pull requests against
+  [lyricalfrog3/horizon](https://github.com/lyricalfrog3/horizon), branch `hfc`, then update
+  the submodule pointer here.
 - If an AI agent wrote the change, the commit ends with that agent's `Co-Authored-By:` line.
 - In the pull request, list what you verified and how (test names, or what you saw in the
   live client), and anything you did not verify.

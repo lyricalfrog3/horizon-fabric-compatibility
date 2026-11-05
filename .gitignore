@@ -3,7 +3,9 @@
 **/target/
 
 # Nested Git checkouts (each has its own history)
-/workspace/
+/workspace/*
+# The Horizon client is a submodule (the lyricalfrog3/horizon fork, branch hfc).
+!/workspace/horizon
 /research/horizon-mixins/
 
 # Local game and runtime state

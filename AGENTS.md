@@ -6,7 +6,7 @@ This repository has two separate tracks. Do not mix their claims.
 |---|---|---|
 | HFC installer | `crates/hfc-*` except `hfc-runtime` | Host-side discovery, analysis, content conversion, cache, install and reports. Does not execute mod Java code. |
 | Experimental Fabric runtime | `crates/hfc-runtime` plus `workspace/horizon` client hooks | Interprets selected Fabric entrypoints in the client with a custom bytecode interpreter and Java/Minecraft builtins. Not general Fabric compatibility. |
-| Nested Horizon checkout | `workspace/horizon` | The client and launcher. Has its own Git history and its own `AGENTS.md`; read that before editing client code. |
+| Horizon client submodule | `workspace/horizon` | The client and launcher: a submodule pinned to the `lyricalfrog3/horizon` fork, branch `hfc`. Has its own Git history and its own `AGENTS.md`; read that before editing client code. |
 | Nested references | `workspace/horizon-mods`, `research/horizon-mixins` | Separate Git checkouts; the root repository ignores them. |
 
 Read [docs/architecture/fabric-runtime.md](docs/architecture/fabric-runtime.md) before changing
@@ -40,9 +40,8 @@ the runtime. Read [docs/testing.md](docs/testing.md) before adding tests.
 
 ## Build and test
 
-The root workspace references the separate `workspace/horizon` checkout through path
-dependencies; check that checkout out at the pinned commit (see
-`docs/research/horizon-current-state.md`) before building or running the whole workspace.
+The root workspace references the `workspace/horizon` submodule through path dependencies;
+run `git submodule update --init` before building or running the whole workspace.
 
 Root workspace (HFC crates, including the runtime):
 
@@ -93,14 +92,17 @@ fabricated classes.
 | `crates/hfc-bootstrap` | Conversion run loop and install/state/reports |
 | `crates/hfc-cli` | `hfc` command line |
 | `docs/` | Architecture, decisions, research, roadmap, testing, compatibility matrix |
-| `workspace/horizon` | Horizon client/launcher checkout (separate Git repository) |
+| `workspace/horizon` | Horizon client/launcher (submodule: `lyricalfrog3/horizon`, branch `hfc`) |
 | `test-mods/` | Local pinned Fabric jars for runtime tests (jars ignored by Git) |
 
 ## Git
 
-The root repository tracks HFC source and docs, not the nested checkouts. Commit client-adapter
-changes inside `workspace/horizon`; commit runtime/HFC changes at the root. Build output,
-generated mods, saves, caches and local jars are ignored.
+The root repository tracks HFC source and docs, and pins the client through the
+`workspace/horizon` submodule; the other nested checkouts are ignored. Commit runtime/HFC
+changes at the root. Commit client-adapter changes inside `workspace/horizon`, push them to
+the fork's `hfc` branch (remote `fork`, `git@github.com:lyricalfrog3/horizon.git`), then
+commit the updated submodule pointer at the root. Never push to upstream
+`horizon-rust/horizon`. Build output, generated mods, saves, caches and local jars are ignored.
 
 ## Attribution
 

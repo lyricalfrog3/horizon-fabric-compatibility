@@ -21,7 +21,7 @@ const ITEM: &str = "net/minecraft/world/item/Item";
 /// The instance field holding the native record on a `Properties` object.
 const PROPERTIES_FIELD: &str = "$hfc_properties";
 /// The instance field holding an item's copy of its properties.
-const ITEM_FIELD: &str = "$hfc_item_properties";
+pub(crate) const ITEM_FIELD: &str = "$hfc_item_properties";
 
 /// An item a mod registered: its id and what its properties recorded.
 #[derive(Debug, Clone)]
@@ -297,7 +297,7 @@ fn properties_method(
 
 /// The id a `Registry.register` key names: a `ResourceKey`, an `Identifier` or a
 /// path in the `minecraft` namespace.
-fn registration_id(heap: &Heap, key: &Value) -> Option<String> {
+pub(crate) fn registration_id(heap: &Heap, key: &Value) -> Option<String> {
     match heap.get(key.as_obj()?)? {
         JavaObject::Instance {
             class_name, fields, ..
@@ -343,6 +343,8 @@ impl Interpreter {
             // A vanilla item (`Items.X`) registered again is not a mod's item.
             _ => return Some(value.clone()),
         };
+        // A `BlockItem` places a block; the block's facts name its item.
+        self.note_block_item(&id, value.as_obj()?);
         if let Some(vanilla) = self.vanilla_item_class(&class) {
             log::warn!(
                 "item {id} extends {vanilla}, whose behaviour the host cannot take from data; \

@@ -26,22 +26,25 @@ process with a custom heap and builtins. Only run mods you trust.
 ## Entrypoint instruction budget
 
 `FabricBridge::init` runs `onInitialize` entrypoints first, then `onInitializeClient`. Each
-entrypoint gets `ENTRYPOINT_BUDGET` instructions (currently **10,000,000**).
+entrypoint gets `ENTRYPOINT_BUDGET` instructions (currently **100,000,000**).
 
 A JVM has no instruction cap. The cap exists only to stop a mis-decoded branch from hanging
 the render thread. The previous 200,000 cap aborted legitimate Fabric API initialization and
 left mods half-registered. Measured with the real Minecraft jar, libraries and JDK image:
 
-| Entrypoint | Approximate cost | 200k | 10M |
-|---|---:|---|---|
-| `ModMenu.onInitializeClient` | ~367k | fail | pass |
-| Fabric `RecipeSyncImpl.onInitialize` | ~590k | fail | pass |
-| Fabric `CustomIngredientInit.onInitialize` | ~575k | fail | pass |
-| Fabric `AttachmentSync.onInitialize` | ~4.9M | fail | pass |
-| `CustomUnbakedBlockStateModelInit.onInitializeClient` | >50M | fail | **intentionally still fails** |
+| Entrypoint | Approximate cost | 200k | 10M | 100M |
+|---|---:|---|---|---|
+| `ModMenu.onInitializeClient` | ~367k | fail | pass | pass |
+| Fabric `RecipeSyncImpl.onInitialize` | ~590k | fail | pass | pass |
+| Fabric `CustomIngredientInit.onInitialize` | ~575k | fail | pass | pass |
+| Fabric `AttachmentSync.onInitialize` | ~4.9M | fail | pass | pass |
+| `CustomUnbakedBlockStateModelInit.onInitializeClient` | >50M | fail | fail | not re-measured at 100M |
+| `MdmMod.onInitialize` (344 blocks, 15,360 states) | ~46.1M | fail | fail | pass (release ~5.3 s, debug ~54 s) |
 
-The last entrypoint only registers custom block-state model codecs. It is unrelated to the
-mods tested here and is deliberately not given a larger budget. A failure is logged as
+The mdm cost is dominated by building `StateDefinition`s for blocks with many
+states (`furniture_part` 2,916; three `electric_guitar_*` 3,468 each). The budget was raised
+from 10M to 100M for it. `CustomUnbakedBlockStateModelInit` only registers custom block-state model codecs. It is unrelated to the
+mods tested here; it was not re-measured after the raise and may now run further. A failure is logged as
 `Mod entrypoint <class>.<method><descriptor> failed to initialize: ...`; it does not abort
 the other entrypoints.
 
@@ -525,3 +528,95 @@ The root repository does not track `workspace/horizon`, `workspace/horizon-mods`
 `research/horizon-mixins`; each is a separate Git checkout with its own history. Client-side
 adapter changes must be committed in `workspace/horizon`. Build output, generated mods,
 world saves and downloaded jars are ignored by the root repository.
+
+## Registered blocks
+
+`Registry.register` for the BLOCK registry records the mod's block object (same interception
+as items). `Interpreter::collect_block_facts` (called at the end of `init`) then reads facts
+by calling the real bytecode: `Block` getters, `StateDefinition.getProperties` and
+`getPossibleStates`, `BlockStateBase` getters (destroy speed, light emission, map colour,
+sound type, occlusion) and the `defaultBlockState` field. `FabricBridge::registered_blocks`
+returns them as `RegisteredBlock`. A fact that fails to read goes into `unreadable`; nothing
+is guessed. The BlockItem of each block comes from the item registration (`BlockItem.block`),
+with the components its `Item.Properties` set (`item_components`). `overrides` lists the
+vanilla methods the mod's own classes override, as `<vanilla class>.<method>` (the most derived
+vanilla class in the chain declaring the same name and descriptor; constructors, static and
+private methods left out), read from the loaded class files: it tells which vanilla behaviour
+the mod replaced (mdm's beds override `AbstractBedBlock.setPlacedBy`).
+
+Shapes are not read in `init`: `Shapes.or` over many fine boxes costs tens of millions of
+instructions (three `electric_guitar_*` blocks ~40M each, ~168M for all 344 blocks, ~13 s
+release). `FabricBridge::read_block_shapes(ids)` runs `getShape`/`getCollisionShape` with
+`EmptyBlockGetter`, `BlockPos.ZERO` and `toAabbs()` for the given ids (empty = all), each
+under `BLOCK_SHAPE_BUDGET`.
+
+General runtime fixes this needed: `Collection.toArray(T[])`, structural List map keys,
+adopting bytecode collections (Guava `ImmutableList`) into heap lists in `copyOf`/copy
+constructors, three-argument `Stream.collect`, `Object.clone` on plain instances and
+`Integer.toString()`/`Long.toString()` as instance methods.
+
+### Blocks in the client (stage B: decoration)
+
+`workspace/horizon` turns each `RegisteredBlock` into a Horizon block declaration in the
+generated content mod (`game/fabric_bridge/content/blocks.rs`, `data/<ns>/horizon/block/`).
+The template follows the vanilla class: a vanilla block of the block's first vanilla class
+with the same states, unless the mod overrides that class's behaviour (`overrides`, minus the
+methods the declaration carries from facts: shapes, codec, state definition, rotate/mirror);
+then the next vanilla class up; at `Block`, a plain vanilla block (class `Block`, one state,
+not flammable, no fluid/ticks/offset/block entity) with the same sounds where one has them.
+A block whose kept vanilla behaviour needs states no vanilla block of its class has is left
+out. The declaration carries the default state's hardness, resistance, light, tool need,
+friction, map colour, sounds and `can_occlude`, the block's own state properties, and its
+outline and collision per state (`shapes`/`collision` keyed by the fewest properties they
+depend on; over 16 boxes are merged into a cover). Shapes are read once per run on the
+content-root thread (about 15 s for mdm's 344 blocks in the fast build). Block entities, use and ticks are not run; placement is in the next section.
+Drops come from the jar's own `data/<ns>/loot_table/blocks/` files through Horizon's loot
+engine. Tables written in an older format (a `conditions` list of `{"condition": ...}`) roll
+as 26.3 rolls them: its codecs read only `condition`, so the old list is an ignored field.
+
+### Placing a registered block (stage C1)
+
+The host asks the bridge for the state of a block a mod registered
+(`FabricBridge::state_for_placement`, called from `Game::fabric_state_for_placement` in the
+server's `before_state_for_placement` hook) and, once it placed it, for the other blocks the
+mod sets (`FabricBridge::block_placed`, from `fabric_block_placed` after `native_place_block`).
+Only blocks whose `overrides` name `getStateForPlacement` / `setPlacedBy` / `onPlace` run mod
+code; the rest keep the host's placement.
+
+The mod's real bytecode runs with a native `BlockPlaceContext` (`place_builtins.rs`) built from
+the click: clicked position, face and hit point, the placer's yaw, pitch, position and sneaking,
+the item, `replacingClickedOnBlock`, and the real `Direction` constants. The `Level` is a
+snapshot of the host's blocks within 2 of the position (`HostBridge::block`, `block_properties`);
+a mod block is its own `BlockState` object, so the mod's `getBlockState(..).getBlock()` works. A
+null result refuses the placement; the state maps back to Horizon's by its property values.
+`setBlock` calls made by `setPlacedBy`/`onPlace` are collected and set through
+`native_set_block`. Budget 20M instructions per call; a call over 50 ms is logged.
+
+Limits: the hand is always the main hand (the hook does not carry it); the world border and
+build height are the overworld's defaults; `canBeReplaced` of a vanilla block is air or the
+`minecraft:replaceable` tag; no block entity is created or given the stack's data by
+`setPlacedBy`; `getStateForPlacement` is not run on a client that predicts.
+
+### Containers (stage C2)
+
+`RegisteredBlock::container` (`container_builtins.rs`, read in `collect_block_facts`) runs the
+block's real `EntityBlock.newBlockEntity` on its default state and asks the entity:
+`getContainerSize()`, `getDisplayName()` and the menu `createMenu(0, Inventory)` builds (its
+`AbstractContainerMenu.getType()` matched against `MenuType`'s constants). A block entity that
+does not extend `BaseContainerBlockEntity` is `NotVanillaContainer(class)`; anything that failed
+is `Unreadable(reason)`. `title` is the text `getDisplayName()` answered (a literal, or the
+mod's own language file's text when it used a translation).
+
+The client writes `"container": {slots, menu, title}` into the block declaration only when
+Horizon has that menu with that slot count (`containers::MOD_MENUS`), and the title only when
+it is not the block's own `block.<ns>.<path>` key. Horizon's side is documented in
+`workspace/horizon/docs/mods.md` (a block's `container`): the content mod's block gets the world
+class `HorizonContainerBlock` (opens its menu on use), a mod block entity of its own id that
+holds the slots, hopper and comparator access and drops on break, all through the machinery native
+mod containers use. Not run: the block entity's own code (ticking, `getMaxStackSize`, `canPlaceItem`,
+`canTakeItemThroughFace`, loot tables), and the block's `useWithoutItem` (stage C3).
+
+mdm (344 blocks): 130 are 27-slot `generic_9x3` containers (storage furniture; each block
+entity extends `RandomizableContainerBlockEntity`), 211 have `DecorationPlacementBlockEntity` and
+2 have `WallClockBlockEntity` (neither is a container; they stay decoration), 1
+(`furniture_part`) has no block entity.

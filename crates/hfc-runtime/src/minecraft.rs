@@ -542,6 +542,17 @@ pub struct Level {
     pub is_client: bool,
     pub dimension: String,
     pub blocks: HashMap<[i32; 3], BlockState>,
+    /// Positions holding a block a mod registered in code: the heap id of the
+    /// mod's own `BlockState` object, which `getBlockState` answers instead of
+    /// a native state.
+    pub mod_states: HashMap<[i32; 3], usize>,
+    /// `setBlock`/`setBlockAndUpdate` calls, in order: position and the heap
+    /// id of the state written (a native `BlockState` or a mod's own).
+    pub placed: Vec<([i32; 3], usize)>,
+    /// The build height: `isOutsideBuildHeight` is `y < min_y || y >= max_y`.
+    /// The overworld's, as the host does not report its dimension's.
+    pub min_y: i32,
+    pub max_y: i32,
     pub dropped_stacks: Vec<(BlockPos, String, i32)>,
     pub replanted: Vec<(BlockPos, BlockState)>,
     /// Positions a mod removed with `destroyBlock`/`removeBlock`, in order.
@@ -554,6 +565,10 @@ impl Level {
             is_client,
             dimension: "minecraft:overworld".into(),
             blocks: HashMap::new(),
+            mod_states: HashMap::new(),
+            placed: Vec::new(),
+            min_y: -64,
+            max_y: 320,
             dropped_stacks: Vec::new(),
             replanted: Vec::new(),
             broken: Vec::new(),
@@ -617,6 +632,14 @@ pub struct Player {
     pub uuid: Option<usize>,
     /// A server-side player: its class is `ServerPlayer`, as seen by mods.
     pub server_side: bool,
+    /// Rotation in degrees (`getYRot`, `getXRot`), as the host reports it.
+    pub yaw: f32,
+    pub pitch: f32,
+    /// `Entity.position()`.
+    pub position: [f64; 3],
+    /// `Entity.getDirection()`: the real `Direction` constant, set by the
+    /// bridge when it knows the player's rotation.
+    pub direction: Option<Value>,
 }
 
 impl Player {
@@ -630,6 +653,10 @@ impl Player {
             food_exhaustion: 0.0,
             uuid: None,
             server_side: false,
+            yaw: 0.0,
+            pitch: 0.0,
+            position: [0.0; 3],
+            direction: None,
         }
     }
 }

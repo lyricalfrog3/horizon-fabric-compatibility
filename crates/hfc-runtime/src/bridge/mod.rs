@@ -12,6 +12,11 @@ use hfc_core::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use crate::place_builtins::PlacementRequest;
+pub use blocks::{
+    BlockChange, BlockContainer, BlockSound, ContainerRead, PlacedBy, Placement, RegisteredBlock,
+    RegisteredState,
+};
 pub use items::{CreativeTabAddition, RegisteredItem, TabPlacement};
 
 /// A desktop action a mod asked for; the runtime cannot reach the desktop.
@@ -49,6 +54,12 @@ pub trait HostBridge {
     fn drop_item(&mut self, pos: [i32; 3], item: &str, count: u32) {
         let _ = pos;
         let _ = self.give(item, count);
+    }
+    /// Every property of the block at `pos`, `(name, value)`. Hosts that
+    /// cannot say leave the default (no properties).
+    fn block_properties(&self, pos: [i32; 3]) -> Vec<(String, String)> {
+        let _ = pos;
+        Vec::new()
     }
 }
 
@@ -150,8 +161,14 @@ impl ModEntrypoint {
 /// resolve their whole config/`Codec` graph at init. With the game's real
 /// Minecraft and JDK classes those entrypoints need millions of instructions
 /// (Mod Menu alone ~370k, Fabric's attachment sync ~4.9M), so the old 200k
-/// cap aborted legitimate initialization and left mods half-registered.
-const ENTRYPOINT_BUDGET: u64 = 10_000_000;
+/// cap aborted legitimate initialization and left mods half-registered. Large
+/// block registries need more still (mdm: ~46M); see
+/// `docs/architecture/fabric-runtime.md` for the measurements.
+const ENTRYPOINT_BUDGET: u64 = 100_000_000;
+
+/// The most instructions one `getShape` or `getCollisionShape` call may use in
+/// `read_block_shapes`.
+const BLOCK_SHAPE_BUDGET: u64 = 100_000_000;
 
 /// The Fabric compatibility bridge managing mod execution.
 pub struct FabricBridge {
@@ -199,6 +216,7 @@ impl Default for FabricBridge {
     }
 }
 
+pub(crate) mod blocks;
 mod events;
 pub(crate) mod items;
 mod menu;
@@ -710,11 +728,19 @@ impl FabricBridge {
 
         for entry in &sorted_entrypoints {
             self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+            let started = std::time::Instant::now();
             let res = self.interp.execute_method(
                 &entry.class_name,
                 &entry.method_name,
                 &entry.descriptor,
                 &[],
+            );
+            log::debug!(
+                "entrypoint {}.{} used {} instructions in {:?}",
+                entry.class_name,
+                entry.method_name,
+                ENTRYPOINT_BUDGET - self.interp.step_budget.unwrap_or(0),
+                started.elapsed()
             );
             if let Err(e) = res {
                 log::warn!(
@@ -729,6 +755,9 @@ impl FabricBridge {
         // The entrypoints have registered their tab listeners and items.
         self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
         self.interp.run_creative_tab_events();
+        // Every block object exists now; read their states and shapes. Each
+        // block gets its own budget so one bad block cannot starve the rest.
+        self.interp.collect_block_facts(ENTRYPOINT_BUDGET);
         self.interp.step_budget = prev_budget;
 
         self.initialized = true;

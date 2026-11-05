@@ -40,17 +40,23 @@ client where noted. A mod not listed here should be treated as unsupported.
 | **Right Click Harvest** | Right-click harvesting and replanting; `rightclickharvest.json5` written with comments, matching the real game's file | ✅ |
 | **Veinminer** | Breaking one ore breaks the connected vein (Kotlin coroutines, `PlayerBlockBreakEvents.BEFORE`) | ✅ |
 | **Mod Menu** | Title and pause menu buttons, the mod list with icons, search and scrolling; link dialogs that open the browser or copy to the clipboard; `modmenu.json` byte-identical to the real game's | ✅ |
-| **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow; the tooltip body from the mod's real component list (centred title, name separator, item-model request); `legendarytooltips.toml` written with comments, allowed values and ranges | ✅ frame, title, separator, model panel |
+| **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow; the tooltip body from the mod's real component list (centred title, name separator, the item model rotating in 3D); the shine that restarts per hovered stack; `legendarytooltips.toml` written with comments, allowed values and ranges, and read back | ✅ |
 | **Emerald Tools** | Its five tools, registered in code, become Horizon items with vanilla-formula tool stats, textures, names and recipes; `/give`, creative search and the tabs the mod chose (Fabric `CreativeModeTabEvents`) find them | ✅ (in vanilla's Tools and Combat tabs) |
 | **Emerald Armor** | Its four armor pieces, registered in code with `Item.Properties.humanoidArmor`, become Horizon items with vanilla-formula durability, armor and toughness, a single stack, and an equippable slot; its worn-armor model and textures (under `assets/minecraft`) are carried | ✅ (worn and rendered) |
+| **Modern Decorations** | Its 344 blocks, registered in code, become Horizon blocks from facts read by running the mod's real block code: states, hardness, light, sounds, outline and collision shapes; they render with the jar's models, drop through its loot tables, and come with their items. Placement runs the mod's own `getStateForPlacement` and `setPlacedBy` (facing, multi-block furniture), and the 130 storage blocks are 27-slot containers that keep and drop their items | ✅ placing, facing, storage |
 | **JamLib, Iceberg, Placeholder API, Fabric API** | Load and initialise as libraries for the mods above | ✅ |
 
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the
-[runtime design note](docs/architecture/fabric-runtime.md). Notably: Legendary's item model is
-drawn flat and does not rotate (the HUD renderer has no 3D model transform), and its shine
-is not checked live; mod log messages print their `{}` placeholders
-unfilled. Editing a config file and restarting works in
-the live client (checked with Mod Menu), but reading an existing file back has no test yet.
+[runtime design note](docs/architecture/fabric-runtime.md). Notably:
+
+- Blocks: a mod block's own right-click code (`useWithoutItem`) and block-entity ticking don't
+  run yet; containers ignore the mod's per-slot stack limit and per-face rules; blocks whose
+  block entity is not a vanilla container stay decoration. Reading every block's facts makes
+  startup slower (about 20 s with Modern Decorations) until they are cached.
+- Mods that carry blocks or entities around (Carry On) and most `Mixin`-heavy gameplay mods do
+  not work.
+- Mod advancements are granted but don't appear in the advancement screen.
+- Mod log messages print their `{}` placeholders unfilled.
 
 ## How it works
 

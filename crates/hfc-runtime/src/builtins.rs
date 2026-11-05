@@ -59,10 +59,54 @@ pub(crate) fn map_key_position(heap: &Heap, map_id: usize, key: &Value) -> Optio
     if let Some(pos) = entries.iter().position(|(k, _)| k == key) {
         return Some(pos);
     }
+    // `List.equals`: a list key matches a list with equal elements. Block state
+    // tables key their states by the list of their property values.
+    if let Some(JavaObject::List(wanted)) = key.as_obj().and_then(|id| heap.get(id)) {
+        return entries.iter().position(|(k, _)| {
+            matches!(
+                k.as_obj().and_then(|id| heap.get(id)),
+                Some(JavaObject::List(items)) if lists_equal(heap, items, wanted)
+            )
+        });
+    }
     let text = key.as_obj().and_then(|id| heap.get_string(id))?;
     entries
         .iter()
         .position(|(k, _)| k.as_obj().and_then(|id| heap.get_string(id)) == Some(text))
+}
+
+/// `List.equals` over heap lists: equal length and equal elements, where an
+/// element is equal by value, by identity, or as a list or string with equal content.
+fn lists_equal(heap: &Heap, a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            if x == y {
+                return true;
+            }
+            let (Some(xi), Some(yi)) = (x.as_obj(), y.as_obj()) else {
+                return false;
+            };
+            match (heap.get(xi), heap.get(yi)) {
+                (Some(JavaObject::List(p)), Some(JavaObject::List(q))) => lists_equal(heap, p, q),
+                (Some(JavaObject::String(p)), Some(JavaObject::String(q))) => p == q,
+                // Boxed booleans are fresh objects per `Boolean.valueOf`.
+                (
+                    Some(JavaObject::Instance {
+                        class_name: p_class,
+                        fields: p,
+                    }),
+                    Some(JavaObject::Instance {
+                        class_name: q_class,
+                        fields: q,
+                    }),
+                ) => {
+                    p_class == "java/lang/Boolean"
+                        && q_class == p_class
+                        && p.get("value") == q.get("value")
+                }
+                _ => false,
+            }
+        })
 }
 
 pub(crate) fn text_of_value(heap: &Heap, val: &Value) -> String {
@@ -1224,6 +1268,11 @@ pub fn dispatch_builtin(
         return result;
     }
 
+    // `BlockPlaceContext` getters for `getStateForPlacement`.
+    if let Some(result) = crate::place_builtins::place_method(heap, class_name, method_name, args) {
+        return result;
+    }
+
     // The item list a creative tab event listener records into.
     if let Some(result) =
         crate::creative_tab_builtins::output_method(heap, method_name, descriptor, args)
@@ -2141,6 +2190,18 @@ pub fn dispatch_builtin(
                 let new_id = heap.alloc(cloned_arr);
                 return BuiltinResult::Handled(Value::Object(Some(new_id)));
             }
+            // `Object.clone` of a bytecode object (`BitSet.clone` calls
+            // `super.clone()`): a shallow copy of its fields.
+            if class_name == "java/lang/Object" {
+                if let Some(JavaObject::Instance { class_name, fields }) = heap.get(id) {
+                    let copy = JavaObject::Instance {
+                        class_name: class_name.clone(),
+                        fields: fields.clone(),
+                    };
+                    let new_id = heap.alloc(copy);
+                    return BuiltinResult::Handled(Value::Object(Some(new_id)));
+                }
+            }
         }
     }
 
@@ -3046,6 +3107,30 @@ pub fn dispatch_builtin(
             };
             let sid = heap.alloc_stream(items);
             return BuiltinResult::Handled(Value::Object(Some(sid)));
+        }
+    }
+
+    // `Collection.toArray(T[])`: a copy typed like the array passed in.
+    if matches!(
+        class_name,
+        "java/util/Collection" | "java/util/List" | "java/util/Set"
+    ) && method_name == "toArray"
+        && args.len() == 2
+    {
+        let items = match args[0].as_obj().and_then(|id| heap.get(id)) {
+            Some(JavaObject::List(items)) | Some(JavaObject::Set(items)) => Some(items.clone()),
+            _ => None,
+        };
+        let elem_type = match args[1].as_obj().and_then(|id| heap.get(id)) {
+            Some(JavaObject::Array { elem_type, .. }) => Some(elem_type.clone()),
+            _ => None,
+        };
+        if let (Some(elements), Some(elem_type)) = (items, elem_type) {
+            let array = heap.alloc(JavaObject::Array {
+                elem_type,
+                elements,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(array)));
         }
     }
 
@@ -5591,15 +5676,37 @@ pub fn dispatch_builtin(
                     return BuiltinResult::Handled(Value::Int(pos.z));
                 }
             }
+        } else if method_name == "offset" && args.len() >= 2 {
+            // `offset(Vec3i)` (a BlockPos is one) and `offset(int, int, int)`.
+            if let Some(pos) = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockPos>(id))
+                .cloned()
+            {
+                let by = if args.len() >= 4 {
+                    Some((args[1].as_int(), args[2].as_int(), args[3].as_int()))
+                } else {
+                    args[1]
+                        .as_obj()
+                        .and_then(|id| heap.get_native::<BlockPos>(id))
+                        .map(|other| (other.x, other.y, other.z))
+                };
+                if let Some((dx, dy, dz)) = by {
+                    let new_id = heap.alloc_block_pos(pos.x + dx, pos.y + dy, pos.z + dz);
+                    return BuiltinResult::Handled(Value::Object(Some(new_id)));
+                }
+            }
         } else if method_name == "relative" && args.len() >= 2 {
             if let Some(id) = args[0].as_obj() {
                 if let Some(pos) = heap.get_native::<BlockPos>(id).cloned() {
-                    if let Some(dir_id) = args[1].as_obj() {
-                        if let Some(dir) = heap.get_native::<Direction>(dir_id) {
-                            let new_id =
-                                heap.alloc_block_pos(pos.x + dir.x, pos.y + dir.y, pos.z + dir.z);
-                            return BuiltinResult::Handled(Value::Object(Some(new_id)));
-                        }
+                    if let Some(dir) = direction_of(heap, &args[1]) {
+                        let steps = args.get(2).map_or(1, |v| v.as_int());
+                        let new_id = heap.alloc_block_pos(
+                            pos.x + dir.x * steps,
+                            pos.y + dir.y * steps,
+                            pos.z + dir.z * steps,
+                        );
+                        return BuiltinResult::Handled(Value::Object(Some(new_id)));
                     }
                     if args.len() >= 3 {
                         let offset = args[2].as_int();
@@ -5671,8 +5778,31 @@ pub fn dispatch_builtin(
         }
     }
 
+    // The runtime does not model a world border: the whole level is inside it.
+    if class_name == "net/minecraft/world/level/border/WorldBorder"
+        && matches!(method_name, "isWithinBounds" | "isInsideCloseToBorder")
+    {
+        return BuiltinResult::Handled(Value::from_bool(true));
+    }
+
     // BlockState
     if class_name == "net/minecraft/world/level/block/state/BlockState" {
+        if method_name == "canBeReplaced" && !args.is_empty() {
+            // `BlockBehaviour.Properties.replaceable()`: air, fluids, plants.
+            // The `minecraft:replaceable` tag lists exactly those.
+            let id = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockState>(id))
+                .map(|state| state.block.id.clone());
+            if let Some(id) = id {
+                let replaceable = id == "minecraft:air"
+                    || heap
+                        .registries
+                        .tag_members("BLOCK", "minecraft:replaceable")
+                        .contains(&id);
+                return BuiltinResult::Handled(Value::from_bool(replaceable));
+            }
+        }
         if method_name == "getProperties" && !args.is_empty() {
             // One property object per block-state property the runtime carries.
             let names: Vec<String> = args[0]
@@ -5894,9 +6024,60 @@ pub fn dispatch_builtin(
                     heap.get_native::<Level>(id),
                     heap.get_native::<BlockPos>(pos_id),
                 ) {
+                    // A block a mod registered answers its own state object.
+                    if let Some(own) = level.mod_states.get(&[pos.x, pos.y, pos.z]) {
+                        return BuiltinResult::Handled(Value::Object(Some(*own)));
+                    }
                     let state = level.get_block_state(pos);
                     let sid = heap.alloc_block_state(state);
                     return BuiltinResult::Handled(Value::Object(Some(sid)));
+                }
+            }
+        } else if method_name == "isOutsideBuildHeight" && args.len() >= 2 {
+            let y = match args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockPos>(id))
+            {
+                Some(pos) => pos.y,
+                None => args[1].as_int(),
+            };
+            let bounds = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<Level>(id))
+                .map(|level| (level.min_y, level.max_y));
+            if let Some((min_y, max_y)) = bounds {
+                return BuiltinResult::Handled(Value::from_bool(y < min_y || y >= max_y));
+            }
+        } else if method_name == "getWorldBorder" {
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/world/level/border/WorldBorder".into(),
+                fields: HashMap::new(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "setBlock" && args.len() >= 4 {
+            // `setBlock(pos, state, flags)`: the state is a native one or a
+            // mod block's own object; the bridge reads which when it hands the
+            // changes to the host.
+            if let (Some(id), Some(pos_id), Some(st_id)) =
+                (args[0].as_obj(), args[1].as_obj(), args[2].as_obj())
+            {
+                let pos = heap.get_native::<BlockPos>(pos_id).cloned();
+                let native = heap.get_native::<BlockState>(st_id).cloned();
+                if let Some(pos) = pos {
+                    if let Some(level) = heap.get_native_mut::<Level>(id) {
+                        let at = [pos.x, pos.y, pos.z];
+                        match native {
+                            Some(state) => {
+                                level.mod_states.remove(&at);
+                                level.blocks.insert(at, state);
+                            }
+                            None => {
+                                level.mod_states.insert(at, st_id);
+                            }
+                        }
+                        level.placed.push((at, st_id));
+                        return BuiltinResult::Handled(Value::from_bool(true));
+                    }
                 }
             }
         } else if method_name == "setBlockAndUpdate" && args.len() >= 3 {
@@ -6029,7 +6210,13 @@ pub fn dispatch_builtin(
                     .is_some_and(|p| p.is_crouching);
             return BuiltinResult::Handled(Value::from_bool(crouching));
         } else if method_name == "getItemInHand" {
-            let stack_id = heap.alloc_item_stack(ItemStack::empty());
+            let held = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_native::<Player>(id))
+                .and_then(|p| p.hand_item.clone())
+                .unwrap_or_else(ItemStack::empty);
+            let stack_id = heap.alloc_item_stack(held);
             return BuiltinResult::Handled(Value::Object(Some(stack_id)));
         } else if method_name == "level" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -6043,6 +6230,32 @@ pub fn dispatch_builtin(
                 fields: HashMap::new(),
             });
             return BuiltinResult::Handled(Value::Object(Some(pid)));
+        } else if let Some(player) = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| heap.get_native::<Player>(id))
+            .filter(|_| {
+                matches!(
+                    method_name,
+                    "getYRot"
+                        | "getXRot"
+                        | "getDirection"
+                        | "getX"
+                        | "getY"
+                        | "getZ"
+                        | "isShiftKeyDown"
+                )
+            })
+        {
+            return BuiltinResult::Handled(match method_name {
+                "getYRot" => Value::Float(player.yaw),
+                "getXRot" => Value::Float(player.pitch),
+                "getDirection" => player.direction.clone().unwrap_or(Value::NULL),
+                "getX" => Value::Double(player.position[0]),
+                "getY" => Value::Double(player.position[1]),
+                "getZ" => Value::Double(player.position[2]),
+                _ => Value::from_bool(player.is_crouching),
+            });
         } else if method_name == "getAbilities" {
             let mut fields = HashMap::new();
             fields.insert("instabuild".into(), Value::from_bool(false));
@@ -6652,4 +6865,30 @@ pub fn dispatch_builtin(
     }
 
     BuiltinResult::NotHandled
+}
+
+/// A `Direction` value: the runtime's native one, or the real enum constant
+/// (an instance holding the constant's name) Minecraft's own `Direction`
+/// bytecode makes.
+pub(crate) fn direction_of(heap: &Heap, value: &Value) -> Option<Direction> {
+    let id = value.as_obj()?;
+    if let Some(direction) = heap.get_native::<Direction>(id) {
+        return Some(direction.clone());
+    }
+    let JavaObject::Instance { class_name, fields } = heap.get(id)? else {
+        return None;
+    };
+    if class_name != "net/minecraft/core/Direction" {
+        return None;
+    }
+    let name = heap.get_string(fields.get("name")?.as_obj()?)?;
+    Some(match name {
+        "down" | "DOWN" => Direction::DOWN,
+        "up" | "UP" => Direction::UP,
+        "north" | "NORTH" => Direction::NORTH,
+        "south" | "SOUTH" => Direction::SOUTH,
+        "west" | "WEST" => Direction::WEST,
+        "east" | "EAST" => Direction::EAST,
+        _ => return None,
+    })
 }

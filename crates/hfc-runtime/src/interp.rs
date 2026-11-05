@@ -230,6 +230,49 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Replace each argument that is a collection implemented in bytecode (not
+    /// by the heap) with a heap list of its elements, in iteration order.
+    fn adopt_collection_args(&mut self, args: &[Value], first: usize) -> Result<Vec<Value>> {
+        let mut out = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            let real = index >= first
+                && arg.as_obj().is_some_and(|id| {
+                    matches!(self.heap.get(id), Some(JavaObject::Instance { .. }))
+                })
+                && self.is_instance_of(arg, "java/util/Collection");
+            if !real {
+                out.push(arg.clone());
+                continue;
+            }
+            let iterator = self.execute_method(
+                "java/util/Collection",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                std::slice::from_ref(arg),
+            )?;
+            let mut items = Vec::new();
+            while self
+                .execute_method(
+                    "java/util/Iterator",
+                    "hasNext",
+                    "()Z",
+                    std::slice::from_ref(&iterator),
+                )?
+                .as_int()
+                != 0
+            {
+                items.push(self.execute_method(
+                    "java/util/Iterator",
+                    "next",
+                    "()Ljava/lang/Object;",
+                    std::slice::from_ref(&iterator),
+                )?);
+            }
+            out.push(Value::Object(Some(self.heap.alloc_list(items))));
+        }
+        Ok(out)
+    }
+
     /// Check if a value is an instance of the target type.
     pub fn is_instance_of(&mut self, obj_val: &Value, target_type: &str) -> bool {
         // A boxed number is a plain value; it is an instance of its wrapper.
@@ -1086,6 +1129,22 @@ impl Interpreter {
                             elements: items,
                         }))));
                     }
+                    "toArray" if args.len() == 2 => {
+                        // `toArray(IntFunction<A[]>)`: the generator makes the
+                        // typed array, the stream's elements fill it.
+                        let array = self.execute_method(
+                            "java/util/function/IntFunction",
+                            "apply",
+                            "(I)Ljava/lang/Object;",
+                            &[args[1].clone(), Value::Int(items.len() as i32)],
+                        )?;
+                        if let Some(id) = array.as_obj()
+                            && let Some(JavaObject::Array { elements, .. }) = self.heap.get_mut(id)
+                        {
+                            *elements = items;
+                            return Ok(array);
+                        }
+                    }
                     "map" | "mapToObj" | "mapToInt" | "mapToLong" | "mapToDouble" => {
                         let function = args.get(1).cloned().unwrap_or(Value::NULL);
                         let mut mapped = Vec::new();
@@ -1201,6 +1260,25 @@ impl Interpreter {
                             fields,
                         });
                         return Ok(Value::Object(Some(id)));
+                    }
+                    // `collect(supplier, accumulator, combiner)`: the sequential
+                    // result container, which every element is accumulated into.
+                    "collect" if args.len() == 4 => {
+                        let container = self.execute_method(
+                            "java/util/function/Supplier",
+                            "get",
+                            "()Ljava/lang/Object;",
+                            &[args[1].clone()],
+                        )?;
+                        for item in items {
+                            self.execute_method(
+                                "java/util/function/BiConsumer",
+                                "accept",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                                &[args[2].clone(), container.clone(), item],
+                            )?;
+                        }
+                        return Ok(container);
                     }
                     "collect" => {
                         let collector = args.get(1).cloned().unwrap_or(Value::NULL);
@@ -1476,7 +1554,22 @@ impl Interpreter {
             return Ok(Value::Object(Some(pose)));
         }
 
+        // A heap-modelled list, set or map copies from a collection that is
+        // real bytecode (a Guava `ImmutableList`, `Lists.cartesianProduct`):
+        // read its elements through `Iterator` first.
+        let adopted;
+        let args = if collection_copy_call(class_name, method_name) {
+            // `copyOf` is static; the others take the receiver first.
+            adopted = self.adopt_collection_args(args, usize::from(method_name != "copyOf"))?;
+            adopted.as_slice()
+        } else {
+            args
+        };
+
         if let Some(value) = self.register_item(class_name, method_name, args) {
+            return Ok(value);
+        }
+        if let Some(value) = self.register_block(class_name, method_name, args) {
             return Ok(value);
         }
 
@@ -3329,4 +3422,19 @@ mod exception_tests {
         );
         assert_eq!(result.as_int(), 9);
     }
+}
+
+/// Calls that copy the elements of a collection argument into a heap-modelled
+/// list or set.
+fn collection_copy_call(class_name: &str, method_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/util/List"
+            | "java/util/Set"
+            | "java/util/ArrayList"
+            | "java/util/LinkedList"
+            | "java/util/HashSet"
+            | "java/util/LinkedHashSet"
+            | "java/util/TreeSet"
+    ) && matches!(method_name, "copyOf" | "<init>" | "addAll")
 }

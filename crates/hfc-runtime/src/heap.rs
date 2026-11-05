@@ -35,6 +35,14 @@ pub struct Heap {
     pub clipboard: String,
     /// Items mods registered in `BuiltInRegistries.ITEM`, in registration order.
     pub(crate) registered_items: Vec<crate::item_builtins::RegisteredRecord>,
+    /// Blocks mods registered in `BuiltInRegistries.BLOCK`, in registration order.
+    pub(crate) registered_blocks: Vec<crate::block_builtins::BlockRecord>,
+    /// `BlockItem`s mods registered: the item's id, its block object and the item object.
+    pub(crate) registered_block_items: Vec<(String, usize, usize)>,
+    /// What `collect_block_facts` read from the registered blocks.
+    pub(crate) block_facts: Vec<crate::bridge::RegisteredBlock>,
+    /// The `BlockState` objects of registered blocks, by block id and state key.
+    pub(crate) block_state_objects: HashMap<String, HashMap<String, Value>>,
     /// `Item.Properties` methods the runtime does not model, each logged once.
     pub unsupported_item_properties: Vec<String>,
     /// Creative-tab placements the tab events' listeners made, in call order.
@@ -60,6 +68,10 @@ impl Heap {
             host_requests: Vec::new(),
             clipboard: String::new(),
             registered_items: Vec::new(),
+            registered_blocks: Vec::new(),
+            registered_block_items: Vec::new(),
+            block_facts: Vec::new(),
+            block_state_objects: HashMap::new(),
             unsupported_item_properties: Vec::new(),
             creative_tab_additions: Vec::new(),
             unsupported_creative_tab_calls: Vec::new(),

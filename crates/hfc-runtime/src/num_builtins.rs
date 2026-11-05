@@ -143,7 +143,11 @@ pub fn numeric_method(
                     i32::from_str_radix(text.trim(), radix).unwrap_or(0),
                 ))
             }
-            "toString" if descriptor.starts_with("(I)") || descriptor.starts_with("(II)") => {
+            "toString"
+                if descriptor.starts_with("(I)")
+                    || descriptor.starts_with("(II)")
+                    || descriptor == "()Ljava/lang/String;" =>
+            {
                 let radix = int(1).unwrap_or(10) as u32;
                 let text = if radix == 10 {
                     int(0)?.to_string()
@@ -193,7 +197,7 @@ pub fn numeric_method(
                 let text = string_of(heap, &args[0])?;
                 handled(Value::Long(text.trim().parse().unwrap_or(0)))
             }
-            "toString" if descriptor.starts_with("(J)") => {
+            "toString" if descriptor.starts_with("(J)") || descriptor == "()Ljava/lang/String;" => {
                 let sid = heap.alloc_string(long(0)?.to_string());
                 handled(Value::Object(Some(sid)))
             }

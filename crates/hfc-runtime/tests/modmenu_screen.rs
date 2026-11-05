@@ -6,7 +6,7 @@
 //! test uses the same generic key mapping, screen and display-list APIs any mod
 //! would.
 
-use hfc_runtime::bridge::FabricBridge;
+use hfc_runtime::bridge::{FabricBridge, HostRequest};
 use hfc_runtime::minecraft::{GuiDraw, MenuKind};
 use hfc_runtime::value::{JavaObject, Value};
 use std::path::{Path, PathBuf};
@@ -623,5 +623,111 @@ fn hovering_a_title_widget_renders_and_returns() {
         let draws =
             bridge.menu_widget_draw(MenuKind::Title, 427, 240, 0, widget.x + 5, widget.y + 5);
         assert!(!draws.is_empty(), "the hovered widget rendered nothing");
+    }
+}
+
+/// Mod Menu's Give Feedback and Report Bugs buttons open vanilla's
+/// `ConfirmLinkScreen`, whose `MultiLineTextWidget` draws each line through
+/// `ActiveTextCollector.accept(x, y, FormattedCharSequence)`: the text comes
+/// after the position, and the link itself is one of the lines.
+#[test]
+fn the_confirm_link_screen_draws_its_message_and_link() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+    assert!(bridge.press_key_mapping("key.modmenu.open_menu"));
+    bridge.render_screen(1280, 720, 0.0).unwrap().unwrap();
+    let parent = bridge.current_screen().unwrap();
+    let link = Value::Object(Some(
+        bridge
+            .interp
+            .heap
+            .alloc_string("https://example.com/feedback"),
+    ));
+    let uri = bridge
+        .interp
+        .execute_method(
+            "java/net/URI",
+            "create",
+            "(Ljava/lang/String;)Ljava/net/URI;",
+            &[link],
+        )
+        .unwrap();
+    bridge
+        .interp
+        .execute_method(
+            "net/minecraft/client/gui/screens/ConfirmLinkScreen",
+            "confirmLinkNow",
+            "(Lnet/minecraft/client/gui/screens/Screen;Ljava/net/URI;Z)V",
+            &[parent, uri, Value::from_bool(false)],
+        )
+        .unwrap();
+    let screen = bridge.current_screen().unwrap();
+    assert_eq!(
+        screen_class(&bridge, &screen),
+        "net/minecraft/client/gui/screens/ConfirmLinkScreen"
+    );
+    let draws = bridge.render_screen(1280, 720, 0.0).unwrap().unwrap();
+    let texts = text_draws(&draws);
+    assert!(
+        texts.contains(&"https://example.com/feedback"),
+        "the link was not drawn: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text.parse::<i32>().is_ok()),
+        "a coordinate was drawn as text: {texts:?}"
+    );
+}
+
+/// The confirm-link screen's Open and Copy buttons reach the desktop, which is
+/// the host's: each press becomes a request the host performs.
+#[test]
+fn the_confirm_link_buttons_ask_the_host_to_open_or_copy_the_link() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let link = "https://example.com/feedback";
+    for (label, expected) in [
+        ("gui.yes", HostRequest::OpenUri(link.to_string())),
+        ("chat.copy", HostRequest::SetClipboard(link.to_string())),
+    ] {
+        let mut bridge = fixture.bridge();
+        bridge.init().unwrap();
+        assert!(bridge.press_key_mapping("key.modmenu.open_menu"));
+        bridge.render_screen(1280, 720, 0.0).unwrap().unwrap();
+        let parent = bridge.current_screen().unwrap();
+        let text = Value::Object(Some(bridge.interp.heap.alloc_string(link)));
+        let uri = bridge
+            .interp
+            .execute_method(
+                "java/net/URI",
+                "create",
+                "(Ljava/lang/String;)Ljava/net/URI;",
+                &[text],
+            )
+            .unwrap();
+        bridge
+            .interp
+            .execute_method(
+                "net/minecraft/client/gui/screens/ConfirmLinkScreen",
+                "confirmLinkNow",
+                "(Lnet/minecraft/client/gui/screens/Screen;Ljava/net/URI;Z)V",
+                &[parent, uri, Value::from_bool(false)],
+            )
+            .unwrap();
+        let draws = bridge.render_screen(1280, 720, 0.0).unwrap().unwrap();
+        let (x, y) = draws
+            .iter()
+            .find_map(|draw| match draw {
+                GuiDraw::Text { text, x, y, .. } if text == label => Some((*x, *y)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {label} button"));
+        bridge.take_host_requests();
+        bridge.mouse_button(f64::from(x + 3), f64::from(y + 3), 1, true);
+        bridge.mouse_button(f64::from(x + 3), f64::from(y + 3), 1, false);
+        assert_eq!(bridge.take_host_requests(), vec![expected], "{label}");
     }
 }

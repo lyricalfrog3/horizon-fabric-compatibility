@@ -23,6 +23,12 @@ pub struct Heap {
     identifiers: HashMap<String, usize>,
     /// Block and item registries and tags, loaded by the host.
     pub registries: crate::registry::Registries,
+    /// What mods asked of the host's desktop (open a link or a folder, copy
+    /// text), taken by the host with `FabricBridge::take_host_requests`.
+    pub host_requests: Vec<crate::bridge::HostRequest>,
+    /// The text `ClipboardManager.getClipboard` answers: the last text a mod
+    /// copied, or what the host put there.
+    pub clipboard: String,
 }
 
 impl Heap {
@@ -38,6 +44,8 @@ impl Heap {
             fs: crate::vfs::Vfs::default(),
             identifiers: HashMap::new(),
             registries: crate::registry::Registries::default(),
+            host_requests: Vec::new(),
+            clipboard: String::new(),
         }
     }
 

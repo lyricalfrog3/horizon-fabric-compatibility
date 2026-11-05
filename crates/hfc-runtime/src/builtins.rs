@@ -879,6 +879,33 @@ fn registry_method(
     }
 }
 
+/// The object-typed parameters of a method descriptor: (parameter index, class).
+fn descriptor_object_params(descriptor: &str) -> Vec<(usize, String)> {
+    let inner = descriptor
+        .strip_prefix('(')
+        .and_then(|d| d.split(')').next())
+        .unwrap_or("");
+    let bytes = inner.as_bytes();
+    let (mut out, mut i, mut index) = (Vec::new(), 0, 0);
+    while i < bytes.len() {
+        let array = bytes[i] == b'[';
+        while bytes[i] == b'[' {
+            i += 1;
+        }
+        if bytes[i] == b'L' {
+            let end = inner[i..].find(';').map_or(bytes.len(), |e| i + e);
+            if !array {
+                out.push((index, inner[i + 1..end].to_string()));
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+        index += 1;
+    }
+    out
+}
+
 pub fn dispatch_builtin(
     heap: &mut Heap,
     class_name: &str,
@@ -4644,15 +4671,71 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::NULL);
     }
 
+    // The desktop is the host's: links, folders and the clipboard become
+    // requests the host performs (`FabricBridge::take_host_requests`).
+    if class_name == "com/mojang/blaze3d/Blaze3D"
+        && (method_name == "openUri" || method_name == "openPath")
+    {
+        let target = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::String(s)) => Some(s.clone()),
+                Some(JavaObject::Instance { fields, .. }) => fields
+                    .get("string")
+                    .or_else(|| fields.get("path"))
+                    .and_then(|v| v.as_obj())
+                    .and_then(|id| heap.get_string(id))
+                    .map(str::to_string),
+                _ => None,
+            });
+        if let Some(target) = target {
+            heap.host_requests.push(if method_name == "openUri" {
+                crate::bridge::HostRequest::OpenUri(target)
+            } else {
+                crate::bridge::HostRequest::OpenPath(target)
+            });
+        }
+        return BuiltinResult::Handled(Value::NULL);
+    }
+    if class_name == "com/mojang/blaze3d/platform/ClipboardManager" {
+        if method_name == "setClipboard" {
+            let text = args
+                .get(1)
+                .map(|v| text_of_value(heap, v))
+                .unwrap_or_default();
+            if !text.is_empty() {
+                heap.clipboard = text.clone();
+                heap.host_requests
+                    .push(crate::bridge::HostRequest::SetClipboard(text));
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+        if method_name == "getClipboard" {
+            let text = heap.clipboard.clone();
+            return BuiltinResult::Handled(Value::Object(Some(heap.alloc_string(text))));
+        }
+    }
+
     // Widgets draw their labels through an `ActiveTextCollector` returned by
     // `GuiGraphicsExtractor.textRenderer()`. The collector is the graphics
     // object itself here, so accepting text appends to the same display list.
     if class_name == "net/minecraft/client/gui/ActiveTextCollector" {
-        let text_value = if descriptor.starts_with("(Lnet/minecraft/client/gui/TextAlignment;") {
-            args.get(5)
-        } else {
-            args.get(1)
-        };
+        // The text is the first parameter that is text (`Component`,
+        // `FormattedCharSequence`, `String`); overloads put it first
+        // (`accept(Component, x, y)`) or last (`accept(x, y, FormattedCharSequence)`).
+        let text_index = descriptor_object_params(descriptor)
+            .into_iter()
+            .find(|(_, ty)| {
+                matches!(
+                    ty.as_str(),
+                    "net/minecraft/network/chat/Component"
+                        | "net/minecraft/util/FormattedCharSequence"
+                        | "java/lang/String"
+                )
+            })
+            .map(|(index, _)| index + 1);
+        let text_value = text_index.and_then(|i| args.get(i));
         let text = text_value
             .map(|v| text_of_value(heap, v))
             .unwrap_or_default();
@@ -4671,7 +4754,12 @@ pub fn dispatch_builtin(
             }
             "acceptScrolling" if args.len() >= 6 => (args[2].as_int(), args[4].as_int()),
             "accept" if args.len() >= 6 => (args[2].as_int(), args[3].as_int()),
-            "accept" if args.len() >= 4 => (args[1].as_int(), args[2].as_int()),
+            // `accept(x, y, text)` and `accept(text, x, y)`: the two ints around
+            // the text are the position.
+            "accept" if args.len() >= 4 && text_index == Some(3) => {
+                (args[1].as_int(), args[2].as_int())
+            }
+            "accept" if args.len() >= 4 => (args[2].as_int(), args[3].as_int()),
             _ => (0, 0),
         };
         if let Some(graphics) = args.first().and_then(|v| v.as_obj()) {

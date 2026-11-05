@@ -12,6 +12,17 @@ use hfc_core::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// A desktop action a mod asked for; the runtime cannot reach the desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRequest {
+    /// `Blaze3D.openUri`: show the link in the system browser.
+    OpenUri(String),
+    /// `Blaze3D.openPath`: show the folder or file in the file manager.
+    OpenPath(String),
+    /// `ClipboardManager.setClipboard`: put the text on the system clipboard.
+    SetClipboard(String),
+}
+
 /// Host interface matching Horizon's `mod_api::Host` services.
 pub trait HostBridge {
     fn block(&self, pos: [i32; 3]) -> String;
@@ -251,6 +262,17 @@ impl FabricBridge {
         }
         self.interp.heap.translations = merged.clone();
         self.translations = merged;
+    }
+
+    /// The desktop actions mods asked for since the last call, oldest first.
+    /// The host performs them (it owns the browser, file manager and clipboard).
+    pub fn take_host_requests(&mut self) -> Vec<HostRequest> {
+        std::mem::take(&mut self.interp.heap.host_requests)
+    }
+
+    /// The system clipboard's text, for `ClipboardManager.getClipboard`.
+    pub fn set_clipboard_text(&mut self, text: &str) {
+        self.interp.heap.clipboard = text.to_string();
     }
 
     pub fn translations(&self) -> &HashMap<String, String> {

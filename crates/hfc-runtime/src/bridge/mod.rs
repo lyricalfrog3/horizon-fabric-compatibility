@@ -633,6 +633,27 @@ impl FabricBridge {
 
         let prev_budget = self.interp.step_budget;
         self.mixins = self.load_mixin_manifest();
+        self.interp.mixin_interfaces.clear();
+        self.interp.mixin_interface_methods.clear();
+        for added in &self.mixins.interface_methods {
+            let interfaces = self
+                .interp
+                .mixin_interfaces
+                .entry(added.target_class.clone())
+                .or_default();
+            if !interfaces.contains(&added.interface) {
+                interfaces.push(added.interface.clone());
+            }
+            self.interp
+                .mixin_interface_methods
+                .entry((
+                    added.interface.clone(),
+                    added.method.clone(),
+                    added.descriptor.clone(),
+                ))
+                .or_default()
+                .push(added.clone());
+        }
         self.interp.mixin_accessors = self
             .mixins
             .accessors

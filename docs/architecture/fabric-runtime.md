@@ -338,10 +338,15 @@ metadata drives this in `reflect.rs`, ahead of the builtins:
   list/set/map, not a JDK-internal class the heap cannot model. A class that extends a
   modeled collection (an anonymous `HashMap` subclass calling its inherited `put`) also
   dispatches to that storage.
-- Library adapters implement mixin-added interfaces where the project applies no general
-  mixins. Prism's `TextColorMixin` makes `TextColor` an `IColor`; the runtime answers
-  `IColor.getIntValue/getName/isAnimated` for `TextColor` receivers, which is what
-  tooltip color derivation reads.
+- Mixin-added interfaces are applied generally (`mixin::interface_methods_from_class`).
+  A mixin class that implements an interface (Prism's `TextColorMixin implements IColor`
+  on `TextColor`) adds that interface to its target for `instanceof`, and a call to one
+  of its methods on the target runs the mixin's own bytecode with the target as `this`,
+  so `@Shadow` fields read the target's fields. A receiver whose own class implements the
+  method (Prism's `DynamicColor`) keeps its implementation. Mixin-annotated members
+  (`@Inject`, `@Shadow`, `@Overwrite`, accessors) are not added this way.
+- The declaring class of a static field reached through a subclass is cached per
+  (class, field), so `getstatic`/`putstatic` walk the hierarchy once.
 - File watchers (`WatchService`, `Path.register`) are inert: nothing changes on disk
   while the game runs, so a config is not reloaded live.
 

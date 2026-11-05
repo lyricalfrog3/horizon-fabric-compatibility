@@ -94,6 +94,14 @@ pub struct Interpreter {
     /// `@Accessor` / `@Invoker` mixin methods by (interface, name, descriptor):
     /// a call naming the interface is performed on the class it is mixed into.
     pub mixin_accessors: HashMap<(String, String, String), crate::mixin::MixinAccessor>,
+    /// Interfaces mixins add to a target class, by target.
+    pub mixin_interfaces: HashMap<String, Vec<String>>,
+    /// Interface methods mixins add, by (interface, method, descriptor).
+    pub mixin_interface_methods:
+        HashMap<(String, String, String), Vec<crate::mixin::MixinInterfaceMethod>>,
+    /// The class declaring each static field reached through a subclass,
+    /// by (named class, field); a class hierarchy never changes once loaded.
+    static_field_owners: HashMap<(String, String), Option<String>>,
 }
 
 impl Default for Interpreter {
@@ -119,6 +127,9 @@ impl Interpreter {
             injection_depth: 0,
             menu_contributions: Vec::new(),
             mixin_accessors: HashMap::new(),
+            mixin_interfaces: HashMap::new(),
+            mixin_interface_methods: HashMap::new(),
+            static_field_owners: HashMap::new(),
         }
     }
 
@@ -138,6 +149,9 @@ impl Interpreter {
             injection_depth: 0,
             menu_contributions: Vec::new(),
             mixin_accessors: HashMap::new(),
+            mixin_interfaces: HashMap::new(),
+            mixin_interface_methods: HashMap::new(),
+            static_field_owners: HashMap::new(),
         }
     }
 
@@ -376,6 +390,9 @@ impl Interpreter {
             for iface in &c.interfaces {
                 queue.push_back(iface.clone());
             }
+            if let Some(added) = self.mixin_interfaces.get(&curr) {
+                queue.extend(added.iter().cloned());
+            }
         }
         false
     }
@@ -578,6 +595,52 @@ impl Interpreter {
                 Ok(Value::NULL)
             }
         })
+    }
+
+    /// A call to an interface method a mixin added to the receiver's class runs
+    /// the mixin's bytecode with the receiver as `this`. A receiver whose own
+    /// class (or a superclass) implements the method keeps that implementation.
+    fn redirect_mixin_interface_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<Result<Value>> {
+        if self.mixin_interface_methods.is_empty() {
+            return None;
+        }
+        let candidates = self
+            .mixin_interface_methods
+            .get(&(
+                class_name.to_string(),
+                method_name.to_string(),
+                descriptor.to_string(),
+            ))?
+            .clone();
+        let receiver = match self.heap.get(args.first()?.as_obj()?)? {
+            JavaObject::Instance { class_name, .. } => class_name.clone(),
+            _ => return None,
+        };
+        let mut current = Some(receiver.clone());
+        while let Some(name) = current {
+            let _ = self.loader.get_or_load(&name);
+            let Some(class) = self.loader.get(&name) else {
+                break;
+            };
+            if class
+                .methods
+                .get(&(method_name.to_string(), descriptor.to_string()))
+                .is_some_and(|method| method.code.is_some())
+            {
+                return None;
+            }
+            current = class.super_class.clone();
+        }
+        let added = candidates
+            .into_iter()
+            .find(|added| self.class_is_assignable_to(&receiver, &added.target_class))?;
+        Some(self.execute_special_method(&added.mixin_class, method_name, descriptor, args))
     }
 
     fn execute_method_inner(
@@ -1311,6 +1374,11 @@ impl Interpreter {
 
         if let Some(result) =
             self.redirect_mixin_accessor(class_name, method_name, descriptor, args)
+        {
+            return result;
+        }
+        if let Some(result) =
+            self.redirect_mixin_interface_method(class_name, method_name, descriptor, args)
         {
             return result;
         }
@@ -2684,6 +2752,16 @@ impl Interpreter {
     /// against the class that actually declares it, so both `Subclass.x` and
     /// `Superclass.x` name one storage slot.
     fn static_field_owner(&mut self, class_name: &str, field_name: &str) -> Option<String> {
+        let key = (class_name.to_string(), field_name.to_string());
+        if let Some(owner) = self.static_field_owners.get(&key) {
+            return owner.clone();
+        }
+        let owner = self.find_static_field_owner(class_name, field_name);
+        self.static_field_owners.insert(key, owner.clone());
+        owner
+    }
+
+    fn find_static_field_owner(&mut self, class_name: &str, field_name: &str) -> Option<String> {
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(class_name.to_string());
         let mut visited = std::collections::HashSet::new();

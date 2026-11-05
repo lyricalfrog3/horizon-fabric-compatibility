@@ -90,11 +90,62 @@ pub struct MixinAccessor {
     pub kind: AccessorKind,
 }
 
+/// A method a mixin class adds to its target by implementing an interface
+/// (`@Mixin(TextColor.class) class TextColorMixin implements IColor`). A call
+/// to the interface method on the target runs the mixin's own bytecode with the
+/// target as `this`; its `@Shadow` fields are the target's fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinInterfaceMethod {
+    pub interface: String,
+    pub method: String,
+    pub descriptor: String,
+    pub mixin_class: String,
+    pub target_class: String,
+}
+
+/// The interface methods a mixin class adds to its targets: its non-static
+/// methods with code, other than constructors and Mixin-annotated members
+/// (`@Inject`, `@Shadow`, `@Overwrite`, accessors), for each interface it implements.
+pub fn interface_methods_from_class(class: &Class) -> Vec<MixinInterfaceMethod> {
+    let mut out = Vec::new();
+    if class.interfaces.is_empty() {
+        return out;
+    }
+    let Some(targets) = mixin_targets(class) else {
+        return out;
+    };
+    for method in class.methods.values() {
+        if method.name.starts_with('<')
+            || method.is_static
+            || method.code.is_none()
+            || method
+                .annotations
+                .iter()
+                .any(|annotation| annotation.type_name.starts_with("org/spongepowered/"))
+        {
+            continue;
+        }
+        for interface in &class.interfaces {
+            for target in &targets {
+                out.push(MixinInterfaceMethod {
+                    interface: interface.clone(),
+                    method: method.name.clone(),
+                    descriptor: method.descriptor.clone(),
+                    mixin_class: class.this_class.clone(),
+                    target_class: target.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Every injector (applied or unsupported) found in the loaded mods.
 #[derive(Debug, Clone, Default)]
 pub struct MixinManifest {
     pub injectors: Vec<MixinInjector>,
     pub accessors: Vec<MixinAccessor>,
+    pub interface_methods: Vec<MixinInterfaceMethod>,
     /// Human-readable notes about annotations this bridge skipped.
     pub unsupported: Vec<String>,
 }

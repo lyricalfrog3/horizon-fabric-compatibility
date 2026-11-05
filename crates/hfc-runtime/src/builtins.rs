@@ -6104,35 +6104,6 @@ pub fn dispatch_builtin(
         }
     }
 
-    // Prism's `TextColorMixin` makes Minecraft's `TextColor` implement its
-    // `IColor` interface by reading the color's value and name. The runtime
-    // does not apply general mixins, so the library's interface methods are
-    // answered here for `TextColor` receivers; `DynamicColor` (a TextColor
-    // subclass) keeps its own animated implementation.
-    if class_name == "com/anthonyhilyard/prism/util/IColor"
-        && let Some(JavaObject::Instance {
-            class_name: actual,
-            fields,
-        }) = args
-            .first()
-            .and_then(|value| value.as_obj())
-            .and_then(|id| heap.get(id))
-        && actual == "net/minecraft/network/chat/TextColor"
-    {
-        match method_name {
-            "getIntValue" => {
-                return BuiltinResult::Handled(
-                    fields.get("value").cloned().unwrap_or(Value::Int(0)),
-                );
-            }
-            "getName" => {
-                return BuiltinResult::Handled(fields.get("name").cloned().unwrap_or(Value::NULL));
-            }
-            "isAnimated" => return BuiltinResult::Handled(Value::from_bool(false)),
-            _ => {}
-        }
-    }
-
     // TextColor
     if class_name == "net/minecraft/network/chat/TextColor" {
         if method_name == "fromRgb" && !args.is_empty() {

@@ -42,6 +42,9 @@ impl FabricBridge {
                     manifest
                         .accessors
                         .extend(mixin::accessors_from_class(class));
+                    manifest
+                        .interface_methods
+                        .extend(mixin::interface_methods_from_class(class));
                     for injector in mixin::injectors_from_class(class) {
                         if injector.supported() {
                             manifest.injectors.push(injector);

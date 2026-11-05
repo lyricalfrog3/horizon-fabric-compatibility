@@ -40,13 +40,14 @@ client where noted. A mod not listed here should be treated as unsupported.
 | **Right Click Harvest** | Right-click harvesting and replanting; `rightclickharvest.json5` written with comments, matching the real game's file | ✅ |
 | **Veinminer** | Breaking one ore breaks the connected vein (Kotlin coroutines, `PlayerBlockBreakEvents.BEFORE`) | ✅ |
 | **Mod Menu** | Title and pause menu buttons, the mod list with icons, search and scrolling; link dialogs that open the browser or copy to the clipboard; `modmenu.json` byte-identical to the real game's | ✅ |
-| **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow drawn from the mod's own bytecode; `legendarytooltips.toml` written with comments, allowed values and ranges | ✅ |
+| **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow; the tooltip body from the mod's real component list (centred title, name separator, item-model request); `legendarytooltips.toml` written with comments, allowed values and ranges | Frame ✅; body test-checked |
 | **JamLib, Iceberg, Placeholder API, Fabric API** | Load and initialise as libraries for the mods above | ✅ |
 
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the
-[runtime design note](docs/architecture/fabric-runtime.md). Notably: Iceberg's `GATHER`
-tooltip components (the 3D item model), Legendary's centred title and name separator are not
-applied, and mod log messages print their `{}` placeholders unfilled. Editing a config file and restarting works in
+[runtime design note](docs/architecture/fabric-runtime.md). Notably: Legendary's item-model
+rotation is not applied by the HUD renderer and its shine gradients lose the horizontal
+orientation (GUI pose rotation is not applied); mod log messages print their `{}` placeholders
+unfilled. Editing a config file and restarting works in
 the live client (checked with Mod Menu), but reading an existing file back has no test yet.
 
 ## How it works

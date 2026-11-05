@@ -57,6 +57,16 @@ pub enum Flow {
     Cancel,
 }
 
+/// A tooltip laid out from the mods' real `ClientTooltipComponent` list, in
+/// GUI pixels relative to the tooltip's text origin. The component draws come
+/// first (text, then images), followed by the mods' `POSTEXT` draws.
+#[derive(Debug, Clone, Default)]
+pub struct TooltipRender {
+    pub width: i32,
+    pub height: i32,
+    pub draws: Vec<GuiDraw>,
+}
+
 /// The identifier of a GUI texture entry in a mod jar:
 /// `assets/<namespace>/textures/gui/<path>.png` is
 /// `<namespace>:textures/gui/<path>.png`, the name a mod passes to
@@ -168,6 +178,9 @@ pub struct FabricBridge {
     /// Done button installs it back, the host must see "no Fabric screen".
     menu_screen: Option<usize>,
     gui_texture_cache: HashMap<String, Option<crate::minecraft::PngImage>>,
+    /// When the previous render-tick event was dispatched, for the real
+    /// `DeltaTracker` a hovered tooltip's shine and model animation read.
+    last_render_tick: Option<std::time::Instant>,
 }
 
 impl Default for FabricBridge {
@@ -213,6 +226,7 @@ impl FabricBridge {
             menu_cache: HashMap::new(),
             menu_screen: None,
             gui_texture_cache: HashMap::new(),
+            last_render_tick: None,
         }
     }
 
@@ -256,6 +270,7 @@ impl FabricBridge {
             menu_cache: HashMap::new(),
             menu_screen: None,
             gui_texture_cache: HashMap::new(),
+            last_render_tick: None,
         }
     }
 

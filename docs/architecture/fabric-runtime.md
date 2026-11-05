@@ -95,11 +95,12 @@ the server applies the harvest.
 | Fabric `ItemTooltipCallback` | dispatched | text lines can be added/changed |
 | Iceberg `RenderTooltipEvents.COLOREXT` | dispatched | background/border colors; the callback gets the real client level's registry access and the host's item rarity |
 | Iceberg `RenderTooltipEvents.POSTEXT` | dispatched | returns a `GuiDraw` list the host replays after the tooltip text; this is where Legendary Tooltips draws its frame and shadow |
-| Iceberg `RenderTooltipEvents.GATHER` | **not dispatched** | it adds the item-model and padding components, which the host does not render yet |
+| Iceberg `RenderTooltipEvents.GATHER` | dispatched | the mod receives the raw text elements and can add image components (Legendary adds its item model and padding) |
+| Iceberg/Prism `RenderTickEvents.START` | dispatched with each tooltip render | a `DeltaTracker` carries the real time since the previous tooltip frame, so shine and model timers animate |
 | Fabric `ScreenEvents.AFTER_INIT` | dispatched | runs for every initialized mod screen |
 | Fabric `ClientTickEvents` | dispatched | runs once per host tick, before the screen tick |
 | Fabric key mappings | supported | `KeyMapping`, `KeyMappingHelper` and `consumeClick`; the host binds by translation key or physical key |
-| Mixins / access wideners | **partially applied, menu widgets only** | `@Inject` callbacks that add widgets to a host menu are run with synthesized screen/layout locals; all other mixins and access wideners are ignored |
+| Mixins / access wideners | **partially applied** | menu-widget `@Inject` callbacks run with synthesized screen/layout locals; non-cancellable `@Inject(at = HEAD)` callbacks on `GuiGraphicsExtractor.tooltip` run with the real receiver and arguments (title centring). Cancellable HEAD callbacks and draw-code transforms need the real target body and are ignored |
 
 ### Mod Menu
 
@@ -209,14 +210,19 @@ off a library such as Fabric API leaves the mods that need it to fail.
 
 ### Legendary Tooltips
 
-The mod's own frame is rendered. Iceberg fires `RenderTooltipEvents.POSTEXT` at the tail of
-Minecraft's tooltip pass; Legendary's `TooltipDecor.drawBorder` slices
-`legendarytooltips:textures/gui/tooltip_borders.png` into 8 px corners and edges and blits
-each part. The bridge dispatches `POSTEXT` with a real `GuiGraphicsExtractor` display list,
-`ItemStack`, font and tooltip geometry, and the client replays the returned draws after the
-tooltip text.
+Minecraft's own tooltip body is built from the mods' real
+`List<ClientTooltipComponent>`. The bridge wraps the host's text lines in
+`FormattedText`, dispatches Iceberg's `GATHER` (an `Either<FormattedText,
+TooltipComponent>` list), converts the result to client components, and applies the
+non-cancellable `@Inject(at = HEAD)` callbacks on `GuiGraphicsExtractor.tooltip` with the
+real receiver and arguments. That is where Legendary's `GuiGraphicsMixin` centres the title
+and inserts its title-break component. The bridge then measures the components, records
+their `extractText` and `extractImage` calls into a `GuiGraphicsExtractor` display list, and
+appends `RenderTooltipEvents.POSTEXT` (frame, shadow, separator). The host replays the list
+after its background box, so the centred title, separator, model panel and frame come from
+the mod's own code.
 
-What the frame path needed:
+What the path needed:
 
 - `COLOREXT` reads `Minecraft.getInstance().level.registryAccess()`. The runtime answers
   `Level.registryAccess()` from the host-loaded registry snapshot, so the listener no longer
@@ -233,22 +239,39 @@ What the frame path needed:
 - The host keeps its own tooltip background when the mod returns a fully transparent one.
   Legendary uses transparent level-0 colors because Iceberg's background-cancelling mixin
   supplies the surface; that mixin is not applied here, so the host box stays.
+- `ItemStack.getMaxDamage()`/`isDamageableItem()` answer from the host's item data, so
+  Legendary's `render_item_model = "EQUIPMENT"` adds its model to equipment tooltips.
+- `FormattedCharSequence.accept` feeds a `FormattedCharSink` (Iceberg's `StringRecomposer`
+  reads a title through it), `new ArrayList(collection)` copies its source,
+  `StringBuilder.append(char[])` appends characters, and `Language.getVisualOrder` returns a
+  text-carrying sequence. Together these let the library recompose and centre the title.
+- Item components record a `GuiDraw::Item`; `GuiGraphicsExtractor.item` does the same for
+  Fabric screens. Iceberg's `CustomItemRenderer` is a host boundary: its request is recorded
+  instead of running its offscreen GPU path.
+- `RenderTickEvents.START` gets a `DeltaTracker` whose `getRealtimeDeltaTicks` is the host
+  time since the previous tooltip frame, which is what `TooltipDecor.updateTimer` and
+  `ItemModelComponent.updateTimer` read.
 
-Verified live: hovering an enchanted netherite pickaxe shows the gold frame with readable
-text; a common item keeps the normal dark tooltip and no frame. `tests/legendary_tooltips.rs`
-asserts the epic frame blits (sub-rectangles) and non-zero common colors.
+Verified live (frame): hovering an enchanted netherite pickaxe shows the gold frame with
+readable text; a common item keeps the normal dark tooltip and no frame.
+`tests/legendary_tooltips.rs` now also asserts that GATHER adds the item-model and padding
+components, that Legendary's HEAD injector padded (centred) the title, that the name
+separator fills were drawn, that the model component recorded a `GuiDraw::Item`, and that
+the shine timer advances with real time.
 
-Still partial: the centred title comes from Legendary's `GuiGraphicsMixin` (a mixin
-callback, not an event), the name separator needs a `ClientTooltipComponent` list (the bridge
-passes an empty one), `GATHER` is not dispatched, and the 3D item model and shine animation
-are not rendered.
+Still partial: the model is drawn through the GUI item renderer, so its recorded Y rotation
+is not applied (the HUD has no 3D model transform), and `model_rotation_speed = 0` (the
+current config) keeps it still. The shine's horizontal gradients are recorded as vertical
+ones because GUI pose rotation is not applied. A component type other than text or an image
+component is only drawn if it implements `extractText`/`extractImage`.
 
 ## GUI replay
 
 `GuiGraphicsExtractor` calls are recorded into a `GuiDraw` display list
 (`crates/hfc-runtime/src/minecraft.rs`) instead of touching the GPU:
-`fill`, `fillGradient`, `text`, `centeredText`, `blit`, `blitSprite`, and scissor bounds.
-`fillGradient` is recorded as `GuiDraw::Gradient` (both colours) and replayed with
+`fill`, `fillGradient`, `text`, `centeredText`, `item`, `blit`, `blitSprite`, and scissor
+bounds. `item` is recorded as `GuiDraw::Item` and the host draws it with the game's own GUI
+item renderer. `fillGradient` is recorded as `GuiDraw::Gradient` (both colours) and replayed with
 `HudBatch::fill_gradient`. A blit carries the normalised `u0..u1`/`v0..v1` it samples, so a
 nine-slice frame can blit one corner of a larger sheet; the host crops the texture's atlas
 region to that sub-rectangle.

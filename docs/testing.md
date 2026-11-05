@@ -37,8 +37,8 @@ mod's id or class name is not coverage and must not be added.
 | `hfc-cache` (keying, commit, recovery, prune, stats) | 6 |
 | `hfc-bootstrap` unit (config, state, report, install, ids, carry verification) | 12 |
 | `hfc-bootstrap` end to end | 5 |
-| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, mixin menu widgets, Mod Menu screen, Legendary tooltip frame) | 19 |
-| **HFC total** | **63** |
+| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, mixin menu widgets, Mod Menu screen, Legendary tooltip) | 20 |
+| **HFC total** | **64** |
 | Launcher `fabric_compat` (`cargo test --lib fabric_compat`) | 3 |
 
 `cargo test --workspace` also runs the tests of the path-dependency crates under
@@ -54,11 +54,14 @@ produces a `Mods` widget, that the widget renders, and that clicking it installs
 Those tests skip when the pinned jars or a Minecraft install are absent.
 
 `tests/legendary_tooltips.rs` loads Fabric API, Iceberg, Prism and Legendary Tooltips, lets
-the mod write and load its default config, then drives the tooltip colour and post-render
-calls the client makes. It asserts that an epic item returns at least the frame's four
-corner blits, each sampling a sub-rectangle of `legendarytooltips:textures/gui/tooltip_borders.png`,
-and that a common item selects no frame but still returns non-transparent background and
-border colours.
+the mod write and load its default config, then drives the tooltip calls the client makes.
+It asserts that an epic item returns the frame's corner blits sampling
+`legendarytooltips:textures/gui/tooltip_borders.png`, that GATHER added the item-model and
+padding components, that the title component was padded by Legendary's HEAD injector, that
+the name separator and `GuiDraw::Item` model request were recorded, and that a common item
+selects no frame but still returns non-transparent background and border colours. A third
+test dispatches two tooltip frames with real time between them and checks that the shine
+timer advanced.
 
 The end-to-end tests cover:
 

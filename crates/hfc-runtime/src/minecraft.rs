@@ -33,6 +33,15 @@ pub enum GuiDraw {
         y: i32,
         color: i32,
     },
+    /// An item model at a GUI position. `rotation` is degrees about the
+    /// vertical axis; the host draws the model with its own item renderer.
+    Item {
+        item: String,
+        x: i32,
+        y: i32,
+        size: i32,
+        rotation: f32,
+    },
     /// A texture rectangle. `u0..u1` and `v0..v1` are the part of the texture
     /// to sample, normalised to its size (`0..1` is the whole image), so a mod
     /// that draws a nine-slice frame from one texture keeps its corners and
@@ -430,6 +439,9 @@ pub struct ItemStack {
     /// The item's rarity (`common`, `uncommon`, `rare`, `epic`) as the host's
     /// item data reports it. Mods read it through `ItemStack.getRarity()`.
     pub rarity: Option<String>,
+    /// The item's maximum durability as the host's item data reports it; 0 for
+    /// an item that cannot take damage.
+    pub max_damage: i32,
 }
 
 impl ItemStack {
@@ -440,11 +452,17 @@ impl ItemStack {
             damage: 0,
             enchantments: Vec::new(),
             rarity: None,
+            max_damage: 0,
         }
     }
 
     pub fn with_rarity(mut self, rarity: Option<&str>) -> Self {
         self.rarity = rarity.map(str::to_string);
+        self
+    }
+
+    pub fn with_max_damage(mut self, max_damage: i32) -> Self {
+        self.max_damage = max_damage.max(0);
         self
     }
 

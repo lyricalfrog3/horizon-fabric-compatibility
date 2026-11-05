@@ -100,18 +100,40 @@ pub(crate) fn text_of_value(heap: &Heap, val: &Value) -> String {
     value_to_string(heap, val)
 }
 
-/// A `FormattedCharSequence` carrying `text`. The runtime never feeds a
-/// `FormattedCharSink`, so this shared representation is what the host reads
-/// back; the real interface's lambdas cannot be inspected for their text.
-fn alloc_formatted_char_sequence(heap: &mut Heap, text: String) -> Value {
+/// A `FormattedCharSequence` carrying `text`, and optionally the line's ARGB
+/// color so `extractText` keeps a tooltip line's color when the component
+/// passes `-1` (the text style's own color).
+fn alloc_formatted_char_sequence_colored(
+    heap: &mut Heap,
+    text: String,
+    color: Option<i32>,
+) -> Value {
     let sid = heap.alloc_string(text);
     let mut fields = HashMap::new();
     fields.insert("text".into(), Value::Object(Some(sid)));
+    if let Some(color) = color {
+        fields.insert("color".into(), Value::Int(color));
+    }
     let id = heap.alloc(JavaObject::Instance {
         class_name: "net/minecraft/util/FormattedCharSequence".into(),
         fields,
     });
     Value::Object(Some(id))
+}
+
+/// The ARGB color a formatted sequence carries, when it has one.
+fn formatted_sequence_color(heap: &Heap, value: &Value) -> Option<i32> {
+    let id = value.as_obj()?;
+    match heap.get(id)? {
+        JavaObject::Instance { fields, .. } => fields.get("color").map(Value::as_int),
+        JavaObject::List(items) | JavaObject::Set(items) | JavaObject::Stream(items) => items
+            .iter()
+            .find_map(|item| formatted_sequence_color(heap, item)),
+        JavaObject::Array { elements, .. } => elements
+            .iter()
+            .find_map(|item| formatted_sequence_color(heap, item)),
+        _ => None,
+    }
 }
 
 /// The text a formatted sequence or a composite of them displays. `composite`
@@ -195,6 +217,20 @@ fn identifier_argument(heap: &Heap, args: &[Value], from: usize) -> String {
         }
     }
     String::new()
+}
+
+/// The Y rotation, in degrees, encoded by a quaternion (`0, sin(θ/2), 0,
+/// cos(θ/2)`). A quaternion the runtime did not build has no fields and reads
+/// as no rotation.
+fn quaternion_y_degrees(heap: &Heap, value: &Value) -> f32 {
+    if let Some(JavaObject::Instance { fields, .. }) = value.as_obj().and_then(|id| heap.get(id)) {
+        let y = fields.get("y").map(Value::as_float);
+        let w = fields.get("w").map(Value::as_float);
+        if let (Some(y), Some(w)) = (y, w) {
+            return 2.0 * y.atan2(w).to_degrees();
+        }
+    }
+    0.0
 }
 
 /// The size in a PNG's IHDR chunk. `NativeImage.read` only needs the header;
@@ -1102,7 +1138,11 @@ pub fn dispatch_builtin(
         } else {
             text_of_value(heap, &args[0])
         };
-        return BuiltinResult::Handled(alloc_formatted_char_sequence(heap, text));
+        let color = args[0].as_obj().and_then(|id| match heap.get(id) {
+            Some(JavaObject::Instance { fields, .. }) => fields.get("color").map(Value::as_int),
+            _ => None,
+        });
+        return BuiltinResult::Handled(alloc_formatted_char_sequence_colored(heap, text, color));
     }
 
     // `FormattedCharSequence` is a functional interface in 26.3: its factories
@@ -1112,28 +1152,39 @@ pub fn dispatch_builtin(
     // characters would stay invisible. Answer the factories with the runtime's
     // text-carrying sequence instead of executing them.
     if class_name == "net/minecraft/util/FormattedCharSequence" {
-        let text = match method_name {
+        let built = match method_name {
             "forward" | "backward" => {
                 let mut text = formatted_text_of_value(heap, args.first().unwrap_or(&Value::NULL));
                 if method_name == "backward" {
                     text = text.chars().rev().collect();
                 }
-                Some(text)
+                let color = args
+                    .first()
+                    .and_then(|value| formatted_sequence_color(heap, value));
+                Some((text, color))
             }
-            "codepoint" => Some(
+            "codepoint" => Some((
                 char::from_u32(args.first().map(Value::as_int).unwrap_or(0) as u32)
                     .map(|c| c.to_string())
                     .unwrap_or_default(),
-            ),
-            "composite" | "fromPair" | "fromList" => Some(
-                args.iter()
+                None,
+            )),
+            "composite" | "fromPair" | "fromList" => {
+                let text = args
+                    .iter()
                     .map(|value| formatted_text_of_value(heap, value))
-                    .collect::<String>(),
-            ),
+                    .collect::<String>();
+                let color = args
+                    .iter()
+                    .find_map(|value| formatted_sequence_color(heap, value));
+                Some((text, color))
+            }
             _ => None,
         };
-        if let Some(text) = text {
-            return BuiltinResult::Handled(alloc_formatted_char_sequence(heap, text));
+        if let Some((text, color)) = built {
+            return BuiltinResult::Handled(alloc_formatted_char_sequence_colored(
+                heap, text, color,
+            ));
         }
     }
 
@@ -2144,6 +2195,21 @@ pub fn dispatch_builtin(
                     char::from_u32(args[1].as_int() as u32)
                         .map(|c| c.to_string())
                         .unwrap_or_default()
+                } else if descriptor.starts_with("([C)") {
+                    // `append(char[])`: Iceberg's tooltip text sink builds a
+                    // line one copied codepoint at a time.
+                    args[1]
+                        .as_obj()
+                        .and_then(|id| match heap.get(id) {
+                            Some(JavaObject::Array { elements, .. }) => Some(
+                                elements
+                                    .iter()
+                                    .filter_map(|value| char::from_u32(value.as_int() as u32))
+                                    .collect::<String>(),
+                            ),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
                 } else {
                     match &args[1] {
                         Value::Int(i) => i.to_string(),
@@ -2585,9 +2651,15 @@ pub fn dispatch_builtin(
         || class_name == "java/util/LinkedList"
     {
         if method_name == "<init>" {
+            // `new ArrayList(collection)` copies it; an `int` capacity
+            // argument is not a collection and starts empty.
+            let initial = args
+                .get(1)
+                .map(|source| collection_items(heap, source))
+                .unwrap_or_default();
             if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
                 if let Some(obj) = heap.get_mut(this_id) {
-                    *obj = JavaObject::List(Vec::new());
+                    *obj = JavaObject::List(initial);
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
@@ -3566,7 +3638,7 @@ pub fn dispatch_builtin(
     // 9. Either (com/mojang/datafixers/util/Either)
     // -------------------------------------------------------------
     if class_name == "com/mojang/datafixers/util/Either" {
-        if method_name == "left" && !args.is_empty() {
+        if method_name == "left" && descriptor.starts_with("(Ljava/lang/Object;)") {
             let mut fields = HashMap::new();
             fields.insert("left".into(), args[0].clone());
             fields.insert("is_left".into(), Value::from_bool(true));
@@ -3575,7 +3647,7 @@ pub fn dispatch_builtin(
                 fields,
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
-        } else if method_name == "right" && !args.is_empty() {
+        } else if method_name == "right" && descriptor.starts_with("(Ljava/lang/Object;)") {
             let mut fields = HashMap::new();
             fields.insert("right".into(), args[0].clone());
             fields.insert("is_left".into(), Value::from_bool(false));
@@ -3584,7 +3656,7 @@ pub fn dispatch_builtin(
                 fields,
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
-        } else if method_name == "left" && args.len() == 1 {
+        } else if method_name == "left" && descriptor == "()Ljava/util/Optional;" {
             // Returns Optional<L>
             let val = args[0]
                 .as_obj()
@@ -4574,6 +4646,62 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::Int(size));
     }
 
+    // Iceberg's custom item renderer draws a rotated item model into an
+    // offscreen target, which the runtime has no GPU for. The host can draw
+    // the model itself, so record the request instead.
+    if class_name == "com/anthonyhilyard/iceberg/renderer/CustomItemRenderer" {
+        let request = match method_name {
+            "renderDetailModelIntoGUI" if args.len() >= 6 => Some((
+                args[5].clone(),
+                args[1].clone(),
+                args[2].as_int(),
+                args[3].as_int(),
+                args[4].clone(),
+                22,
+            )),
+            "renderItemIntoGUI" if args.len() >= 7 => Some((
+                args[1].clone(),
+                args[2].clone(),
+                args[3].as_int(),
+                args[4].as_int(),
+                args[6].clone(),
+                16,
+            )),
+            "renderItemModelIntoGUIWithAlpha" if args.len() >= 6 => Some((
+                args[1].clone(),
+                args[2].clone(),
+                args[3].as_int(),
+                args[4].as_int(),
+                Value::NULL,
+                16,
+            )),
+            _ => None,
+        };
+        if let Some((graphics, stack, x, y, rotation, size)) = request {
+            let item = stack
+                .as_obj()
+                .and_then(|id| heap.get_native::<ItemStack>(id))
+                .map(|stack| stack.item.id.clone())
+                .unwrap_or_default();
+            if !item.is_empty() {
+                let rotation = quaternion_y_degrees(heap, &rotation);
+                if let Some(graphics) = graphics
+                    .as_obj()
+                    .and_then(|id| heap.get_native_mut::<GuiGraphics>(id))
+                {
+                    graphics.draws.push(GuiDraw::Item {
+                        item,
+                        x,
+                        y,
+                        size,
+                        rotation,
+                    });
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
     if class_name == "net/minecraft/client/renderer/texture/TextureManager"
         && method_name == "register"
         && args.len() >= 3
@@ -4592,6 +4720,27 @@ pub fn dispatch_builtin(
             heap.textures.insert(texture, image);
         }
         return BuiltinResult::Handled(Value::NULL);
+    }
+
+    // The render-tick event's `DeltaTracker` carries the real frame time the
+    // bridge measured; tooltip shine and model rotation read it.
+    if class_name == "net/minecraft/client/DeltaTracker"
+        && matches!(
+            method_name,
+            "getRealtimeDeltaTicks" | "getGameTimeDeltaTicks"
+        )
+    {
+        let delta = args
+            .first()
+            .and_then(|value| value.as_obj())
+            .and_then(|id| match heap.get(id) {
+                Some(JavaObject::Instance { fields, .. }) => {
+                    fields.get("delta").map(Value::as_float)
+                }
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        return BuiltinResult::Handled(Value::Float(delta));
     }
 
     if class_name == "net/minecraft/client/Options" && method_name == "guiScale" {
@@ -4997,11 +5146,17 @@ pub fn dispatch_builtin(
             if method_name == "centeredText" {
                 x -= text_width(&text) / 2;
             }
+            let mut color = args[5].as_int();
+            if color == -1
+                && let Some(sequence_color) = formatted_sequence_color(heap, &args[2])
+            {
+                color = sequence_color;
+            }
             draw = Some(GuiDraw::Text {
                 text,
                 x,
                 y: args[4].as_int(),
-                color: args[5].as_int(),
+                color,
             });
         } else if method_name == "textWithWordWrap" && args.len() >= 7 {
             let mut text = text_of_value(heap, &args[2]);
@@ -5109,6 +5264,26 @@ pub fn dispatch_builtin(
                 v0,
                 v1,
             });
+        } else if (method_name == "item" || method_name == "fakeItem") && args.len() >= 4 {
+            let (stack, x, y) = match args.len() {
+                6 => (2, 3, 4),
+                _ => (1, 2, 3),
+            };
+            let item = args
+                .get(stack)
+                .and_then(|value| value.as_obj())
+                .and_then(|id| heap.get_native::<ItemStack>(id))
+                .map(|stack| stack.item.id.clone())
+                .unwrap_or_default();
+            if !item.is_empty() {
+                draw = Some(GuiDraw::Item {
+                    item,
+                    x: args.get(x).map(Value::as_int).unwrap_or(0),
+                    y: args.get(y).map(Value::as_int).unwrap_or(0),
+                    size: 16,
+                    rotation: 0.0,
+                });
+            }
         } else if method_name == "enableScissor" && args.len() >= 5 {
             draw = Some(GuiDraw::Scissor {
                 x1: args[1].as_int(),
@@ -5120,9 +5295,7 @@ pub fn dispatch_builtin(
             draw = Some(GuiDraw::ScissorOff);
         } else if matches!(
             method_name,
-            "item"
-                | "fakeItem"
-                | "itemDecorations"
+            "itemDecorations"
                 | "setTooltipForNextFrame"
                 | "setComponentTooltipForNextFrame"
                 | "tooltip"
@@ -5704,10 +5877,20 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::from_bool(false));
     }
     if class_name == "net/minecraft/world/item/ItemStack"
-        && matches!(method_name, "getMaxDamage" | "getDamageValue")
+        && matches!(
+            method_name,
+            "getMaxDamage" | "getDamageValue" | "isDamageableItem"
+        )
     {
-        // No item durability data: report an item that takes no damage.
-        return BuiltinResult::Handled(Value::Int(0));
+        let stack = args
+            .first()
+            .and_then(|value| value.as_obj())
+            .and_then(|id| heap.get_native::<ItemStack>(id));
+        return BuiltinResult::Handled(match method_name {
+            "getMaxDamage" => Value::Int(stack.map_or(0, |stack| stack.max_damage)),
+            "getDamageValue" => Value::Int(stack.map_or(0, |stack| stack.damage)),
+            _ => Value::from_bool(stack.is_some_and(|stack| stack.max_damage > 0)),
+        });
     }
     if class_name == "net/minecraft/world/item/ItemStack" && method_name == "getEnchantments" {
         let list: Vec<(String, i32)> = args
@@ -6201,14 +6384,17 @@ pub fn dispatch_builtin(
                 .filter(|v| !v.is_null())
                 .map(|v| text_of_value(heap, v))
                 .unwrap_or_default();
-            let sid = heap.alloc_string(text);
-            let mut fields = HashMap::new();
-            fields.insert("text".into(), Value::Object(Some(sid)));
-            let id = heap.alloc(JavaObject::Instance {
-                class_name: "net/minecraft/util/FormattedCharSequence".into(),
-                fields,
+            let color = args.get(1).and_then(|value| {
+                value.as_obj().and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => {
+                        fields.get("color").map(Value::as_int)
+                    }
+                    _ => None,
+                })
             });
-            return BuiltinResult::Handled(Value::Object(Some(id)));
+            return BuiltinResult::Handled(alloc_formatted_char_sequence_colored(
+                heap, text, color,
+            ));
         }
     }
 

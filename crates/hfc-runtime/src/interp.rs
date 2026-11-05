@@ -1407,6 +1407,34 @@ impl Interpreter {
             return Ok(self.resolve_static_field("net/minecraft/world/item/Rarity", field));
         }
 
+        // A `FormattedCharSequence` the runtime built carries plain text; its
+        // `accept` feeds each codepoint to a `FormattedCharSink`, which is how
+        // library code (Iceberg's `StringRecomposer`) reads a tooltip line.
+        if class_name == "net/minecraft/util/FormattedCharSequence"
+            && method_name == "accept"
+            && args.len() >= 2
+        {
+            let text = crate::builtins::text_of_value(&self.heap, &args[0]);
+            let style = self.resolve_static_field("net/minecraft/network/chat/Style", "EMPTY");
+            for (index, character) in text.chars().enumerate() {
+                let keep_going = self.execute_method(
+                    "net/minecraft/util/FormattedCharSink",
+                    "accept",
+                    "(ILnet/minecraft/network/chat/Style;I)Z",
+                    &[
+                        args[1].clone(),
+                        Value::Int(index as i32),
+                        style.clone(),
+                        Value::Int(character as i32),
+                    ],
+                )?;
+                if !keep_going.as_bool() {
+                    break;
+                }
+            }
+            return Ok(Value::from_bool(true));
+        }
+
         // 1. Built-in shims
         match dispatch_builtin(
             &mut self.heap,

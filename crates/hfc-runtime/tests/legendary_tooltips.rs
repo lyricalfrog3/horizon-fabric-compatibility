@@ -1,9 +1,8 @@
-//! Legendary Tooltips draws its own tooltip frame from Iceberg's
-//! `RenderTooltipEvents.POSTEXT`: `TooltipDecor.drawBorder` slices
-//! `legendarytooltips:textures/gui/tooltip_borders.png` into corners and
-//! edges and blits each part. The frame is selected by the item's rarity
-//! through Iceberg's `Selectors.itemMatches`, which reads
-//! `ItemStack.getRarity()`.
+//! Legendary Tooltips builds its tooltip from Minecraft's real
+//! `ClientTooltipComponent` list: Iceberg's `GATHER` adds the item-model and
+//! padding components, Legendary's `tooltip` mixin centres the title, and
+//! `POSTEXT` draws the frame and name separator. The item model comes from
+//! Iceberg's `CustomItemRenderer`.
 //!
 //! The test loads the pinned jars, lets the mod write and load its default
 //! config, then drives the same bridge calls the client does. It needs the
@@ -11,11 +10,12 @@
 
 mod common;
 
+use hfc_runtime::bridge::TooltipRender;
 use hfc_runtime::minecraft::GuiDraw;
 use std::path::PathBuf;
 
 struct Tooltip {
-    draws: Vec<GuiDraw>,
+    render: TooltipRender,
     background: u32,
     border_top: u32,
     border_bottom: u32,
@@ -59,19 +59,25 @@ fn tooltip(rarity: &str) -> Option<Tooltip> {
         &mut border_top,
         &mut border_bottom,
     );
-    let draws = bridge.item_tooltip_frame(
+    let lines = vec![
+        ("Diamond Sword".to_string(), 0xFF55FFFFu32),
+        ("Efficiency V".to_string(), 0xFFAAAAAAu32),
+        (String::new(), 0xFFAAAAAAu32),
+        ("When in Main Hand:".to_string(), 0xFFAAAAAAu32),
+        (" 5 Attack Damage".to_string(), 0xFF55FF55u32),
+        (" 1.2 Attack Speed".to_string(), 0xFF55FF55u32),
+    ];
+    let render = bridge.item_tooltip_render(
         "minecraft:diamond_sword",
         Some(rarity),
+        1561,
+        &lines,
         640,
         360,
-        100,
-        100,
-        120,
-        40,
     );
     let _ = std::fs::remove_dir_all(&dir);
-    Some(Tooltip {
-        draws,
+    render.map(|render| Tooltip {
+        render,
         background,
         border_top,
         border_bottom,
@@ -96,11 +102,12 @@ fn frame_blits(draws: &[GuiDraw]) -> Vec<(&str, f32, f32, f32, f32)> {
 }
 
 #[test]
-fn epic_item_draws_the_legendary_frame() {
+fn epic_item_draws_the_legendary_frame_and_title() {
     let Some(tooltip) = tooltip("epic") else {
         return;
     };
-    let blits = frame_blits(&tooltip.draws);
+    let draws = &tooltip.render.draws;
+    let blits = frame_blits(draws);
     let frame: Vec<_> = blits
         .iter()
         .filter(|(texture, ..)| texture.contains("tooltip_borders"))
@@ -110,14 +117,100 @@ fn epic_item_draws_the_legendary_frame() {
         "expected at least the frame's four corners, got {:?}",
         blits.iter().map(|b| b.0).collect::<Vec<_>>()
     );
-    // A frame is drawn as its corners and edges, not the whole sheet: at
-    // least one blit samples a sub-rectangle of the texture.
     assert!(
         frame
             .iter()
             .any(|(_, u0, u1, v0, v1)| (*u0, *u1, *v0, *v1) != (0.0, 1.0, 0.0, 1.0)),
         "the frame blits sample the whole sheet instead of its parts: {frame:?}"
     );
+
+    // GATHER adds Legendary's item-model component; its extractImage asks
+    // Iceberg's item renderer to draw this stack.
+    assert!(
+        draws.iter().any(|draw| matches!(
+            draw,
+            GuiDraw::Item { item, .. } if item == "minecraft:diamond_sword"
+        )),
+        "the item-model component recorded no item draw: {draws:#?}"
+    );
+
+    // The title component is centred by Legendary's tooltip HEAD injector:
+    // Iceberg pads it with spaces to the tooltip's width.
+    let title = draws
+        .iter()
+        .find_map(|draw| match draw {
+            GuiDraw::Text { text, .. } if text.contains("Diamond Sword") => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("the title line was not drawn");
+    assert_ne!(title, "Diamond Sword", "the title was not padded");
+    assert_eq!(title.trim(), "Diamond Sword");
+
+    // `drawShadow` draws five one-pixel gradient rectangles; the name
+    // separator adds two more, so seven fills means it was drawn.
+    let fills = draws
+        .iter()
+        .filter(|draw| matches!(draw, GuiDraw::Fill { .. }))
+        .count();
+    assert!(fills >= 7, "the name separator did not draw: {draws:#?}");
+}
+
+#[test]
+fn render_ticks_advance_the_shine_timer() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .to_path_buf();
+    let jars = [
+        "fabric-api-0.165.0+26.3.jar",
+        "Iceberg-26.3-fabric-1.4.3.1.jar",
+        "Prism-26.3-fabric-1.1.3.jar",
+        "LegendaryTooltips-26.3-fabric-1.6.3.jar",
+    ]
+    .map(|name| root.join("test-mods").join(name));
+    if jars.iter().any(|jar| !jar.exists()) {
+        return;
+    }
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        return;
+    };
+    for jar in &jars {
+        bridge.load_mod_jar(jar).unwrap();
+    }
+    let dir = std::env::temp_dir().join(format!("hfc-legendary-ticks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    bridge.set_game_dir(Some(dir.clone()));
+    bridge.init().unwrap();
+    let lines = vec![("Diamond Sword".to_string(), 0xFF55FFFFu32)];
+    let render = |bridge: &mut hfc_runtime::bridge::FabricBridge| {
+        bridge.item_tooltip_render(
+            "minecraft:diamond_sword",
+            Some("epic"),
+            1561,
+            &lines,
+            640,
+            360,
+        )
+    };
+    let shine = |bridge: &mut hfc_runtime::bridge::FabricBridge| {
+        bridge
+            .interp
+            .resolve_static_field(
+                "com/anthonyhilyard/legendarytooltips/tooltip/TooltipDecor",
+                "shineTimer",
+            )
+            .as_float()
+    };
+    assert!(render(&mut bridge).is_some());
+    let first_shine = shine(&mut bridge);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(render(&mut bridge).is_some());
+    assert!(
+        shine(&mut bridge) < first_shine,
+        "the shine timer did not advance with real time"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -125,7 +218,7 @@ fn common_item_has_no_custom_frame_but_real_colors() {
     let Some(tooltip) = tooltip("common") else {
         return;
     };
-    let blits = frame_blits(&tooltip.draws);
+    let blits = frame_blits(&tooltip.render.draws);
     assert!(
         blits
             .iter()
@@ -133,10 +226,6 @@ fn common_item_has_no_custom_frame_but_real_colors() {
         "a common item selected a custom frame: {:?}",
         blits.iter().map(|b| b.0).collect::<Vec<_>>()
     );
-    // Rarity-matched colors come through Prism's DynamicColor: a fallback
-    // TextColor read as an `IColor`. Both used to come back 0 (a fully
-    // transparent tooltip) when `List.of` or the TextColor adapter was
-    // missing.
     assert_ne!(
         tooltip.background, 0,
         "the common tooltip background is fully transparent"

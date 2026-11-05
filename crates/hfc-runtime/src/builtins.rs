@@ -887,6 +887,20 @@ pub fn dispatch_builtin(
     args: &[Value],
     virtual_dispatch: bool,
 ) -> BuiltinResult {
+    // LWJGL's windowing natives (SDL, GLFW) belong to the host: the window, its
+    // cursor and text input are the host's, and the interpreter cannot load a
+    // shared library. A call into them does nothing and answers the type's zero.
+    if class_name.starts_with("org/lwjgl/sdl/") || class_name.starts_with("org/lwjgl/glfw/") {
+        let zero = match descriptor.rsplit(')').next().and_then(|r| r.bytes().next()) {
+            Some(b'Z' | b'B' | b'C' | b'S' | b'I') => Value::Int(0),
+            Some(b'J') => Value::Long(0),
+            Some(b'F') => Value::Float(0.0),
+            Some(b'D') => Value::Double(0.0),
+            _ => Value::NULL,
+        };
+        return BuiltinResult::Handled(zero);
+    }
+
     // A native list or set reached through `Collection` is still that list or set.
     if matches!(
         class_name,

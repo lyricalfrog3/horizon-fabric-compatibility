@@ -303,9 +303,23 @@ impl Interpreter {
                     "getFields" => Some(self.field_objects(&class, true)),
                     "getDeclaredFields" => Some(self.field_objects(&class, false)),
                     "getSuperclass" => {
-                        let class = self.loader.get_or_load_mut(&class).ok()??;
-                        Some(match class.super_class.clone() {
-                            Some(parent) if !class.is_interface => {
+                        // `Object` has no superclass; walking up a hierarchy
+                        // (`while (c != null) { ...; c = c.getSuperclass(); }`)
+                        // must end there, also for a class this cannot load.
+                        if class == "java/lang/Object" || class.starts_with('[') {
+                            return Some(if class == "java/lang/Object" {
+                                Value::NULL
+                            } else {
+                                Value::Object(Some(self.heap.alloc_class("java/lang/Object")))
+                            });
+                        }
+                        let Some(info) = self.loader.get_or_load_mut(&class).ok().flatten() else {
+                            return Some(Value::Object(Some(
+                                self.heap.alloc_class("java/lang/Object"),
+                            )));
+                        };
+                        Some(match info.super_class.clone() {
+                            Some(parent) if !info.is_interface => {
                                 Value::Object(Some(self.heap.alloc_class(parent)))
                             }
                             _ => Value::NULL,

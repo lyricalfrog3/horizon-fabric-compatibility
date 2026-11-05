@@ -605,3 +605,23 @@ fn a_mods_own_http_helper_runs_against_the_offline_boundary() {
     };
     assert_eq!(status, Some(404));
 }
+
+/// Hovering the title widget runs the widget's render with the pointer over it,
+/// which reaches LWJGL's static initializers through `Class.forName`. Those walk
+/// class hierarchies with `Class.getSuperclass`; a null `Class` must throw as in a
+/// JVM, or the walk never ends and the game freezes on hover.
+#[test]
+fn hovering_a_title_widget_renders_and_returns() {
+    let Some(fixture) = Fixture::discover() else {
+        return;
+    };
+    let mut bridge = fixture.bridge();
+    bridge.init().unwrap();
+    let widgets = bridge.prepare_menu_contributions(MenuKind::Title, 427, 240);
+    let widget = &widgets[0];
+    for _ in 0..3 {
+        let draws =
+            bridge.menu_widget_draw(MenuKind::Title, 427, 240, 0, widget.x + 5, widget.y + 5);
+        assert!(!draws.is_empty(), "the hovered widget rendered nothing");
+    }
+}

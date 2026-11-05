@@ -2484,6 +2484,28 @@ impl Interpreter {
                     }
                     call_args.reverse();
                     let this_ref = stack.pop().unwrap_or(Value::NULL);
+                    // A method of `Class` on null throws, as in a JVM. Reflection
+                    // walks (`c = c.getSuperclass()` until a field is found) end
+                    // on that exception; answering null instead loops forever.
+                    if this_ref.is_null() && class_name == "java/lang/Class" {
+                        let message = format!(
+                            "Cannot invoke \"Class.{method_name}()\" because value is null"
+                        );
+                        if let Some(target) = self.raise_if_caught(
+                            code,
+                            byte_offset,
+                            "java/lang/NullPointerException",
+                            &message,
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        return Err(Error::new(
+                            "interpreter",
+                            format!("java.lang.NullPointerException: {message}"),
+                        ));
+                    }
                     call_args.insert(0, this_ref);
 
                     let ret =

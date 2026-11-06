@@ -167,6 +167,14 @@ exceptions the runtime otherwise answers with defaults (`Pattern.compile`,
 them aborted static initializers, including Right Click Harvest's config. Those need real host
 boundaries first; each is a place where the runtime is still wrong, not only silent.
 
+A differential suite ([`tests/jvm_diff.rs`](../../crates/hfc-runtime/tests/jvm_diff.rs)) compiles small
+Java programs from `crates/hfc-runtime/tests/jvm/` and runs each on the machine's JVM and in the
+interpreter over the JDK image the client uses, comparing their labelled output.
+[`tests/jvm/known_divergences.toml`](../../crates/hfc-runtime/tests/jvm/known_divergences.toml) is
+the maintained list of what the interpreter still gets wrong (exception unwinding, Java's float
+and concatenation formatting, JDK collection printing); it may only shrink, and each entry is a
+bug in the general path.
+
 Other known gaps found by running Veinminer (Kotlin): a null that would throw in a JVM still
 loops (Kotlin's null-parameter message walks an empty stack trace), and there are no real threads,
 so Kotlin coroutine dispatchers only get as far as a single-threaded interpreter allows.

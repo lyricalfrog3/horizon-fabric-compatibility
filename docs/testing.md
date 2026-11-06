@@ -132,6 +132,32 @@ on a regression in analysis without parsing English.
 - Tests must not depend on the network, a game install or a particular OS. Unix-only tests are
   marked `#[cfg(unix)]` (the launcher script tests).
 
+## JVM differential tests
+
+`crates/hfc-runtime/tests/jvm_diff.rs` pins the interpreter to the Java specification: each class
+in `crates/hfc-runtime/tests/jvm/hfc/cases/` has a `run()` that returns deterministic labelled
+lines (`name=value`), `hfc.Harness` runs every case on the machine's real JVM, and the Rust test
+runs the same class in a fresh interpreter over the Minecraft runtime's `lib/modules` image and
+compares the output line by line. Expected values always come from the JVM, never from the code
+under test.
+
+- The machine needs `java` (from `JAVA_HOME`, else `PATH`) with the `jdk.compiler` module, and a
+  Minecraft installation for the JDK image. There is no `javac` binary on every machine: the test
+  runs `java -m jdk.compiler/com.sun.tools.javac.Main`. It does not pass `--release` (a `-jre`
+  package has no `ct.sym`); the classes are compiled for the running JDK.
+- With `HFC_SKIP_JVM_DIFF=1`, a missing Java or Minecraft prints that it skipped instead of
+  failing. Without it, the test fails with a clear message: a silent pass would hide the suite.
+- `crates/hfc-runtime/tests/jvm/known_divergences.toml` lists `Case.label` entries the
+  interpreter is known to get wrong, each with a one-line reason. A listed label that diverges is
+  reported but does not fail; a listed label that starts matching (or is gone) fails, so the list
+  can only shrink. Any unlisted divergence fails, with the interpreter's missing symbols.
+- To add a case, add a class under `hfc.cases` with the `run()` convention above; it is picked up
+  by the glob. Keep it deterministic (no time, identity hash codes, unordered maps over
+  identity-keyed objects, threads or unseeded randomness) and give every line a label.
+- A divergence is fixed in the interpreter's general path (an opcode, a JDK builtin, a host
+  boundary), never in the case or the comparison. Remove its label from the list in the same
+  commit.
+
 ## What is not tested (and why it matters)
 
 - **A real Horizon launch.** The hook compiles and its subprocess contract is tested, and the

@@ -413,6 +413,45 @@ impl FabricBridge {
         self.interp.loader.add_jimage(path)
     }
 
+    /// Run a static method of a loaded class under an instruction budget, with
+    /// missing-symbol tracking on; the differential JVM test uses it. The
+    /// value must be a `java.lang.String`.
+    #[doc(hidden)]
+    pub fn debug_call_static(
+        &mut self,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        budget: u64,
+    ) -> Result<String> {
+        let previous_budget = self.interp.step_budget;
+        let previous_trace = self.interp.trace_missing;
+        self.interp.step_budget = Some(budget);
+        self.interp.trace_missing = true;
+        self.interp.missing.clear();
+        let result = self.interp.execute_method(class, method, descriptor, &[]);
+        self.interp.step_budget = previous_budget;
+        self.interp.trace_missing = previous_trace;
+        let value = result?;
+        value
+            .as_obj()
+            .and_then(|id| self.interp.heap.get_string(id))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                hfc_core::Error::new(
+                    "interpreter",
+                    format!("{class}.{method} did not return a String"),
+                )
+            })
+    }
+
+    /// The symbols the last [`FabricBridge::debug_call_static`] could not
+    /// resolve.
+    #[doc(hidden)]
+    pub fn debug_missing(&self) -> Vec<String> {
+        self.interp.missing.clone()
+    }
+
     /// Walk every entrypoint's transitive class references. Classes found are
     /// parsed and cached; classes that no registered jar or JDK image provides
     /// are reported, which is what a mod will actually fail on.

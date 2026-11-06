@@ -25,6 +25,7 @@ fn has_synthetic_statics(class_name: &str) -> bool {
             | "net/minecraft/core/registries/Registries"
             | "net/minecraft/stats/Stats"
             | "net/minecraft/core/registries/BuiltInRegistries"
+            | "net/minecraft/core/particles/ParticleTypes"
     )
 }
 
@@ -3185,6 +3186,15 @@ impl Interpreter {
         if class_name == "net/minecraft/world/item/Items" {
             let item_id = format!("minecraft:{}", field_name.to_lowercase());
             let id = self.heap.alloc_native(Item { id: item_id });
+            return Value::Object(Some(id));
+        }
+
+        if class_name == "net/minecraft/core/particles/ParticleTypes" {
+            // `ParticleTypes.FALLING_WATER` is the constant registered under
+            // `minecraft:falling_water`; the runtime does not build the
+            // particle registry, so the field name gives the id.
+            let id = format!("minecraft:{}", field_name.to_ascii_lowercase());
+            let id = self.heap.alloc_native(ParticleType { id });
             return Value::Object(Some(id));
         }
 

@@ -568,6 +568,9 @@ fn a_passing_use_block_listener_lets_vanilla_handle_the_click() {
     let event = hfc_runtime::bridge::RightClickBlockEvent {
         pos: [0, 64, 0],
         face: [0, 1, 0],
+        hit: [0.5, 65.0, 0.5],
+        sneaking: false,
+        off_hand: false,
     };
     assert_eq!(
         bridge.right_click_block(&mut DirtHost, &event),

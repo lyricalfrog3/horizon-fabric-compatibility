@@ -536,6 +536,37 @@ impl NativeObject for IntegerProperty {
     }
 }
 
+/// A particle a mod's code asked the level to send (`ServerLevel.sendParticles`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParticleCall {
+    /// `minecraft:falling_water`.
+    pub id: String,
+    pub at: [f64; 3],
+    pub count: i32,
+    pub spread: [f64; 3],
+    pub speed: f64,
+}
+
+/// A `ParticleType` constant (`ParticleTypes.FALLING_WATER`), by the id it is
+/// registered under. Synthetic: the runtime does not build the particle
+/// registry, so the constant is made from its field name.
+#[derive(Debug)]
+pub struct ParticleType {
+    pub id: String,
+}
+
+impl NativeObject for ParticleType {
+    fn class_name(&self) -> &str {
+        "net/minecraft/core/particles/SimpleParticleType"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// A Level (or ServerLevel).
 #[derive(Debug, Clone)]
 pub struct Level {
@@ -557,6 +588,11 @@ pub struct Level {
     pub replanted: Vec<(BlockPos, BlockState)>,
     /// Positions a mod removed with `destroyBlock`/`removeBlock`, in order.
     pub broken: Vec<BlockPos>,
+    /// `ServerLevel.sendParticles` calls, in order, for the host to show.
+    pub particles: Vec<ParticleCall>,
+    /// `Level.scheduleTick` calls, in order: position, the block's heap id and
+    /// the delay in ticks.
+    pub scheduled: Vec<([i32; 3], usize, i32)>,
 }
 
 impl Level {
@@ -572,6 +608,8 @@ impl Level {
             dropped_stacks: Vec::new(),
             replanted: Vec::new(),
             broken: Vec::new(),
+            particles: Vec::new(),
+            scheduled: Vec::new(),
         }
     }
 

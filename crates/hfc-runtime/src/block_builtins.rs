@@ -588,6 +588,24 @@ impl Interpreter {
         };
         let records = self.heap.registered_blocks.clone();
         let mut facts = std::mem::take(&mut self.heap.block_facts);
+        let total = if only.is_empty() {
+            facts.len()
+        } else {
+            facts
+                .iter()
+                .filter(|b| only.contains(&b.id.as_str()))
+                .count()
+        };
+        // A cold start spends most of its time here (mdm: 344 blocks, ~13 s),
+        // on the content-root thread. One line per quarter tells a log reader —
+        // and a player looking at a loading screen that stopped moving — that
+        // it is still working.
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
+        let mut next_report = 1usize;
+        if total > 0 {
+            log::info!("Fabric: reading the shapes of {total} registered block(s)");
+        }
         for block in &mut facts {
             if !only.is_empty() && !only.contains(&block.id.as_str()) {
                 continue;
@@ -626,6 +644,17 @@ impl Interpreter {
                     }
                 }
             }
+            done += 1;
+            if done * 4 >= next_report * total {
+                log::info!(
+                    "Fabric: {done}/{total} registered block shapes read in {:.1?}",
+                    started.elapsed()
+                );
+                next_report += 1;
+            }
+        }
+        if only.is_empty() {
+            self.heap.block_facts_shapes = true;
         }
         self.heap.block_facts = facts;
     }

@@ -43,16 +43,19 @@ client where noted. A mod not listed here should be treated as unsupported.
 | **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow; the tooltip body from the mod's real component list (centred title, name separator, the item model rotating in 3D); the shine that restarts per hovered stack; `legendarytooltips.toml` written with comments, allowed values and ranges, and read back | ✅ |
 | **Emerald Tools** | Its five tools, registered in code, become Horizon items with vanilla-formula tool stats, textures, names and recipes; `/give`, creative search and the tabs the mod chose (Fabric `CreativeModeTabEvents`) find them | ✅ (in vanilla's Tools and Combat tabs) |
 | **Emerald Armor** | Its four armor pieces, registered in code with `Item.Properties.humanoidArmor`, become Horizon items with vanilla-formula durability, armor and toughness, a single stack, and an equippable slot; its worn-armor model and textures (under `assets/minecraft`) are carried | ✅ (worn and rendered) |
-| **Modern Decorations** | Its 344 blocks, registered in code, become Horizon blocks from facts read by running the mod's real block code: states, hardness, light, sounds, outline and collision shapes; they render with the jar's models, drop through its loot tables, and come with their items. Placement runs the mod's own `getStateForPlacement` and `setPlacedBy` (facing, multi-block furniture), and the 130 storage blocks are 27-slot containers that keep and drop their items | ✅ placing, facing, storage |
+| **Modern Decorations** | Its 344 blocks, registered in code, become Horizon blocks from facts read by running the mod's real block code: states, hardness, light, sounds, outline and collision shapes; they render with the jar's models, drop through its loot tables, and come with their items. Placement runs the mod's own `getStateForPlacement` and `setPlacedBy` (facing, multi-block furniture); right-click runs the block's own `useWithoutItem`/`useItemOn` (a shower head toggles its water); scheduled block ticks run, with the particles they send; and the 130 storage blocks are 27-slot containers with the mod's own stack limit, per-face hopper rules, items and drops | ✅ placing, facing, storage, use |
 | **JamLib, Iceberg, Placeholder API, Fabric API** | Load and initialise as libraries for the mods above | ✅ |
 
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the
 [runtime design note](docs/architecture/fabric-runtime.md). Notably:
 
-- Blocks: a mod block's own right-click code (`useWithoutItem`) and block-entity ticking don't
-  run yet; containers ignore the mod's per-slot stack limit and per-face rules; blocks whose
-  block entity is not a vanilla container stay decoration. Reading every block's facts makes
-  startup slower (about 20 s with Modern Decorations) until they are cached.
+- Blocks: a mod block's own right-click code (`useWithoutItem`/`useItemOn`) runs, scheduled
+  block ticks run (a lit shower head sprays), and a container keeps the mod's stack limit and
+  per-face hopper rules; ticking block entities (`getTicker`), neighbour updates and per-stack
+  slot rules (`canPlaceItem`) don't run, and blocks whose block entity is not a vanilla
+  container stay decoration. Reading a mod's block facts and shapes makes its first
+  start slower (about 24 s with Modern Decorations; later starts reuse the cache and take about
+  9 s, the mod's own entrypoint, against about 3 s without it).
 - Mods that carry blocks or entities around (Carry On) and most `Mixin`-heavy gameplay mods do
   not work.
 - Mod advancements are granted but don't appear in the advancement screen.
@@ -71,7 +74,8 @@ Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.m
    content → Horizon content mods   Java / Minecraft / Fabric API
    + report.md / report.json        classes answered in Rust; the
                                     client performs host actions
-                                    (rendering, files, links, clipboard)
+                                    (rendering, particles, ticks, files,
+                                    links, clipboard)
 ```
 
 The runtime prefers executing a mod's real bytecode, JDK and Minecraft classes included.

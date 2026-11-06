@@ -73,6 +73,9 @@ fn test_fabric_bridge_right_click_harvest() {
     let event = RightClickBlockEvent {
         pos: [5, 64, 5],
         face: [0, 1, 0], // UP
+        hit: [5.5, 65.0, 5.5],
+        sneaking: false,
+        off_hand: false,
     };
 
     let flow = bridge.right_click_block(&mut host, &event);
@@ -126,6 +129,9 @@ fn test_fabric_bridge_immature_crop_passes() {
     let event = RightClickBlockEvent {
         pos: [5, 64, 5],
         face: [0, 1, 0],
+        hit: [5.5, 65.0, 5.5],
+        sneaking: false,
+        off_hand: false,
     };
 
     let flow = bridge.right_click_block(&mut host, &event);

@@ -31,6 +31,10 @@ pub(crate) const WORLD_RADIUS: i32 = 2;
 /// The instruction budget of one `getStateForPlacement` call.
 pub(crate) const PLACEMENT_BUDGET: u64 = 20_000_000;
 
+/// The instruction budget of one scheduled block `tick` call. A tick should
+/// cost thousands, not millions; the cap stops a mis-decoded loop.
+pub(crate) const TICK_BUDGET: u64 = 2_000_000;
+
 /// What `getStateForPlacement` is told about the click.
 #[derive(Debug, Clone)]
 pub struct PlacementRequest {
@@ -256,16 +260,9 @@ impl Interpreter {
         Ok(map)
     }
 
-    /// The level, placer and context a block's placement methods are given,
-    /// built from the host's click and the world around it.
-    fn prepare_placement(
-        &mut self,
-        request: &PlacementRequest,
-        world: &WorldSnapshot,
-    ) -> Result<Prepared> {
-        self.ensure_initialized(DIRECTION)?;
-
-        // The level: the host's blocks, a mod's own as its state objects.
+    /// The level mod code reads: the host's blocks, a mod's own as its state
+    /// objects.
+    pub(crate) fn snapshot_level(&mut self, world: &WorldSnapshot) -> Result<usize> {
         let mut level = Level::new(false);
         for (at, id, properties) in &world.blocks {
             if self.heap.registered_blocks.iter().any(|b| &b.id == id) {
@@ -285,7 +282,20 @@ impl Interpreter {
             }
             level.blocks.insert(*at, state);
         }
-        let level_id = self.heap.alloc_level(level);
+        Ok(self.heap.alloc_level(level))
+    }
+
+    /// The level, placer and context a block's placement methods are given,
+    /// built from the host's click and the world around it.
+    pub(crate) fn prepare_placement(
+        &mut self,
+        request: &PlacementRequest,
+        world: &WorldSnapshot,
+    ) -> Result<Prepared> {
+        self.ensure_initialized(DIRECTION)?;
+
+        // The level: the host's blocks, a mod's own as its state objects.
+        let level_id = self.snapshot_level(world)?;
 
         // The placer.
         let horizontal = from_y_rot(f64::from(request.yaw));
@@ -359,7 +369,7 @@ impl Interpreter {
             level: Value::Object(Some(level_id)),
             player: Value::Object(Some(player_id)),
             stack: Value::Object(Some(stack_id)),
-            hand,
+            hand: hand.clone(),
             pos: Value::Object(Some(pos_id)),
             hit_pos: Value::Object(Some(hit_pos_id)),
             face: face_value,
@@ -380,6 +390,8 @@ impl Interpreter {
             stack: stack_id,
             context: context_id,
             pos: pos_id,
+            hit_result,
+            hand,
         })
     }
 
@@ -486,62 +498,94 @@ impl Interpreter {
                 ],
             )?;
         }
-        let writes = self
-            .heap
-            .get_native::<Level>(prepared.level)
-            .map(|level| level.placed.clone())
-            .unwrap_or_default();
-        // The last write to a position wins; keep the order of first writes.
+        self.level_writes(prepared.level)
+    }
+
+    /// The states a level was changed to through `setBlock` or
+    /// `setBlockAndUpdate`, in first-write order, the last write to a position
+    /// winning. Each as `(position, block id, state key)`.
+    pub(crate) fn level_writes(&mut self, level: usize) -> Result<Vec<([i32; 3], String, String)>> {
+        let Some(native) = self.heap.get_native::<Level>(level) else {
+            return Ok(Vec::new());
+        };
+        let writes: Vec<([i32; 3], Value)> = native
+            .placed
+            .iter()
+            .map(|(at, id)| (*at, Value::Object(Some(*id))))
+            .collect();
+        let replanted = native.replanted.clone();
         let mut order: Vec<[i32; 3]> = Vec::new();
-        let mut last: HashMap<[i32; 3], usize> = HashMap::new();
+        let mut last: HashMap<[i32; 3], (String, String)> = HashMap::new();
         for (at, state) in writes {
+            let change = self.state_change(&state)?;
             if !last.contains_key(&at) {
                 order.push(at);
             }
-            last.insert(at, state);
+            last.insert(at, change);
         }
-        let mut changes = Vec::new();
-        for at in order {
-            let state = Value::Object(Some(last[&at]));
-            if let Some(native) = state
-                .as_obj()
-                .and_then(|id| self.heap.get_native::<BlockState>(id))
-            {
-                let mut props: Vec<(String, String)> = native
-                    .properties
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                props.sort();
-                changes.push((at, native.block.id.clone(), state_key_of(&props)));
-                continue;
+        for (pos, state) in replanted {
+            let at = [pos.x, pos.y, pos.z];
+            let mut props: Vec<(String, String)> = state
+                .properties
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            props.sort();
+            if !last.contains_key(&at) {
+                order.push(at);
             }
-            let key = self.state_key(&state)?;
-            let owner = match state.as_obj().and_then(|id| self.heap.get(id)) {
-                Some(JavaObject::Instance { fields, .. }) => {
-                    fields.get("owner").and_then(Value::as_obj)
-                }
-                _ => None,
-            };
-            let id = owner
-                .and_then(|o| self.heap.registered_blocks.iter().find(|b| b.object == o))
-                .map(|b| b.id.clone())
-                .ok_or_else(|| {
-                    failure(format!(
-                        "setBlock at {at:?} wrote a state of no registered block"
-                    ))
-                })?;
-            changes.push((at, id, key));
+            last.insert(at, (state.block.id.clone(), state_key_of(&props)));
         }
-        Ok(changes)
+        Ok(order
+            .into_iter()
+            .map(|at| {
+                let (block, key) = last.remove(&at).unwrap_or_default();
+                (at, block, key)
+            })
+            .collect())
+    }
+
+    /// The block id and state key of a state written to a level: a native
+    /// `BlockState` or a mod block's own object.
+    fn state_change(&mut self, state: &Value) -> Result<(String, String)> {
+        if let Some(native) = state
+            .as_obj()
+            .and_then(|id| self.heap.get_native::<BlockState>(id))
+        {
+            let mut props: Vec<(String, String)> = native
+                .properties
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            props.sort();
+            return Ok((native.block.id.clone(), state_key_of(&props)));
+        }
+        let key = self.state_key(state)?;
+        let owner = match state.as_obj().and_then(|id| self.heap.get(id)) {
+            Some(JavaObject::Instance { fields, .. }) => {
+                fields.get("owner").and_then(Value::as_obj)
+            }
+            _ => None,
+        };
+        let id = owner
+            .and_then(|o| self.heap.registered_blocks.iter().find(|b| b.object == o))
+            .map(|b| b.id.clone())
+            .ok_or_else(|| {
+                failure("a level write was a state of no registered block".to_string())
+            })?;
+        Ok((id, key))
     }
 }
 
 /// The objects a placement method is called with.
-struct Prepared {
-    level: usize,
-    player: usize,
-    stack: usize,
-    context: usize,
-    pos: usize,
+pub(crate) struct Prepared {
+    pub level: usize,
+    pub player: usize,
+    pub stack: usize,
+    pub context: usize,
+    pub pos: usize,
+    /// The `BlockHitResult` of the click (`UseOnContext.getHitResult`).
+    pub hit_result: usize,
+    /// The `InteractionHand` constant of the hand (`UseOnContext.getHand`).
+    pub hand: Value,
 }

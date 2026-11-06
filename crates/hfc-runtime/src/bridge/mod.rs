@@ -14,8 +14,8 @@ use std::path::Path;
 
 pub use crate::place_builtins::PlacementRequest;
 pub use blocks::{
-    BlockChange, BlockContainer, BlockSound, ContainerRead, PlacedBy, Placement, RegisteredBlock,
-    RegisteredState,
+    BlockChange, BlockContainer, BlockEffects, BlockSchedule, BlockSound, BlockUse, ContainerRead,
+    ParticleBurst, PlacedBy, Placement, RegisteredBlock, RegisteredState,
 };
 pub use items::{CreativeTabAddition, RegisteredItem, TabPlacement};
 
@@ -47,6 +47,10 @@ pub trait HostBridge {
     fn held_item(&self) -> Option<String> {
         None
     }
+    /// The item id in the player's off hand, if the host knows it.
+    fn off_hand_item(&self) -> Option<String> {
+        None
+    }
     /// Enchantment ids and levels on the main-hand item.
     fn held_enchantments(&self) -> Vec<(String, i32)> {
         Vec::new()
@@ -60,6 +64,17 @@ pub trait HostBridge {
     fn block_properties(&self, pos: [i32; 3]) -> Vec<(String, String)> {
         let _ = pos;
         Vec::new()
+    }
+    /// A mod block's scheduled tick is due in `delay` game ticks: the host
+    /// runs it with `FabricBridge::tick_block` when it is. Hosts that do not
+    /// tick blocks leave the default, which drops it.
+    fn schedule_block_tick(&mut self, pos: [i32; 3], block: &str, delay: u32) {
+        let _ = (pos, block, delay);
+    }
+    /// A particle burst a mod's block code sent (`ServerLevel.sendParticles`):
+    /// `count` particles at `at`, spread by `spread`, with `speed`.
+    fn particle(&mut self, id: &str, at: [f64; 3], count: u32, spread: [f64; 3], speed: f64) {
+        let _ = (id, at, count, spread, speed);
     }
 }
 
@@ -121,10 +136,16 @@ pub struct JarSummary {
 }
 
 /// Event matching Horizon's `RightClickBlockEvent`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RightClickBlockEvent {
     pub pos: [i32; 3],
     pub face: [i32; 3],
+    /// Where on the block the click landed (`UseOnContext.getClickLocation`).
+    pub hit: [f64; 3],
+    /// `Player.isSecondaryUseActive` (sneaking).
+    pub sneaking: bool,
+    /// The click is the off hand's turn (`Player.getItemInHand(OFF_HAND)`).
+    pub off_hand: bool,
 }
 
 /// A discovered mod entrypoint.
@@ -206,6 +227,9 @@ pub struct FabricBridge {
     /// the hovered stack by identity (vanilla keeps one `ItemStack` per slot)
     /// sees a new hover only when the host shows a different tooltip.
     hovered_tooltip: Option<(HoveredTooltipKey, usize, Option<usize>)>,
+    /// The block facts read from the mod's blocks, and the classpath key they
+    /// belong to (`bridge/block_cache.rs`).
+    block_facts_cache: block_cache::BlockFactsCache,
 }
 
 pub(crate) type HoveredTooltipKey = (String, Vec<(String, u32)>);
@@ -223,6 +247,8 @@ mod menu;
 mod screen;
 mod textures;
 
+mod block_cache;
+
 impl FabricBridge {
     /// Load the block/item registries and tags from a Horizon resources
     /// directory, so mods can resolve ids and tags.
@@ -234,7 +260,17 @@ impl FabricBridge {
 
     /// Let mods read and write files under `dir` (the game directory) on disk.
     /// Until this is called, mod file access stays in memory.
+    ///
+    /// The block facts read out of the mod's blocks are cached under the same
+    /// folder's `.horizon-cache/fabric-blocks`, beside the generated content
+    /// mods, so a later start with the same classpath does not read them again
+    /// (`bridge/block_cache.rs`). [`FabricBridge::set_block_facts_cache`]
+    /// overrides that.
     pub fn set_game_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.block_facts_cache = block_cache::BlockFactsCache::new(
+            dir.as_ref()
+                .map(|dir| dir.join(".horizon-cache").join(block_cache::CACHE_DIR)),
+        );
         self.interp.heap.fs.set_root(dir);
     }
 
@@ -257,6 +293,7 @@ impl FabricBridge {
             gui_texture_cache: HashMap::new(),
             last_render_tick: None,
             hovered_tooltip: None,
+            block_facts_cache: block_cache::BlockFactsCache::new(None),
         }
     }
 
@@ -302,6 +339,7 @@ impl FabricBridge {
             gui_texture_cache: HashMap::new(),
             last_render_tick: None,
             hovered_tooltip: None,
+            block_facts_cache: block_cache::BlockFactsCache::new(None),
         }
     }
 
@@ -735,13 +773,23 @@ impl FabricBridge {
                 &entry.descriptor,
                 &[],
             );
+            let used = ENTRYPOINT_BUDGET - self.interp.step_budget.unwrap_or(0);
             log::debug!(
                 "entrypoint {}.{} used {} instructions in {:?}",
                 entry.class_name,
                 entry.method_name,
-                ENTRYPOINT_BUDGET - self.interp.step_budget.unwrap_or(0),
+                used,
                 started.elapsed()
             );
+            if entry.method_name == "onInitialize" && used > 1_000_000 {
+                log::info!(
+                    "Fabric: entrypoint {}.{} cost {used} instructions, close to the {} cap, in {:.1?}",
+                    entry.class_name,
+                    entry.method_name,
+                    ENTRYPOINT_BUDGET,
+                    started.elapsed()
+                );
+            }
             if let Err(e) = res {
                 log::warn!(
                     "Mod entrypoint {}.{}{} failed to initialize: {e}",
@@ -755,9 +803,29 @@ impl FabricBridge {
         // The entrypoints have registered their tab listeners and items.
         self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
         self.interp.run_creative_tab_events();
-        // Every block object exists now; read their states and shapes. Each
-        // block gets its own budget so one bad block cannot starve the rest.
-        self.interp.collect_block_facts(ENTRYPOINT_BUDGET);
+        // Every block object exists now; read their states and shapes. The
+        // objects themselves have to exist at play time (C1 placement and
+        // C2/C3 use run the mod's own code), so the entrypoints always run;
+        // reading the facts back out of them is what a cache skips when this
+        // classpath was read before. Each block gets its own budget so one bad
+        // block cannot starve the rest.
+        let started = std::time::Instant::now();
+        let registered = self.interp.heap.registered_blocks.len();
+        // With no registered block there is nothing to cache, so the classpath
+        // is not hashed for an empty list: a game without block mods must not
+        // pay for the cache at all.
+        if registered == 0 || !self.load_block_facts_cache() {
+            self.interp.collect_block_facts(ENTRYPOINT_BUDGET);
+            let blocks = self.interp.heap.block_facts.len();
+            if blocks > 0 {
+                log::info!(
+                    "Fabric: facts of {blocks} registered block(s) read in {:.1?} (first start \
+                     with this classpath; later starts reuse them from \
+                     .horizon-cache/fabric-blocks)",
+                    started.elapsed()
+                );
+            }
+        }
         self.interp.step_budget = prev_budget;
 
         self.initialized = true;

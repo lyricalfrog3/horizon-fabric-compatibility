@@ -391,6 +391,168 @@ fn a_bed_is_refused_where_the_host_has_a_block_in_its_way() {
     ));
 }
 
+/// The meadow with one block of `id` standing at `at` in `properties`.
+struct World {
+    at: [i32; 3],
+    id: String,
+    properties: Vec<(String, String)>,
+}
+
+impl hfc_runtime::bridge::HostBridge for World {
+    fn block(&self, pos: [i32; 3]) -> String {
+        if pos == self.at {
+            self.id.clone()
+        } else if pos[1] <= 0 {
+            "minecraft:grass_block".into()
+        } else {
+            "minecraft:air".into()
+        }
+    }
+    fn block_property(&self, pos: [i32; 3], key: &str) -> Option<String> {
+        (pos == self.at)
+            .then(|| {
+                self.properties
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            })
+            .flatten()
+    }
+    fn set_block_property(&mut self, _: [i32; 3], _: &str, _: &str) -> bool {
+        false
+    }
+    fn give(&mut self, _: &str, _: u32) -> Result<(), String> {
+        Ok(())
+    }
+    fn block_properties(&self, pos: [i32; 3]) -> Vec<(String, String)> {
+        if pos == self.at {
+            self.properties.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// A mod block's own `useWithoutItem` runs: the shower head's toggles its
+/// `running` property through `level.setBlock`, and the click is consumed.
+#[test]
+fn a_mod_blocks_own_use_toggles_the_state_it_sets() {
+    use hfc_runtime::bridge::{BlockUse, RightClickBlockEvent};
+    let Some(mut bridge) = mdm() else { return };
+    let blocks = bridge.registered_blocks();
+    let sink = find(&blocks, "mdm:shower_head").clone();
+    assert!(
+        sink.overrides
+            .iter()
+            .any(|o| o.ends_with(".useWithoutItem")),
+        "{:?}",
+        sink.overrides
+    );
+    // javap of ShowerHeadBlock (extends RunningSinkBlock): useWithoutItem
+    // reads RUNNING, sets it to its opposite with `level.setBlock(pos, state, 3)`
+    // and returns SUCCESS. RUNNING is `BooleanProperty.create("running")`.
+    let default: Vec<(String, String)> = sink
+        .default
+        .split(',')
+        .map(|part| {
+            let (k, v) = part.split_once('=').unwrap();
+            (k.to_string(), v.to_string())
+        })
+        .collect();
+    let running = default
+        .iter()
+        .find(|(k, _)| k == "running")
+        .map(|(_, v)| v == "true")
+        .expect("the shower head has a running property");
+    let host = World {
+        at: [4, 1, 4],
+        id: "mdm:shower_head".into(),
+        properties: default,
+    };
+    let event = RightClickBlockEvent {
+        pos: [4, 1, 4],
+        face: [0, 1, 0],
+        hit: [4.5, 1.5, 4.5],
+        sneaking: false,
+        off_hand: false,
+    };
+    let BlockUse::Handled(effects) = bridge.block_used(&host, &event) else {
+        panic!("the shower head's use did not run");
+    };
+    assert_eq!(effects.changes.len(), 1, "{:?}", effects.changes);
+    assert_eq!(effects.changes[0].pos, [4, 1, 4]);
+    assert_eq!(
+        effects.changes[0].properties["running"],
+        (!running).to_string()
+    );
+    // javap of RunningSinkBlock.useWithoutItem: turning it on ends with
+    // `level.scheduleTick(pos, this, 2)`.
+    assert_eq!(
+        effects.schedules,
+        [hfc_runtime::bridge::BlockSchedule {
+            pos: [4, 1, 4],
+            block: "mdm:shower_head".into(),
+            delay: 2,
+        }]
+    );
+
+    // The tick it scheduled sends the water: javap of RunningSinkBlock.tick
+    // reads RUNNING (returning when false), sends one FALLING_WATER particle
+    // at each outlet with no spread and no speed, and schedules itself 2 ticks
+    // later.
+    let on = World {
+        at: [4, 1, 4],
+        id: "mdm:shower_head".into(),
+        properties: vec![
+            ("facing".into(), "north".into()),
+            ("running".into(), "true".into()),
+        ],
+    };
+    let started = std::time::Instant::now();
+    let ticked = bridge
+        .tick_block(&on, [4, 1, 4], "mdm:shower_head")
+        .expect("the shower head's tick ran");
+    eprintln!("shower tick: {:?}", started.elapsed());
+    assert!(!ticked.particles.is_empty(), "{ticked:?}");
+    for particle in &ticked.particles {
+        assert_eq!(particle.id, "minecraft:falling_water");
+        assert_eq!(particle.count, 1);
+        assert_eq!(particle.spread, [0.0; 3]);
+        assert_eq!(particle.speed, 0.0);
+        // The outlet sits in the block's own cell or just above/below it.
+        assert!(
+            particle.at[0] >= 4.0 && particle.at[0] < 5.0,
+            "{particle:?}"
+        );
+        assert!(
+            particle.at[2] >= 4.0 && particle.at[2] < 5.0,
+            "{particle:?}"
+        );
+    }
+    assert_eq!(ticked.schedules[0].delay, 2);
+    // Stopped: the tick returns before sending anything.
+    let off = World {
+        at: [4, 1, 4],
+        id: "mdm:shower_head".into(),
+        properties: vec![
+            ("facing".into(), "north".into()),
+            ("running".into(), "false".into()),
+        ],
+    };
+    let stopped = bridge
+        .tick_block(&off, [4, 1, 4], "mdm:shower_head")
+        .expect("the tick ran");
+    assert!(stopped.particles.is_empty(), "{stopped:?}");
+
+    // A block whose block entity is a container keeps the host's menu path.
+    let cabinet = World {
+        at: [4, 1, 4],
+        id: "mdm:set_1_cabinet".into(),
+        properties: vec![("facing".into(), "north".into())],
+    };
+    assert_eq!(bridge.block_used(&cabinet, &event), BlockUse::NotOverridden);
+}
+
 #[test]
 fn mdm_storage_blocks_report_the_container_their_block_entity_builds() {
     use hfc_runtime::bridge::{BlockContainer, ContainerRead};
@@ -400,13 +562,21 @@ fn mdm_storage_blocks_report_the_container_their_block_entity_builds() {
     // javap of Set1CabinetBlockEntity: it extends RandomizableContainerBlockEntity,
     // its constructor makes `NonNullList.withSize(27, EMPTY)`, `getContainerSize()`
     // is that list's size, `createMenu(int, Inventory)` is `ChestMenu.threeRows`
-    // (MenuType.GENERIC_9x3) and `getDisplayName()` is `Component.literal("Storage")`.
+    // (MenuType.GENERIC_9x3), `getDisplayName()` is `Component.literal("Storage")`,
+    // `getMaxStackSize()` is `bipush 8; ireturn` and it implements
+    // `WorldlyContainer`, whose `getSlotsForFace` is
+    // `IntStream.range(0, getContainerSize()).toArray()`.
+    let all_slots: Vec<usize> = (0..27).collect();
     assert_eq!(
         find(&blocks, "mdm:set_1_cabinet").container,
         ContainerRead::Container(BlockContainer {
             slots: 27,
             menu_type: "minecraft:generic_9x3".into(),
             title: Some("Storage".into()),
+            title_key: None,
+            max_stack_size: Some(8),
+            faces: Some(std::array::from_fn(|_| all_slots.clone())),
+            notes: Vec::new(),
         })
     );
 
@@ -417,7 +587,17 @@ fn mdm_storage_blocks_report_the_container_their_block_entity_builds() {
     );
 
     let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut keys = 0;
     for b in &blocks {
+        if let ContainerRead::Container(c) = &b.container {
+            if let Some(key) = &c.title_key {
+                keys += 1;
+                assert!(
+                    key.starts_with("block.mdm.") || key.starts_with("container."),
+                    "{key}"
+                );
+            }
+        }
         let key = match &b.container {
             ContainerRead::Container(c) => format!("{} x{}", c.menu_type, c.slots),
             ContainerRead::NoBlockEntity => "no block entity".into(),
@@ -427,4 +607,9 @@ fn mdm_storage_blocks_report_the_container_their_block_entity_builds() {
         *by_kind.entry(key).or_default() += 1;
     }
     eprintln!("container counts: {by_kind:#?}");
+    // Every mdm container overrides `getDisplayName()` with a literal; a
+    // container that keeps `BaseContainerBlockEntity`'s default name answers a
+    // `Component.translatable`, which is kept as `title_key` (checked above
+    // when there is one).
+    eprintln!("containers with a translation key: {keys}");
 }

@@ -40,6 +40,11 @@ pub struct JImage {
 }
 
 impl JImage {
+    /// The `lib/modules` file this image was read from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Open a `lib/modules` image and index every class it contains.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();

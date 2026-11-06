@@ -4,10 +4,14 @@
 //! `newBlockEntity`. The runtime builds one from the block's default state and
 //! asks it, through its own methods, what the host needs to give the block a
 //! container: `getContainerSize()`, the menu `createMenu(int, Inventory)`
-//! builds (the menu's real `MenuType`) and `getDisplayName()`. Nothing is
-//! guessed from class names; a block entity that is not a vanilla container
-//! (it does not extend `BaseContainerBlockEntity`) has none, and one whose
-//! menu is not a vanilla `MenuType` is reported, not given a stand-in.
+//! builds (the menu's real `MenuType`), `getDisplayName()` (with the
+//! translation key when it was a `Component.translatable`), `getMaxStackSize()`
+//! and, for a `WorldlyContainer`, `getSlotsForFace(Direction)` per face.
+//! Nothing is guessed from class names; a block entity that is not a vanilla
+//! container (it does not extend `BaseContainerBlockEntity`) has none, and one
+//! whose menu is not a vanilla `MenuType` is reported, not given a stand-in.
+//! The per-stack rules (`canPlaceItem`, `canPlaceItemThroughFace`,
+//! `canTakeItemThroughFace`) cannot be read as one fact and are not run.
 
 use crate::bridge::blocks::{BlockContainer, ContainerRead};
 use crate::interp::Interpreter;
@@ -17,6 +21,10 @@ use hfc_core::{Error, Result};
 const ENTITY_BLOCK: &str = "net/minecraft/world/level/block/EntityBlock";
 const BASE_CONTAINER: &str = "net/minecraft/world/level/block/entity/BaseContainerBlockEntity";
 const CONTAINER: &str = "net/minecraft/world/Container";
+const WORLDLY_CONTAINER: &str = "net/minecraft/world/WorldlyContainer";
+const DIRECTION: &str = "net/minecraft/core/Direction";
+/// `Direction`'s constants, in the order `BlockContainer::faces` uses.
+const FACES: [&str; 6] = ["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"];
 const MENU_TYPE: &str = "net/minecraft/world/inventory/MenuType";
 const INVENTORY: &str = "net/minecraft/world/entity/player/Inventory";
 const MENU: &str = "net/minecraft/world/inventory/AbstractContainerMenu";
@@ -59,16 +67,54 @@ impl Interpreter {
         if slots <= 0 {
             return Err(failure(format!("getContainerSize() is {slots}")));
         }
-        let title = self
+        let display = self
             .execute_method(
                 "net/minecraft/world/MenuProvider",
                 "getDisplayName",
                 "()Lnet/minecraft/network/chat/Component;",
                 &[entity.clone()],
             )
-            .ok()
-            .map(|component| crate::builtins::text_of_value(&self.heap, &component));
-
+            .ok();
+        let title = display
+            .as_ref()
+            .map(|component| crate::builtins::text_of_value(&self.heap, component));
+        let title_key = display
+            .as_ref()
+            .and_then(|component| self.component_key(component));
+        let mut notes = Vec::new();
+        let max_stack_size = match self.execute_method(
+            CONTAINER,
+            "getMaxStackSize",
+            "()I",
+            std::slice::from_ref(&entity),
+        ) {
+            Ok(value) => {
+                let size = value.as_int();
+                if (1..=99).contains(&size) {
+                    Some(size as u32)
+                } else {
+                    notes.push(format!(
+                        "getMaxStackSize() is {size}, which no slot can hold"
+                    ));
+                    None
+                }
+            }
+            Err(error) => {
+                notes.push(format!("getMaxStackSize could not be read: {error}"));
+                None
+            }
+        };
+        let faces = if self.class_is_assignable_to(&class, WORLDLY_CONTAINER) {
+            match self.worldly_faces(&entity, slots as usize) {
+                Ok(faces) => Some(faces),
+                Err(error) => {
+                    notes.push(format!("getSlotsForFace could not be read: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         self.ensure_initialized(INVENTORY)?;
         let inventory = self.alloc_uninitialized(INVENTORY);
         let menu = self.execute_method(
@@ -95,7 +141,53 @@ impl Interpreter {
             slots: slots as usize,
             menu_type,
             title,
+            title_key,
+            max_stack_size,
+            faces,
+            notes,
         }))
+    }
+
+    /// The translation key of a `Component.translatable` as this runtime built
+    /// it (`key` on the component), if it was one.
+    fn component_key(&self, component: &Value) -> Option<String> {
+        let id = component.as_obj()?;
+        let JavaObject::Instance { fields, .. } = self.heap.get(id)? else {
+            return None;
+        };
+        let key = fields.get("key")?.as_obj()?;
+        self.heap.get_string(key).map(str::to_string)
+    }
+
+    /// `WorldlyContainer.getSlotsForFace` for each of the six directions, in
+    /// `Direction` order; slots outside the container are left out.
+    fn worldly_faces(&mut self, entity: &Value, slots: usize) -> Result<[Vec<usize>; 6]> {
+        self.ensure_initialized(DIRECTION)?;
+        let mut faces: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+        for (at, name) in FACES.iter().enumerate() {
+            let direction = self.resolve_static_field(DIRECTION, name);
+            let array = self.execute_method(
+                WORLDLY_CONTAINER,
+                "getSlotsForFace",
+                "(Lnet/minecraft/core/Direction;)[I",
+                &[entity.clone(), direction],
+            )?;
+            let Some(id) = array.as_obj() else {
+                return Err(failure(format!("getSlotsForFace({name}) returned null")));
+            };
+            let Some(JavaObject::Array { elements, .. }) = self.heap.get(id) else {
+                return Err(failure(format!(
+                    "getSlotsForFace({name}) did not return an int array"
+                )));
+            };
+            faces[at] = elements
+                .iter()
+                .map(Value::as_int)
+                .filter(|slot| (0..slots as i32).contains(slot))
+                .map(|slot| slot as usize)
+                .collect();
+        }
+        Ok(faces)
     }
 
     /// The id of one of vanilla's `MenuType` constants (`GENERIC_9x3` is

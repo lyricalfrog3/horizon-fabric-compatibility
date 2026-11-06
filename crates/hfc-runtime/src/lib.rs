@@ -19,6 +19,7 @@ pub mod place_builtins;
 pub mod reflect;
 pub mod registry;
 pub mod text_io;
+pub mod use_builtins;
 pub mod value;
 pub mod vfs;
 

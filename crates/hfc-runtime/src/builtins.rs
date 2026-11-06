@@ -6054,6 +6054,55 @@ pub fn dispatch_builtin(
                 fields: HashMap::new(),
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "getBlockEntity" && args.len() >= 2 {
+            // The runtime's level snapshot holds block states, not block
+            // entities: a mod asking for one gets null, as an empty chunk.
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "scheduleTick" && args.len() >= 4 {
+            // The bridge hands the schedule to the host, which runs the
+            // block's own tick when it is due.
+            let pos = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockPos>(id))
+                .cloned();
+            if let (Some(level_id), Some(pos), Some(block)) =
+                (args[0].as_obj(), pos, args[2].as_obj())
+            {
+                let delay = args[3].as_int();
+                if let Some(level) = heap.get_native_mut::<Level>(level_id) {
+                    level.scheduled.push(([pos.x, pos.y, pos.z], block, delay));
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "sendParticles" && args.len() >= 10 {
+            // `sendParticles(ParticleOptions, x, y, z, count, dx, dy, dz,
+            // speed)`: a simple particle type's id comes from the synthetic
+            // `ParticleTypes` constant.
+            let id = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<ParticleType>(id))
+                .map(|particle| particle.id.clone());
+            if let (Some(level_id), Some(id)) = (args[0].as_obj(), id) {
+                let call = ParticleCall {
+                    id,
+                    at: [
+                        args[2].as_double(),
+                        args[3].as_double(),
+                        args[4].as_double(),
+                    ],
+                    count: args[5].as_int(),
+                    spread: [
+                        args[6].as_double(),
+                        args[7].as_double(),
+                        args[8].as_double(),
+                    ],
+                    speed: args[9].as_double(),
+                };
+                if let Some(level) = heap.get_native_mut::<Level>(level_id) {
+                    level.particles.push(call);
+                }
+            }
+            return BuiltinResult::Handled(Value::Int(args[5].as_int()));
         } else if method_name == "setBlock" && args.len() >= 4 {
             // `setBlock(pos, state, flags)`: the state is a native one or a
             // mod block's own object; the bridge reads which when it hands the
@@ -6573,8 +6622,12 @@ pub fn dispatch_builtin(
 
             let translated = format_translation(&template, &format_args);
             let str_id = heap.alloc_string(translated);
+            let key_id = heap.alloc_string(key);
             let mut fields = HashMap::new();
             fields.insert("text".into(), Value::Object(Some(str_id)));
+            // The key it was built from, so a caller that can translate it
+            // itself (a container's title) keeps it.
+            fields.insert("key".into(), Value::Object(Some(key_id)));
             let sibs_id = heap.alloc_list(Vec::new());
             fields.insert("siblings".into(), Value::Object(Some(sibs_id)));
             fields.insert("color".into(), Value::Int(0xFFFFFFFF_u32 as i32));

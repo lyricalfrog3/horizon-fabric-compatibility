@@ -644,6 +644,19 @@ impl FabricBridge {
             }
         }
 
+        // 5. The block's own useItemOn/useWithoutItem, for a block a mod
+        // registered in code (a container block keeps the host's path).
+        match self.block_used(host, event) {
+            BlockUse::NotOverridden | BlockUse::Passed => {}
+            BlockUse::Failed(error) => {
+                log::warn!("Fabric: {block_id}'s use failed: {error}");
+            }
+            BlockUse::Handled(effects) => {
+                self.apply_block_effects(host, &effects);
+                return Flow::Cancel;
+            }
+        }
+
         Flow::Continue
     }
 

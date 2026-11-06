@@ -569,7 +569,8 @@ out. The declaration carries the default state's hardness, resistance, light, to
 friction, map colour, sounds and `can_occlude`, the block's own state properties, and its
 outline and collision per state (`shapes`/`collision` keyed by the fewest properties they
 depend on; over 16 boxes are merged into a cover). Shapes are read once per run on the
-content-root thread (about 15 s for mdm's 344 blocks in the fast build). Block entities, use and ticks are not run; placement is in the next section.
+content-root thread (about 15 s for mdm's 344 blocks in the fast build). Block entities' own
+code and ticks are not run; use is stage C3 and placement stage C1.
 Drops come from the jar's own `data/<ns>/loot_table/blocks/` files through Horizon's loot
 engine. Tables written in an older format (a `conditions` list of `{"condition": ...}`) roll
 as 26.3 rolls them: its codecs read only `condition`, so the old list is an ignored field.
@@ -601,22 +602,132 @@ build height are the overworld's defaults; `canBeReplaced` of a vanilla block is
 
 `RegisteredBlock::container` (`container_builtins.rs`, read in `collect_block_facts`) runs the
 block's real `EntityBlock.newBlockEntity` on its default state and asks the entity:
-`getContainerSize()`, `getDisplayName()` and the menu `createMenu(0, Inventory)` builds (its
-`AbstractContainerMenu.getType()` matched against `MenuType`'s constants). A block entity that
-does not extend `BaseContainerBlockEntity` is `NotVanillaContainer(class)`; anything that failed
-is `Unreadable(reason)`. `title` is the text `getDisplayName()` answered (a literal, or the
-mod's own language file's text when it used a translation).
+`getContainerSize()`, `getDisplayName()`, `getMaxStackSize()`, the menu `createMenu(0, Inventory)`
+builds (its `AbstractContainerMenu.getType()` matched against `MenuType`'s constants) and, for a
+`WorldlyContainer`, `getSlotsForFace(Direction)` for each of the six directions. A block entity
+that does not extend `BaseContainerBlockEntity` is `NotVanillaContainer(class)`; anything that
+failed is `Unreadable(reason)`. `title` is the text `getDisplayName()` answered (a literal, or the
+mod's own language file's text when it used a translation); `title_key` is the translation key
+when the component was a `Component.translatable` (the runtime keeps it on the component it
+builds). `max_stack_size` is `getMaxStackSize()` (1 to 99; `None` with a note when it could not be
+read or is out of range, and the host then keeps its own limit). `faces` is
+`getSlotsForFace(Direction)` in `Direction` order (down, up, north, south, west, east), slots
+outside the container dropped; `None` when the entity is not a `WorldlyContainer`.
 
-The client writes `"container": {slots, menu, title}` into the block declaration only when
-Horizon has that menu with that slot count (`containers::MOD_MENUS`), and the title only when
-it is not the block's own `block.<ns>.<path>` key. Horizon's side is documented in
+What is not a fact: `canPlaceItem(slot, stack)`, `canPlaceItemThroughFace(slot, stack, face)` and
+`canTakeItemThroughFace` depend on the stack, so they cannot be read once; they are reported as
+not reproduced and the declared slots take and give anything the stack permits.
+
+The client writes `"container": {slots, menu, title|title_key, max_stack_size?, faces?}` into the
+block declaration only when Horizon has that menu with that slot count (`containers::MOD_MENUS`),
+and a title only when it is not the block's own `block.<ns>.<path>` key (a `title_key` is
+preferred over the literal). `max_stack_size` and `faces` are written only when they differ from
+the host's defaults (64, every slot from every face). Horizon's side is documented in
 `workspace/horizon/docs/mods.md` (a block's `container`): the content mod's block gets the world
 class `HorizonContainerBlock` (opens its menu on use), a mod block entity of its own id that
-holds the slots, hopper and comparator access and drops on break, all through the machinery native
-mod containers use. Not run: the block entity's own code (ticking, `getMaxStackSize`, `canPlaceItem`,
-`canTakeItemThroughFace`, loot tables), and the block's `useWithoutItem` (stage C3).
+holds the slots, hopper and comparator access, drops on break, the slots each face reaches and
+the stack size its slots hold (`ModContainer::max_stack`, enforced by the menu and the hopper
+logic), all through the machinery native mod containers use. Not run: the block entity's own
+code (ticking, per-stack slot rules, loot tables).
 
 mdm (344 blocks): 130 are 27-slot `generic_9x3` containers (storage furniture; each block
-entity extends `RandomizableContainerBlockEntity`), 211 have `DecorationPlacementBlockEntity` and
-2 have `WallClockBlockEntity` (neither is a container; they stay decoration), 1
-(`furniture_part`) has no block entity.
+entity extends `RandomizableContainerBlockEntity`; `getMaxStackSize()` is 8 and every slot is
+reachable from every face), 211 have `DecorationPlacementBlockEntity` and 2 have
+`WallClockBlockEntity` (neither is a container; they stay decoration), 1 (`furniture_part`) has
+no block entity.
+
+### Using a registered block (stage C3)
+
+`FabricBridge::block_used` (from `right_click_block` in `bridge/events.rs`, after the Fabric and
+JamLib listeners pass) runs a registered block's own `useItemOn` (when the hand holds an item)
+and `useWithoutItem` through `use_builtins.rs`. It uses the same `Level` snapshot, placer and
+`UseOnContext` placement builds (`place_builtins.rs`), at the state the host's block stands in.
+Only blocks whose `overrides` name those methods run mod code. `InteractionResult.SUCCESS` and
+`FAIL` consume the click; `PASS`/`TRY_WITH_EMPTY_HAND` let the empty hand's turn run and then
+keep the host's handling. A block whose block entity is a `Container` keeps the host's container
+path for the empty hand (its `useWithoutItem` usually only calls `openMenu`, which the host does
+itself); an overridden `useItemOn` still runs, so a container that reacts to an item works.
+
+The states the mod's code set (`Level.setBlock`/`setBlockAndUpdate`) are applied through the host
+by property (`HostBridge::set_block_property`); a write that replaces the block with another one
+is reported, not applied. `RightClickBlockEvent` carries the hit point, whether the player is
+sneaking, and which hand acts (the item is the one in that hand). Budget 20M instructions per
+call; a call over 50 ms is logged.
+
+Not run: `getTicker`/`BlockEntityTicker` (a ticking block entity), neighbour updates
+(`updateShape`, `neighborChanged`), block-entity data and per-stack container rules. mdm's two
+non-container block entities (`DecorationPlacementBlockEntity`, `WallClockBlockEntity`) declare
+no fields and no methods (javap): they store nothing to save. What a wall clock draws (the level
+time) and where a decoration places itself are the mod's renderer, which the host does not run;
+those blocks stay decoration, as their declarations say.
+
+### Scheduled block ticks (stage C3, ticking)
+
+Block code can schedule its block's own tick (`Level.scheduleTick(pos, this, delay)`; a running
+sink re-schedules itself every 2 ticks while lit). The runtime records the call on its `Level`
+snapshot; `HostBridge::schedule_block_tick` hands it to the host, which keeps it per dimension and,
+when the game tick is due, runs `FabricBridge::tick_block`. That runs the block's real
+`Block.tick(state, ServerLevel, pos, RandomSource)` over the host's blocks around it, under
+`TICK_BUDGET` (2M instructions; a tick over 20 ms is logged). What the tick set, scheduled and
+sent is applied through the host: property writes, the next ticks, and
+`ServerLevel.sendParticles` bursts. At most 64 scheduled mod ticks run per game tick; the rest
+move to the next tick. A schedule whose block is no longer there is dropped.
+
+`ParticleTypes` constants are synthesized from their field names (`FALLING_WATER` is
+`minecraft:falling_water`): the runtime does not build the particle registry. `Level.getBlockEntity`
+answers null, as it would in a chunk with no block entities. The host maps the id to its own
+particle engine (`ParticleType::from_name`) and sends the burst to the players within 32 blocks
+through a `ClientboundLevelParticlesPacket`, so the window and LAN guests see it. As in vanilla,
+the client's **Particles** option gates it: at *Minimal*, a normal type such as `falling_water`
+is not drawn (only particles that override the limiter are), so a running block that draws with
+particles looks inert until the option is *All* or *Decreased*.
+
+The schedule lives in memory: it is not saved with the world, so a block that ticks itself (a
+running shower) stops when the world is reloaded. Vanilla saves its scheduled ticks.
+
+mdm's shower head is the worked example: right-click toggles `running` and schedules a tick 2 ticks
+out; each tick sends one `minecraft:falling_water` particle at each outlet and re-schedules itself;
+turning it off returns before sending. One such tick costs about 0.95 ms in release (measured
+through `FabricBridge::tick_block`, the `Level` snapshot included).
+
+### Load time (stage D): the block facts and shapes cache
+
+`FabricBridge::init` reads the facts of every registered block out of the mod's own objects
+(`collect_block_facts`), and the content root then reads every block's shapes
+(`read_block_shapes`). Neither result depends on anything but the classpath: the entrypoints
+always run, because C1 placement, C2 container reads and C3 use call the mod's code at play time
+and need the block objects, but the facts read back out of those objects are the same on every
+start with the same jars.
+
+`bridge/block_cache.rs` keys the facts on the SHA-256 of every JAR the interpreter loads (client
+jar, libraries, every mod jar), the identity (`len` and mtime) of the JDK image, the version of
+`hfc-runtime` and `BLOCK_FACTS_CACHE_VERSION`. The file is the game folder's
+`.horizon-cache/fabric-blocks/facts-<key>.json`, written atomically (`hfc_core::atomic_write`),
+and an older classpath's file is removed. A hit skips `collect_block_facts` and
+`read_block_shapes` and serves the cached blocks (shapes included); a miss reads them from the
+mod again and rewrites the file. Anything that does not read back exactly (a jar that cannot be
+hashed, a missing, damaged or differently keyed file) is a miss, never a guess.
+
+The facts a cache hit serves are pinned equal to a fresh read by
+`crates/hfc-runtime/tests/block_facts_cache.rs` (every block, state, shape and note, plus the
+jar-set miss cases). A cold start logs the facts it read and the shape progress
+(`reading the shapes of N registered block(s)`, then a line per quarter); a hit logs
+`block facts: N block(s) read from the cache`.
+
+Measured (release runtime, `fast` client build, offscreen, `horizon-ctl launch --wait`; the same
+scratch game for the cold and warm runs, a fresh one without mdm):
+
+| Start | mdm | Wall time |
+|---|---|---:|
+| Cold (first start with the jar set) | yes | 23.6 s |
+| Warm (facts and shapes cached) | yes | 8.9 s |
+| Cold, no block mod (Fabric API only) | no | 2.6 s |
+
+Inside the cold start: mdm's entrypoint 5.1 s, facts 0.6 s, shapes 13.8 s, declarations 0.15 s.
+Inside the warm start: the same entrypoint 5.1 s, facts read back from the cache in 74 ms (key
+hashing included), no shape reading, declarations 0.16 s. The export (`content mod`) and the
+declaration run once per start in these runs, not twice.
+
+What a hit cannot skip is `MdmMod.onInitialize` (~46M instructions, release ~5.1 s): it builds the
+`Block` objects the later stages run. That is the warm start's remaining gap to a game without
+the mod (8.9 s against 2.6 s). It is logged when an `onInitialize` uses over 1M instructions.

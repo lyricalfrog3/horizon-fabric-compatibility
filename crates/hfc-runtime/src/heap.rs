@@ -41,6 +41,11 @@ pub struct Heap {
     pub(crate) registered_block_items: Vec<(String, usize, usize)>,
     /// What `collect_block_facts` read from the registered blocks.
     pub(crate) block_facts: Vec<crate::bridge::RegisteredBlock>,
+    /// Whether `block_facts` carries the blocks' outline and collision shapes:
+    /// `read_block_shapes` read them for every block. Facts cached without
+    /// shapes are still valid facts, but whoever reads them must ask for the
+    /// shapes again rather than believe it has them.
+    pub(crate) block_facts_shapes: bool,
     /// The `BlockState` objects of registered blocks, by block id and state key.
     pub(crate) block_state_objects: HashMap<String, HashMap<String, Value>>,
     /// `Item.Properties` methods the runtime does not model, each logged once.
@@ -71,6 +76,7 @@ impl Heap {
             registered_blocks: Vec::new(),
             registered_block_items: Vec::new(),
             block_facts: Vec::new(),
+            block_facts_shapes: false,
             block_state_objects: HashMap::new(),
             unsupported_item_properties: Vec::new(),
             creative_tab_additions: Vec::new(),

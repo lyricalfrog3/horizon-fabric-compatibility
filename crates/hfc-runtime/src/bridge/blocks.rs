@@ -9,10 +9,12 @@
 //! Only data is exported. A block's behaviour (`useWithoutItem`, ticks, block
 //! entities) is mod bytecode the host never runs.
 
+use crate::minecraft::Level;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A block's `SoundType`, as the oracle writes it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockSound {
     pub volume: f32,
     pub pitch: f32,
@@ -25,7 +27,7 @@ pub struct BlockSound {
 }
 
 /// One block state's facts.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegisteredState {
     /// `BlockState.getDestroySpeed`.
     pub hardness: f32,
@@ -47,7 +49,7 @@ pub struct RegisteredState {
 
 /// The inventory of a block whose block entity is a vanilla container
 /// (`BaseContainerBlockEntity`), as its own methods answer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockContainer {
     /// `getContainerSize()`.
     pub slots: usize,
@@ -57,10 +59,25 @@ pub struct BlockContainer {
     /// The plain text of `getDisplayName()`: a literal, or a translation the
     /// mod's language files resolved (the key itself when they did not).
     pub title: Option<String>,
+    /// The translation key `getDisplayName()` answered, when it was a
+    /// `Component.translatable` (`block.<ns>.<path>`, `container.<name>`); the
+    /// host can translate it itself.
+    pub title_key: Option<String>,
+    /// `getMaxStackSize()`: how many of an item one slot holds. `None` when
+    /// the call could not be read (`notes` says why), in which case the host
+    /// keeps vanilla's own limit.
+    pub max_stack_size: Option<u32>,
+    /// `WorldlyContainer.getSlotsForFace`, in `Direction` order (down, up,
+    /// north, south, west, east): the slots each face reaches. `None` when the
+    /// block entity is not a `WorldlyContainer` (every slot is reachable from
+    /// every face) or the read failed.
+    pub faces: Option<[Vec<usize>; 6]>,
+    /// What could not be read, one line each. Nothing was invented for it.
+    pub notes: Vec<String>,
 }
 
 /// What reading a block's container found.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum ContainerRead {
     /// The block has no block entity (or none was asked for).
     #[default]
@@ -73,7 +90,7 @@ pub enum ContainerRead {
 }
 
 /// A block a mod registered.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegisteredBlock {
     /// `namespace:path`, from the registry key the mod registered it under.
     pub id: String,
@@ -300,6 +317,281 @@ impl super::FabricBridge {
                     .collect(),
             ),
             Err(error) => PlacedBy::Failed(error.to_string()),
+        }
+    }
+}
+
+/// A block tick a mod's code scheduled (`Level.scheduleTick`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSchedule {
+    pub pos: [i32; 3],
+    /// The registered block whose tick is due, `namespace:path`.
+    pub block: String,
+    /// In game ticks.
+    pub delay: u32,
+}
+
+/// A particle burst a mod's code asked the level to send
+/// (`ServerLevel.sendParticles`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParticleBurst {
+    /// `minecraft:falling_water`.
+    pub id: String,
+    pub at: [f64; 3],
+    pub count: u32,
+    /// The random spread of each particle from `at`.
+    pub spread: [f64; 3],
+    pub speed: f64,
+}
+
+/// What a mod's block code changed, for the host to apply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlockEffects {
+    /// The states the code set, in first-write order.
+    pub changes: Vec<BlockChange>,
+    /// The block ticks it scheduled.
+    pub schedules: Vec<BlockSchedule>,
+    /// The particles it sent.
+    pub particles: Vec<ParticleBurst>,
+}
+
+/// What using a registered block (right-click) did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BlockUse {
+    /// The block overrides neither use method (or is not a mod's block): the
+    /// host handles the click as it would anyway.
+    NotOverridden,
+    /// The block's code passed the click on (`InteractionResult.PASS`).
+    Passed,
+    /// The block consumed the click: what its code changed, scheduled and
+    /// sent, for the host to apply.
+    Handled(BlockEffects),
+    /// The block's code could not be run to an answer; nothing was invented.
+    Failed(String),
+}
+
+impl super::FabricBridge {
+    /// Run the registered block's own `useItemOn`/`useWithoutItem` for the
+    /// click `event`, over the host's blocks around it, at the state the host
+    /// has the block in. A block whose block entity is a container keeps the
+    /// host's container path for an empty or non-acting hand (its
+    /// `useWithoutItem` is usually just `openMenu`, which the host does
+    /// itself); an overridden `useItemOn` still runs, so a container that
+    /// reacts to an item works.
+    pub fn block_used(
+        &mut self,
+        host: &dyn super::HostBridge,
+        event: &super::RightClickBlockEvent,
+    ) -> BlockUse {
+        let block_id = host.block(event.pos);
+        let Some(fact) = self
+            .interp
+            .heap
+            .block_facts
+            .iter()
+            .find(|b| b.id == block_id)
+        else {
+            return BlockUse::NotOverridden;
+        };
+        let mut use_item = fact.overrides.iter().any(|o| o.ends_with(".useItemOn"));
+        let mut use_without_item = fact
+            .overrides
+            .iter()
+            .any(|o| o.ends_with(".useWithoutItem"));
+        if !use_item && !use_without_item {
+            return BlockUse::NotOverridden;
+        }
+        if matches!(fact.container, ContainerRead::Container(_)) {
+            use_without_item = false;
+            if !use_item {
+                return BlockUse::NotOverridden;
+            }
+        }
+        let request = super::PlacementRequest {
+            block: block_id.clone(),
+            pos: event.pos,
+            hit_pos: event.pos,
+            face: event.face,
+            hit: event.hit,
+            inside: false,
+            yaw: 0.0,
+            pitch: 0.0,
+            player_pos: [0.0; 3],
+            sneaking: event.sneaking,
+            off_hand: event.off_hand,
+            item: if event.off_hand {
+                host.off_hand_item()
+            } else {
+                host.held_item()
+            }
+            .unwrap_or_default(),
+            replace_clicked: false,
+        };
+        // An empty hand has nothing for `useItemOn` to do.
+        if use_item && (request.item.is_empty() || request.item == "minecraft:air") {
+            use_item = false;
+            if !use_without_item {
+                return BlockUse::NotOverridden;
+            }
+        }
+        let started = std::time::Instant::now();
+        let world = world_around(host, event.pos);
+        let previous = self.interp.step_budget;
+        self.interp.step_budget = Some(crate::place_builtins::PLACEMENT_BUDGET);
+        let result = self
+            .interp
+            .block_used(&request, &world, use_item, use_without_item);
+        let used = crate::place_builtins::PLACEMENT_BUDGET - self.interp.step_budget.unwrap_or(0);
+        self.interp.step_budget = previous;
+        let took = started.elapsed();
+        if took.as_millis() > 50 {
+            log::warn!(
+                "use of {} took {took:?} ({used} instructions)",
+                request.block
+            );
+        }
+        match result {
+            Ok(None) => BlockUse::Passed,
+            Ok(Some(level)) => match self.effects_of(level) {
+                Ok(effects) => BlockUse::Handled(effects),
+                Err(error) => BlockUse::Failed(error.to_string()),
+            },
+            Err(error) => BlockUse::Failed(error.to_string()),
+        }
+    }
+
+    /// Run the registered block's own `tick` at `pos` (`Level.scheduleTick`
+    /// made it due), over the host's blocks around it, at the state the host
+    /// has it in. `None` when the block overrides no tick or is gone.
+    pub fn tick_block(
+        &mut self,
+        host: &dyn super::HostBridge,
+        pos: [i32; 3],
+        block_id: &str,
+    ) -> Option<BlockEffects> {
+        let fact = self
+            .interp
+            .heap
+            .block_facts
+            .iter()
+            .find(|b| b.id == block_id)?;
+        if !fact.overrides.iter().any(|o| o.ends_with(".tick")) {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let world = world_around(host, pos);
+        let previous = self.interp.step_budget;
+        self.interp.step_budget = Some(crate::place_builtins::TICK_BUDGET);
+        let result = self.interp.block_tick(block_id, pos, &world);
+        let used = crate::place_builtins::TICK_BUDGET - self.interp.step_budget.unwrap_or(0);
+        self.interp.step_budget = previous;
+        let took = started.elapsed();
+        if took.as_millis() > 20 {
+            log::warn!("tick of {block_id} took {took:?} ({used} instructions)");
+        }
+        match result {
+            Ok(level) => self.effects_of(level).ok(),
+            Err(error) => {
+                log::warn!("Fabric: {block_id}'s tick failed: {error}");
+                None
+            }
+        }
+    }
+
+    /// The changes, block ticks and particles a level a mod's code wrote is
+    /// holding, drained.
+    fn effects_of(&mut self, level: usize) -> hfc_core::Result<BlockEffects> {
+        let (particles, scheduled) = match self.interp.heap.get_native_mut::<Level>(level) {
+            Some(level) => (
+                std::mem::take(&mut level.particles),
+                std::mem::take(&mut level.scheduled),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        let schedules = scheduled
+            .into_iter()
+            .filter_map(|(pos, object, delay)| {
+                let block = self
+                    .interp
+                    .heap
+                    .registered_blocks
+                    .iter()
+                    .find(|b| b.object == object)?
+                    .id
+                    .clone();
+                Some(BlockSchedule {
+                    pos,
+                    block,
+                    delay: delay.max(1) as u32,
+                })
+            })
+            .collect();
+        let particles = particles
+            .into_iter()
+            .filter(|call| call.count > 0)
+            .map(|call| ParticleBurst {
+                id: call.id,
+                at: call.at,
+                count: call.count as u32,
+                spread: call.spread,
+                speed: call.speed,
+            })
+            .collect();
+        let changes = self
+            .interp
+            .level_writes(level)?
+            .into_iter()
+            .map(|(pos, block, key)| BlockChange {
+                pos,
+                block,
+                properties: crate::place_builtins::parse_state_key(&key),
+            })
+            .collect();
+        Ok(BlockEffects {
+            changes,
+            schedules,
+            particles,
+        })
+    }
+
+    /// Apply the effects of a mod block's code through the host: property
+    /// writes (a write that replaces the block with another is reported), the
+    /// block ticks it scheduled, and the particles it sent.
+    pub fn apply_block_effects(&self, host: &mut dyn super::HostBridge, effects: &BlockEffects) {
+        for change in &effects.changes {
+            if host.block(change.pos) != change.block {
+                log::warn!(
+                    "Fabric: block code set {:?} to {}, which a click cannot do here",
+                    change.pos,
+                    change.block
+                );
+                continue;
+            }
+            for (key, value) in &change.properties {
+                // The state the mod wrote carries every property, not only
+                // the ones it changed.
+                if host.block_property(change.pos, key).as_deref() == Some(value.as_str()) {
+                    continue;
+                }
+                if !host.set_block_property(change.pos, key, value) {
+                    log::warn!(
+                        "Fabric: block code set {:?}.{key} to {value}, which the host refused",
+                        change.pos
+                    );
+                }
+            }
+        }
+        for schedule in &effects.schedules {
+            host.schedule_block_tick(schedule.pos, &schedule.block, schedule.delay);
+        }
+        for particle in &effects.particles {
+            host.particle(
+                &particle.id,
+                particle.at,
+                particle.count,
+                particle.spread,
+                particle.speed,
+            );
         }
     }
 }

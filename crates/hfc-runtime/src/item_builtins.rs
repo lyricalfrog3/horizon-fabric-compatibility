@@ -346,10 +346,14 @@ impl Interpreter {
         // A `BlockItem` places a block; the block's facts name its item.
         self.note_block_item(&id, value.as_obj()?);
         if let Some(vanilla) = self.vanilla_item_class(&class) {
-            log::warn!(
-                "item {id} extends {vanilla}, whose behaviour the host cannot take from data; \
-                 it is not exported"
-            );
+            // A `BlockItem` is exported through its block's declaration, which
+            // names it as the block's item.
+            if !self.class_is_assignable_to(&class, "net/minecraft/world/item/BlockItem") {
+                log::warn!(
+                    "item {id} extends {vanilla}, whose behaviour the host cannot take from data; \
+                     it is not exported"
+                );
+            }
             return Some(value.clone());
         }
         if self.heap.registered_items.iter().any(|item| item.id == id) {

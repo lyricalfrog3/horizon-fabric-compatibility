@@ -88,6 +88,18 @@ impl ClassLoader {
         !self.jimages.is_empty()
     }
 
+    /// The JAR files registered with the loader, in registration order. Their
+    /// bytes are what the interpreter loads classes from, so anything cached
+    /// per "classpath" is keyed by their hashes.
+    pub fn jar_paths(&self) -> Vec<&Path> {
+        self.jars.iter().map(|jar| jar.path.as_path()).collect()
+    }
+
+    /// The JDK images registered with the loader, in registration order.
+    pub fn jimage_paths(&self) -> Vec<&Path> {
+        self.jimages.iter().map(|image| image.path()).collect()
+    }
+
     /// Register a JAR file to search for classes and index its contents (including nested JARs).
     pub fn add_jar(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();

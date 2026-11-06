@@ -1172,6 +1172,17 @@ fn push_gui_draw(heap: &mut Heap, graphics: usize, draw: GuiDraw) {
     }
 }
 
+/// Whether an `InteractionHand` value is `OFF_HAND`, as the runtime's
+/// constants carry their name.
+fn interaction_hand_is_off(heap: &Heap, hand: &Value) -> Option<bool> {
+    let id = hand.as_obj()?;
+    let JavaObject::Instance { fields, .. } = heap.get(id)? else {
+        return None;
+    };
+    let name = fields.get("name")?.as_obj()?;
+    Some(heap.get_string(name)? == "OFF_HAND")
+}
+
 /// Where one `ServerLevel.sendParticles` overload keeps the arguments the
 /// runtime reads: `[receiver, ...]` positions of the particle type, the
 /// first coordinate (x; y and z follow), the count, the first spread (dx; dy
@@ -6327,15 +6338,54 @@ pub fn dispatch_builtin(
         } else if method_name == "getAttribute" {
             // No attribute system: a mod's modifier calls are no-ops.
             return BuiltinResult::Handled(Value::NULL);
-        } else if method_name == "getMainHandItem" {
-            let held = args
+        } else if method_name == "getMainHandItem" || method_name == "getItemInHand" {
+            // The acting hand answers the object the use methods got, so a
+            // change the mod makes there is visible afterwards. The other
+            // hand is not modelled and reads empty.
+            let (acting_off, hand_stack, hand_item) = match args
                 .first()
                 .and_then(|v| v.as_obj())
                 .and_then(|id| heap.get_native::<Player>(id))
-                .and_then(|p| p.hand_item.clone())
-                .unwrap_or_else(ItemStack::empty);
-            let stack_id = heap.alloc_item_stack(held);
-            return BuiltinResult::Handled(Value::Object(Some(stack_id)));
+            {
+                Some(player) => (
+                    player.hand_is_off,
+                    player.hand_stack,
+                    player.hand_item.clone(),
+                ),
+                None => (false, None, None),
+            };
+            let requested_off = if method_name == "getItemInHand" {
+                args.get(1)
+                    .and_then(|hand| interaction_hand_is_off(heap, hand))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            let value = match hand_stack {
+                Some(stack) if acting_off == requested_off => Value::Object(Some(stack)),
+                Some(_) => Value::Object(Some(heap.alloc_item_stack(ItemStack::empty()))),
+                None => Value::Object(Some(
+                    heap.alloc_item_stack(hand_item.unwrap_or_else(ItemStack::empty)),
+                )),
+            };
+            return BuiltinResult::Handled(value);
+        } else if method_name == "setItemInHand" && args.len() >= 3 {
+            // The host cannot apply a hand-item replacement yet (stage 1): the
+            // bridge refuses the use when it sees one.
+            if let Some(id) = args[0].as_obj() {
+                let stack = args[2].as_obj();
+                let requested_off = args
+                    .get(1)
+                    .and_then(|hand| interaction_hand_is_off(heap, hand))
+                    .unwrap_or(false);
+                if let Some(player) = heap.get_native_mut::<Player>(id) {
+                    player.hand_replaced = Some(stack);
+                    if player.hand_is_off == requested_off {
+                        player.hand_stack = stack;
+                    }
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "isSpectator" || method_name == "isCrouching" {
             let crouching = method_name == "isCrouching"
                 && args
@@ -6344,15 +6394,6 @@ pub fn dispatch_builtin(
                     .and_then(|id| heap.get_native::<Player>(id))
                     .is_some_and(|p| p.is_crouching);
             return BuiltinResult::Handled(Value::from_bool(crouching));
-        } else if method_name == "getItemInHand" {
-            let held = args
-                .first()
-                .and_then(|v| v.as_obj())
-                .and_then(|id| heap.get_native::<Player>(id))
-                .and_then(|p| p.hand_item.clone())
-                .unwrap_or_else(ItemStack::empty);
-            let stack_id = heap.alloc_item_stack(held);
-            return BuiltinResult::Handled(Value::Object(Some(stack_id)));
         } else if method_name == "level" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(p) = heap.get_native::<Player>(id) {
@@ -6589,6 +6630,44 @@ pub fn dispatch_builtin(
             if let Some(id) = args[0].as_obj() {
                 if let Some(stack) = heap.get_native_mut::<ItemStack>(id) {
                     stack.count = new_count;
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if (method_name == "shrink" || method_name == "grow") && args.len() >= 2 {
+            let amount = args[1].as_int();
+            if let Some(id) = args[0].as_obj() {
+                if let Some(stack) = heap.get_native_mut::<ItemStack>(id) {
+                    stack.count = if method_name == "shrink" {
+                        (stack.count - amount).max(0)
+                    } else {
+                        stack.count.saturating_add(amount)
+                    };
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "consume" && args.len() >= 3 {
+            // `ItemStack.consume(int, LivingEntity)`: creative mode is not
+            // modelled, so it shrinks like the survival path.
+            let amount = args[1].as_int().max(0);
+            if let Some(id) = args[0].as_obj() {
+                if let Some(stack) = heap.get_native_mut::<ItemStack>(id) {
+                    stack.count = (stack.count - amount).max(0);
+                }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "split" && args.len() >= 2 {
+            let amount = args[1].as_int().max(0);
+            if let Some(id) = args[0].as_obj() {
+                let split = heap.get_native_mut::<ItemStack>(id).map(|stack| {
+                    let take = amount.min(stack.count);
+                    let mut split = stack.clone();
+                    split.count = take;
+                    stack.count -= take;
+                    split
+                });
+                if let Some(split) = split {
+                    let split_id = heap.alloc_item_stack(split);
+                    return BuiltinResult::Handled(Value::Object(Some(split_id)));
                 }
             }
             return BuiltinResult::Handled(Value::NULL);

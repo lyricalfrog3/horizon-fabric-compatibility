@@ -241,6 +241,9 @@ pub struct FabricBridge {
     /// The block facts read from the mod's blocks, and the classpath key they
     /// belong to (`bridge/block_cache.rs`).
     block_facts_cache: block_cache::BlockFactsCache,
+    /// Block ids whose use was already reported as changing the held item, so
+    /// a click on one does not flood the log.
+    hand_change_logged: std::collections::HashSet<String>,
 }
 
 pub(crate) type HoveredTooltipKey = (String, Vec<(String, u32)>);
@@ -305,6 +308,7 @@ impl FabricBridge {
             last_render_tick: None,
             hovered_tooltip: None,
             block_facts_cache: block_cache::BlockFactsCache::new(None),
+            hand_change_logged: std::collections::HashSet::new(),
         }
     }
 
@@ -351,6 +355,7 @@ impl FabricBridge {
             last_render_tick: None,
             hovered_tooltip: None,
             block_facts_cache: block_cache::BlockFactsCache::new(None),
+            hand_change_logged: std::collections::HashSet::new(),
         }
     }
 

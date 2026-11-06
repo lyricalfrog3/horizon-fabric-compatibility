@@ -312,8 +312,12 @@ impl Interpreter {
             stack = ItemStack::empty();
         }
         player.hand_item = Some(stack.clone());
-        let player_id = self.heap.alloc_player(player);
         let stack_id = self.heap.alloc_item_stack(stack);
+        // One object for the acting hand: `getItemInHand` and the use methods
+        // see the same stack, so a change the mod makes is readable.
+        player.hand_stack = Some(stack_id);
+        player.hand_is_off = request.off_hand;
+        let player_id = self.heap.alloc_player(player);
 
         // The click.
         let face = Direction::from_array(request.face);

@@ -682,6 +682,15 @@ pub struct Player {
     /// `Entity.getDirection()`: the real `Direction` constant, set by the
     /// bridge when it knows the player's rotation.
     pub direction: Option<Value>,
+    /// The heap id of the acting hand's stack, when the bridge built one:
+    /// `getItemInHand` hands the mod the same object the use methods got, so
+    /// a change it makes can be seen.
+    pub hand_stack: Option<usize>,
+    /// The acting hand is the off hand.
+    pub hand_is_off: bool,
+    /// `setItemInHand` put another stack (or none, `Some(None)`) in the
+    /// acting hand.
+    pub hand_replaced: Option<Option<usize>>,
 }
 
 impl Player {
@@ -699,6 +708,9 @@ impl Player {
             pitch: 0.0,
             position: [0.0; 3],
             direction: None,
+            hand_stack: None,
+            hand_is_off: false,
+            hand_replaced: None,
         }
     }
 }

@@ -661,7 +661,15 @@ impl FabricBridge {
         match self.block_used(host, event) {
             BlockUse::NotOverridden | BlockUse::Passed => {}
             BlockUse::Failed(error) => {
-                log::warn!("Fabric: {block_id}'s use failed: {error}");
+                // A use that changed the held item is refused on every click;
+                // say it once per block, not ten times a second.
+                if error.contains("changed the held item")
+                    && !self.hand_change_logged.insert(block_id.clone())
+                {
+                    log::debug!("Fabric: {error}");
+                } else {
+                    log::warn!("Fabric: {block_id}'s use failed: {error}");
+                }
             }
             BlockUse::Handled(effects) => {
                 self.apply_block_effects(host, &effects);

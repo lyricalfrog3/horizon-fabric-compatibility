@@ -15,7 +15,7 @@ use std::path::Path;
 pub use crate::place_builtins::PlacementRequest;
 pub use blocks::{
     BlockChange, BlockContainer, BlockEffects, BlockSchedule, BlockSound, BlockUse, ContainerRead,
-    ParticleBurst, PlacedBy, Placement, RegisteredBlock, RegisteredState,
+    ItemDrop, ParticleBurst, PlacedBy, Placement, RegisteredBlock, RegisteredState,
 };
 pub use items::{CreativeTabAddition, RegisteredItem, TabPlacement};
 

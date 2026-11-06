@@ -344,6 +344,14 @@ pub struct ParticleBurst {
     pub speed: f64,
 }
 
+/// An item a mod's block code dropped (`Level.popResource`, `dropStacks`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemDrop {
+    pub pos: [i32; 3],
+    pub item: String,
+    pub count: u32,
+}
+
 /// What a mod's block code changed, for the host to apply.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BlockEffects {
@@ -353,6 +361,8 @@ pub struct BlockEffects {
     pub schedules: Vec<BlockSchedule>,
     /// The particles it sent.
     pub particles: Vec<ParticleBurst>,
+    /// The items it dropped.
+    pub drops: Vec<ItemDrop>,
 }
 
 /// What using a registered block (right-click) did.
@@ -503,12 +513,14 @@ impl super::FabricBridge {
     /// The changes, block ticks and particles a level a mod's code wrote is
     /// holding, drained.
     fn effects_of(&mut self, level: usize) -> hfc_core::Result<BlockEffects> {
-        let (particles, scheduled) = match self.interp.heap.get_native_mut::<Level>(level) {
+        let (particles, scheduled, dropped) = match self.interp.heap.get_native_mut::<Level>(level)
+        {
             Some(level) => (
                 std::mem::take(&mut level.particles),
                 std::mem::take(&mut level.scheduled),
+                std::mem::take(&mut level.dropped_stacks),
             ),
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
         let schedules = scheduled
             .into_iter()
@@ -549,10 +561,20 @@ impl super::FabricBridge {
                 properties: crate::place_builtins::parse_state_key(&key),
             })
             .collect();
+        let drops = dropped
+            .into_iter()
+            .filter(|(_, item, count)| *count > 0 && !item.is_empty() && item != "minecraft:air")
+            .map(|(pos, item, count)| ItemDrop {
+                pos: [pos.x, pos.y, pos.z],
+                item,
+                count: count as u32,
+            })
+            .collect();
         Ok(BlockEffects {
             changes,
             schedules,
             particles,
+            drops,
         })
     }
 
@@ -583,6 +605,9 @@ impl super::FabricBridge {
                 }
             }
         }
+        for drop in &effects.drops {
+            host.drop_item(drop.pos, &drop.item, drop.count);
+        }
         for schedule in &effects.schedules {
             host.schedule_block_tick(schedule.pos, &schedule.block, schedule.delay);
         }
@@ -610,7 +635,8 @@ fn use_suppressed(sneaking: bool, main: Option<&str>, off: Option<&str>) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::use_suppressed;
+    use super::{ItemDrop, use_suppressed};
+    use crate::minecraft::{BlockPos, Level};
 
     #[test]
     fn sneaking_with_an_item_in_either_hand_suppresses_the_blocks_use() {
@@ -628,5 +654,36 @@ mod tests {
         assert!(!use_suppressed(true, None, Some("minecraft:air")));
         // Not sneaking never suppresses.
         assert!(!use_suppressed(false, Some("minecraft:stone"), None));
+    }
+
+    /// `popResource`/`dropStacks` record into the level; the bridge must drain
+    /// them for the host, and skip what no stack can hold.
+    #[test]
+    fn the_drops_a_level_holds_are_drained_for_the_host() {
+        let mut bridge = super::super::FabricBridge::new();
+        let mut level = Level::new(false);
+        let at = |y| BlockPos { x: 1, y, z: 3 };
+        level
+            .dropped_stacks
+            .push((at(2), "minecraft:wheat".into(), 2));
+        // Air and an empty count are not items a host can give.
+        level
+            .dropped_stacks
+            .push((at(1), "minecraft:air".into(), 3));
+        level
+            .dropped_stacks
+            .push((at(3), "minecraft:wheat_seeds".into(), 0));
+        let level_id = bridge.interp.heap.alloc_level(level);
+        let effects = bridge.effects_of(level_id).unwrap();
+        assert_eq!(
+            effects.drops,
+            [ItemDrop {
+                pos: [1, 2, 3],
+                item: "minecraft:wheat".into(),
+                count: 2,
+            }]
+        );
+        // Drained, not left for the next call to apply twice.
+        assert!(bridge.effects_of(level_id).unwrap().drops.is_empty());
     }
 }

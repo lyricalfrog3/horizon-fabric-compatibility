@@ -20,7 +20,7 @@
 
 # --- Strings --------------------------------------------------------------
 "Strings.concat" = "string concatenation prints a char as its numeric value and a boolean as 1/0; the recipe's argument types are ignored"
-"Strings.intern" = "String.intern is missing and String.equals on equal text answers false"
+"Strings.intern" = "every string the runtime allocates is interned, so new String(\"hello\") == \"hello\" answers true where a JVM says false"
 "Strings.code_points" = "non-ASCII constant-pool text is decoded wrongly (String.length of 3 chars answers 6)"
 "Strings.compares" = "String.repeat is missing and String.strip does not remove whitespace"
 

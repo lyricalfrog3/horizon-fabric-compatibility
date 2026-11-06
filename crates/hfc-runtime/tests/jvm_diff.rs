@@ -47,6 +47,9 @@ struct Cases {
     classes: PathBuf,
     jar: PathBuf,
     names: Vec<String>,
+    /// The directory the JVM harness runs in and the interpreter's file system
+    /// root: a case that touches files sees the same paths on both sides.
+    dir: PathBuf,
 }
 
 impl Cases {
@@ -133,12 +136,14 @@ impl Cases {
             classes,
             jar,
             names,
+            dir: dir.to_path_buf(),
         })
     }
 
     /// The JVM's `=== <class>` sections.
     fn run_jvm(&self, java: &Path) -> Result<std::collections::BTreeMap<String, String>, String> {
         let output = Command::new(java)
+            .current_dir(&self.dir)
             .arg("-cp")
             .arg(&self.classes)
             .arg("hfc.Harness")
@@ -273,6 +278,9 @@ fn the_interpreter_matches_the_jvm_on_the_cases() {
             .get(name)
             .unwrap_or_else(|| panic!("the JVM harness printed no section for {name}"));
         let mut bridge = FabricBridge::new();
+        // The same directory the JVM harness runs in, so `user.dir`, relative
+        // paths and canonical paths agree on both sides.
+        bridge.interp.heap.fs.set_root(Some(cases.dir.clone()));
         bridge
             .add_jimage(&image)
             .unwrap_or_else(|e| panic!("{}: {e}", image.display()));

@@ -544,9 +544,23 @@ impl Interpreter {
         virtual_dispatch: bool,
     ) -> Result<Value> {
         if self.call_depth > 100 {
+            let stack = if self.trace_calls {
+                let from = self.call_stack.len().saturating_sub(12);
+                format!(
+                    "; stack: {}",
+                    self.call_stack[from..]
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" <- ")
+                )
+            } else {
+                String::new()
+            };
             return Err(Error::new(
                 "interpreter",
-                format!("call stack overflow at {class_name}.{method_name}{descriptor}"),
+                format!("call stack overflow at {class_name}.{method_name}{descriptor}{stack}"),
             ));
         }
         self.call_depth += 1;
@@ -930,6 +944,29 @@ impl Interpreter {
                 "()Lkotlinx/coroutines/CoroutineDispatcher;",
                 &[],
             );
+        }
+
+        // The interpreter has no Java stack frames, and a JVM is allowed to
+        // report none: `walk`'s function receives an empty stream, `forEach`
+        // runs nothing and `getCallerClass` answers null. Log4j's
+        // `StackLocator` and anything else that only wants "who called me"
+        // then completes instead of reading a null the native walk left.
+        if class_name == "java/lang/StackWalker" && !args.is_empty() {
+            match method_name {
+                "walk" if args.len() >= 2 => {
+                    let stream =
+                        Value::Object(Some(self.heap.alloc(JavaObject::Stream(Vec::new()))));
+                    return self.execute_method(
+                        "java/util/function/Function",
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[args[1].clone(), stream],
+                    );
+                }
+                "forEach" if args.len() >= 2 => return Ok(Value::NULL),
+                "getCallerClass" => return Ok(Value::NULL),
+                _ => {}
+            }
         }
 
         // Optional combinators run a modifier's own lambda. A heap builtin

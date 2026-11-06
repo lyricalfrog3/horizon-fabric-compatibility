@@ -203,6 +203,35 @@ pub fn numeric_method(
             }
             _ => None,
         },
+        "java/lang/Float" => match method_name {
+            "parseFloat" | "valueOf"
+                if args.first().is_some_and(|v| string_of(heap, v).is_some()) =>
+            {
+                let text = string_of(heap, &args[0])?;
+                handled(Value::Float(text.trim().parse().unwrap_or(0.0)))
+            }
+            "compare" => handled(Value::Int(
+                args.first()?
+                    .as_float()
+                    .partial_cmp(&args.get(1)?.as_float())
+                    .map_or(0, |o| o as i32),
+            )),
+            "isNaN" if descriptor.starts_with("(F)") => {
+                handled(Value::from_bool(args.first()?.as_float().is_nan()))
+            }
+            "floatToRawIntBits" => handled(Value::Int(args.first()?.as_float().to_bits() as i32)),
+            // `floatToIntBits` collapses every NaN to the one canonical NaN.
+            "floatToIntBits" => {
+                let bits = args.first()?.as_float().to_bits();
+                handled(Value::Int(if f32::from_bits(bits).is_nan() {
+                    0x7fc0_0000
+                } else {
+                    bits as i32
+                }))
+            }
+            "intBitsToFloat" => handled(Value::Float(f32::from_bits(int(0)? as u32))),
+            _ => None,
+        },
         "java/lang/Double" => match method_name {
             "parseDouble" | "valueOf"
                 if args.first().is_some_and(|v| string_of(heap, v).is_some()) =>

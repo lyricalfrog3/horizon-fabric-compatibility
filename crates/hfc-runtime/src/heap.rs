@@ -1,7 +1,7 @@
 //! Heap memory storage for JVM objects.
 
 use crate::value::{JavaObject, NativeObject, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The heap storing all allocated Java objects.
 #[derive(Default, Debug)]
@@ -33,6 +33,11 @@ pub struct Heap {
     /// The text `ClipboardManager.getClipboard` answers: the last text a mod
     /// copied, or what the host put there.
     pub clipboard: String,
+    /// The system properties `System.getProperty`/`System.getProperties` answer,
+    /// with the values a JVM of this version reports. `user.dir` and
+    /// `java.io.tmpdir` depend on the game directory and are filled in when
+    /// they are asked for.
+    pub properties: BTreeMap<String, String>,
     /// Items mods registered in `BuiltInRegistries.ITEM`, in registration order.
     pub(crate) registered_items: Vec<crate::item_builtins::RegisteredRecord>,
     /// Blocks mods registered in `BuiltInRegistries.BLOCK`, in registration order.
@@ -69,6 +74,40 @@ pub struct Heap {
     escaped: bool,
 }
 
+/// The system properties that do not depend on where the game folder is.
+fn default_properties() -> BTreeMap<String, String> {
+    let mut properties = BTreeMap::new();
+    for (key, value) in [
+        ("java.version", "25"),
+        ("java.specification.version", "25"),
+        ("java.class.version", "69.0"),
+        ("java.vendor", "Horizon Fabric Runtime"),
+        ("java.vm.name", "Horizon Fabric Runtime"),
+        ("java.vm.vendor", "Horizon Fabric Runtime"),
+        ("java.vm.version", "25"),
+        ("os.name", "Linux"),
+        ("os.arch", std::env::consts::ARCH),
+        ("file.separator", "/"),
+        ("path.separator", ":"),
+        ("line.separator", "\n"),
+        ("file.encoding", "UTF-8"),
+        ("sun.jnu.encoding", "UTF-8"),
+        ("native.encoding", "UTF-8"),
+        // The interpreter has no `sun.misc.Unsafe`, so JOML must take its
+        // plain-field matrix copies rather than raw memory ones.
+        ("joml.nounsafe", "true"),
+    ] {
+        properties.insert(key.to_string(), value.to_string());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        properties.insert("user.home".to_string(), home);
+    }
+    if let Ok(name) = std::env::var("USER") {
+        properties.insert("user.name".to_string(), name);
+    }
+    properties
+}
+
 impl Heap {
     pub fn new() -> Self {
         Self {
@@ -81,6 +120,7 @@ impl Heap {
             textures: HashMap::new(),
             gui_texture_sizes: HashMap::new(),
             fs: crate::vfs::Vfs::default(),
+            properties: default_properties(),
             identifiers: HashMap::new(),
             registries: crate::registry::Registries::default(),
             host_requests: Vec::new(),

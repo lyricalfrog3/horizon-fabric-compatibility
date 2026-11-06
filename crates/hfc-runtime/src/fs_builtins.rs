@@ -94,7 +94,7 @@ fn is_append(heap: &Heap, value: &Value) -> bool {
     }
 }
 
-fn game_dir(heap: &Heap) -> String {
+pub(crate) fn game_dir(heap: &Heap) -> String {
     heap.fs
         .root()
         .map(|p| p.to_string_lossy().to_string())
@@ -112,6 +112,150 @@ pub fn loader_dir(heap: &mut Heap, method_name: &str) -> Option<Value> {
     Some(alloc_path(heap, &path))
 }
 
+/// The path of a `File` argument (its `path` field), or of a plain string.
+fn file_path(heap: &Heap, value: &Value) -> Option<String> {
+    let id = value.as_obj()?;
+    if let Some(text) = heap.get_string(id) {
+        return Some(text.to_string());
+    }
+    match heap.get(id)? {
+        JavaObject::Instance { fields, .. } => string_of(heap, fields.get("path")?),
+        _ => None,
+    }
+}
+
+/// `java.io.FileSystem` / `java.io.UnixFileSystem` natives, backed by the VFS.
+///
+/// `java.io.File` is real JDK bytecode: it builds its paths, resolves relative
+/// ones against `user.dir` and throws its own exceptions. These are the few
+/// calls it makes that only a JVM native can answer, so what a mod sees is the
+/// JDK's own behaviour over the runtime's file system boundary.
+fn unix_file_system(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    if !matches!(class_name, "java/io/FileSystem" | "java/io/UnixFileSystem") {
+        return None;
+    }
+    let handled = |v: Value| Some(BuiltinResult::Handled(v));
+    // `java.io.File` hands the natives a path as the mod wrote it, and a JVM
+    // resolves a relative one against the process's working directory: here
+    // that is the game folder, which is also the sandbox's root.
+    let path = |index: usize| {
+        args.get(index)
+            .and_then(|v| file_path(heap, v))
+            .map(|path| {
+                if path.starts_with('/') {
+                    path
+                } else {
+                    vfs::join(&game_dir(heap), &path)
+                }
+            })
+    };
+    match method_name {
+        // The constructor's `static { initIDs(); }`; nothing to register here.
+        "initIDs" | "registerNatives" => handled(Value::NULL),
+        "canonicalize0" | "canonicalize" => {
+            let path = path(1)?;
+            let sid = heap.alloc_string(heap.fs.canonicalize(&path));
+            handled(Value::Object(Some(sid)))
+        }
+        "getBooleanAttributes0" | "getBooleanAttributes" => {
+            let Some(meta) = path(1).and_then(|path| heap.fs.metadata(&path)) else {
+                return handled(Value::Int(0));
+            };
+            let mut bits = 1; // BA_EXISTS
+            if meta.is_file {
+                bits |= 2; // BA_REGULAR
+            }
+            if meta.is_dir {
+                bits |= 4; // BA_DIRECTORY
+            }
+            if meta.hidden {
+                bits |= 8; // BA_HIDDEN
+            }
+            handled(Value::Int(bits))
+        }
+        "checkAccess0" | "checkAccess" => {
+            let path = path(1)?;
+            let access = args.get(2).map(Value::as_int).unwrap_or(4);
+            handled(Value::from_bool(heap.fs.check_access(&path, access)))
+        }
+        "getLastModifiedTime0" | "getLastModifiedTime" => {
+            let millis = path(1)
+                .and_then(|path| heap.fs.metadata(&path))
+                .map_or(0, |meta| meta.modified_ms);
+            handled(Value::Long(millis))
+        }
+        "getLength0" | "getLength" => {
+            let len = path(1)
+                .and_then(|path| heap.fs.metadata(&path))
+                .map_or(0, |meta| if meta.is_file { meta.len } else { 0 });
+            handled(Value::Long(len as i64))
+        }
+        "setPermission0" | "setPermission" => {
+            let path = path(1)?;
+            let access = args.get(2).map(Value::as_int).unwrap_or(0);
+            let enable = args.get(3).is_some_and(Value::as_bool);
+            let owner_only = args.get(4).is_some_and(Value::as_bool);
+            handled(Value::from_bool(
+                heap.fs.set_permission(&path, access, enable, owner_only),
+            ))
+        }
+        "createFileExclusively0" | "createFileExclusively" => {
+            let path = path(1)?;
+            handled(Value::from_bool(heap.fs.create_file_exclusive(&path)))
+        }
+        "delete0" | "delete" => {
+            let path = path(1)?;
+            handled(Value::from_bool(heap.fs.delete(&path)))
+        }
+        "createDirectory0" | "createDirectory" => {
+            let path = path(1)?;
+            handled(Value::from_bool(heap.fs.create_dir(&path)))
+        }
+        "rename0" | "rename" => {
+            let (Some(from), Some(to)) = (path(1), path(2)) else {
+                return handled(Value::from_bool(false));
+            };
+            handled(Value::from_bool(heap.fs.rename(&from, &to)))
+        }
+        "setLastModifiedTime0" | "setLastModifiedTime" => {
+            let path = path(1)?;
+            let millis = args.get(2).map(Value::as_long).unwrap_or(0);
+            handled(Value::from_bool(heap.fs.set_last_modified(&path, millis)))
+        }
+        "setReadOnly0" | "setReadOnly" => {
+            let path = path(1)?;
+            handled(Value::from_bool(heap.fs.set_read_only(&path)))
+        }
+        // A directory entry cannot be longer than the file system allows.
+        "getNameMax0" | "getNameMax" => handled(Value::Int(255)),
+        "list0" | "list" => {
+            let Some(path) = path(1) else {
+                return handled(Value::NULL);
+            };
+            if !heap.fs.is_dir(&path) {
+                return handled(Value::NULL);
+            }
+            let names: Vec<Value> = heap
+                .fs
+                .list(&path)
+                .into_iter()
+                .map(|name| Value::Object(Some(heap.alloc_string(name))))
+                .collect();
+            let id = heap.alloc(JavaObject::Array {
+                elem_type: "java/lang/String".into(),
+                elements: names,
+            });
+            handled(Value::Object(Some(id)))
+        }
+        _ => None,
+    }
+}
+
 pub fn file_system_method(
     heap: &mut Heap,
     class_name: &str,
@@ -119,6 +263,10 @@ pub fn file_system_method(
     args: &[Value],
 ) -> Option<BuiltinResult> {
     let handled = |v: Value| Some(BuiltinResult::Handled(v));
+
+    if let Some(result) = unix_file_system(heap, class_name, method_name, args) {
+        return Some(result);
+    }
 
     // Open streams first: they are not Path or Files calls.
     if let Some(id) = args.first().and_then(|v| v.as_obj()) {
@@ -342,25 +490,12 @@ pub fn file_system_method(
                 _ => None,
             }
         }
-        "java/io/File" => {
-            let id = args.first()?.as_obj()?;
-            let path = match heap.get(id)? {
-                JavaObject::Instance { fields, .. } => string_of(heap, fields.get("path")?)?,
-                _ => return None,
-            };
-            match method_name {
-                "exists" => handled(Value::from_bool(heap.fs.exists(&path))),
-                "isDirectory" => handled(Value::from_bool(heap.fs.is_dir(&path))),
-                "isFile" => handled(Value::from_bool(heap.fs.is_file(&path))),
-                "getPath" | "getAbsolutePath" | "toString" => {
-                    let sid = heap.alloc_string(path);
-                    handled(Value::Object(Some(sid)))
-                }
-                "toPath" => handled(alloc_path(heap, &path)),
-                "mkdirs" | "mkdir" => handled(Value::from_bool(heap.fs.create_dirs(&path))),
-                "delete" => handled(Value::from_bool(heap.fs.delete(&path))),
-                _ => None,
-            }
+        // `java.io.File` is real JDK bytecode; its file-system calls come back
+        // here through `java/io/FileSystem` (see `unix_file_system`). The one
+        // exception is `toPath`, which builds a `Path` the runtime models.
+        "java/io/File" if method_name == "toPath" => {
+            let path = file_path(heap, args.first()?)?;
+            handled(alloc_path(heap, &path))
         }
         _ => None,
     }

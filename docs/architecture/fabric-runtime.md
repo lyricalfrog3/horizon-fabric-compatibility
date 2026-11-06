@@ -152,9 +152,10 @@ this way.
 Reflection that constructs objects (`Class.getConstructor`/`getDeclaredConstructor` and
 `Constructor.newInstance`) runs the class's real constructor. That is how JamLib's
 `ConfigManager` builds a mod's config class, so Right Click Harvest's `Config` and its enums come
-from the mod's own bytecode. Config files are not read or written yet: `Files.writeString`,
-Jankson and `Path.getParent` are unresolved and return defaults, so every mod runs on its config
-defaults. Unresolved calls returning defaults is also why a test can pass without a feature
+from the mod's own bytecode. Config files are read and written through the runtime's file-system
+boundary (`Files`, `File`, `Path`), which is the game folder; JamLib/Jankson and Night Config
+configure a mod the way they do in the real game (`tests/config_files.rs` pins the exact bytes
+Right Click Harvest and Legendary Tooltips write). Unresolved calls returning defaults is also why a test can pass without a feature
 working; check `Interpreter::missing` (set `trace_missing`) before claiming a path runs.
 
 Exceptions are frame-local. The Code attribute's exception table is read, and `athrow`,
@@ -589,6 +590,46 @@ That pass is bounded and memoized, because a cold start spends most of its shape
   for every state (`BlockBehaviour`'s implementations ignore the state: `Shapes.block()`, and
   that or `Shapes.empty()` from the block-wide `hasCollision`), so one state's pair is read and
   given to the rest (27 of Farmer's Delight's 135 blocks, all their 4 to 8 states).
+
+### The JDK host boundary
+
+A JVM-native method has no bytecode, so the interpreter has to answer it. The rule is the same
+as everywhere else: implement it at the boundary with the JDK's own semantics, not a plausible
+default. `java.io.File` is real JDK bytecode (path building, `getAbsolutePath`, exceptions); the
+natives beneath it are answered from the runtime's file system (`fs_builtins.rs`):
+`canonicalize0`, `getBooleanAttributes0`, `checkAccess0`, `getLastModifiedTime0`, `getLength0`,
+`createFileExclusively0`, `createDirectory0`, `delete0`, `list0`, `rename0`,
+`setLastModifiedTime0`, `setReadOnly0`, `setPermission0`, `getNameMax0` and `initIDs`, for both
+`java.io.FileSystem` and `java.io.UnixFileSystem`. A relative path is the mod's, so it resolves
+against the game folder, exactly as a JVM process started there would; the folders above the game
+folder exist (a walk up `getParent()` terminates) but nothing outside it is listed, read or
+written. `File.createNewFile` fails when the file is there, `mkdir` needs its parent, and
+`rename` moves one entry.
+
+The rest of the boundary, in the same spirit: `System`'s property table (`user.dir` is the game
+folder, `java.io.tmpdir` is `tmp/` under it, `file.separator`/`path.separator`/`java.version` and
+the rest as a JVM 25 reports them), `System.getProperties`/`setProperty`/`clearProperty` and
+`Properties.getProperty`, `System.identityHashCode` (the heap id, stable and distinct per object),
+a monotonic `System.nanoTime`, `Runtime.availableProcessors`, `String.intern` (every string the
+runtime allocates is already interned by its text), `Float.floatToRawIntBits`/`floatToIntBits`/
+`intBitsToFloat`, the `registerNatives` calls of `Class`, `ClassLoader`, `Thread` and `Object`,
+`Thread.getNextThreadIdOffset`, `BootLoader.setBootLoaderUnnamedModule0`,
+`Unsafe.staticFieldBase0`, `VM.initialize`/`getNanoTimeAdjustment`, and `StackWalker`, which
+reports no frames (the interpreter has none) so `walk`'s function runs over an empty stream.
+
+`crates/hfc-runtime/tests/jvm_diff.rs` runs every case in a temporary folder that is both the
+JVM harness's working directory and the interpreter's file-system root, and
+`tests/jvm/hfc/cases/Jdk.java` pins these answers against the real JVM: identity hashes, interning,
+float bits, processors, monotonic time, the properties, and `File` create/list/canonicalize/
+rename/delete (including that two spellings of a path canonicalize the same).
+
+Measured with the census (`--mods test-mods --alone`): **55 missing symbols before, 18 after**.
+iceberg 5→0, jamlib 5→0, legendarytooltips 16→1, mdm 21→11, modmenu 7→5, rightclickharvest 1→1.
+What is left is not JDK natives: `List.listIterator` and the other collection views (a heap
+`List`/`Map` has no iterator view yet), method references such as `ToIntFunction.applyAsInt`
+whose bootstrap target is the interface rather than the implementation, and Minecraft's registry
+API (`WritableRegistry.register`, `Registry.key`, `createIntrusiveHolder`), which is the mod-API
+surface the content side needs next.
 
 ### Shape maps keyed by an enum
 

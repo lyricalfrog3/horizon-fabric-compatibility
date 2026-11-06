@@ -1260,6 +1260,119 @@ fn particle_layout(descriptor: &str) -> Option<ParticleLayout> {
     }
 }
 
+/// The system property table `System.getProperties` hands out, made once and
+/// kept in a singleton so a mod that sets a property sees it later.
+fn system_properties(heap: &mut Heap) -> usize {
+    if let Some(id) = heap.get_singleton("system.properties") {
+        return id;
+    }
+    let pairs: Vec<(String, String)> = heap
+        .properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let entries: Vec<(Value, Value)> = pairs
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                Value::Object(Some(heap.alloc_string(key))),
+                Value::Object(Some(heap.alloc_string(value))),
+            )
+        })
+        .collect();
+    let id = heap.alloc(JavaObject::Map(entries));
+    heap.set_singleton("system.properties", id);
+    id
+}
+
+/// `System.getProperty(key)`: the table's entry, or one of the two that depend
+/// on where the game folder is.
+pub(crate) fn system_property(heap: &Heap, key: &str) -> Option<String> {
+    match key {
+        "user.dir" => Some(crate::fs_builtins::game_dir(heap)),
+        "java.io.tmpdir" => Some(crate::vfs::join(&crate::fs_builtins::game_dir(heap), "tmp")),
+        _ => {
+            if let Some(id) = heap.get_singleton("system.properties")
+                && let Some(JavaObject::Map(entries)) = heap.get(id)
+            {
+                return entries
+                    .iter()
+                    .find(|(entry_key, _)| {
+                        entry_key
+                            .as_obj()
+                            .and_then(|id| heap.get_string(id))
+                            .is_some_and(|text| text == key)
+                    })
+                    .and_then(|(_, value)| {
+                        value
+                            .as_obj()
+                            .and_then(|id| heap.get_string(id))
+                            .map(str::to_string)
+                    });
+            }
+            heap.properties.get(key).cloned()
+        }
+    }
+}
+
+fn properties_get(heap: &Heap, table: usize, key: &str) -> Option<String> {
+    let JavaObject::Map(entries) = heap.get(table)? else {
+        return None;
+    };
+    entries.iter().find_map(|(entry_key, value)| {
+        let matches = entry_key
+            .as_obj()
+            .and_then(|id| heap.get_string(id))
+            .is_some_and(|text| text == key);
+        matches
+            .then(|| {
+                value
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .map(str::to_string)
+            })
+            .flatten()
+    })
+}
+
+fn properties_put(heap: &mut Heap, table: usize, key: &str, value: &str) {
+    let key_id = heap.alloc_string(key);
+    let value_id = heap.alloc_string(value);
+    let existing = match heap.get(table) {
+        Some(JavaObject::Map(entries)) => entries.iter().position(|(entry_key, _)| {
+            entry_key
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .is_some_and(|text| text == key)
+        }),
+        _ => None,
+    };
+    if let Some(JavaObject::Map(entries)) = heap.get_mut(table) {
+        match existing {
+            Some(position) => entries[position].1 = Value::Object(Some(value_id)),
+            None => entries.push((Value::Object(Some(key_id)), Value::Object(Some(value_id)))),
+        }
+    }
+}
+
+fn properties_remove(heap: &mut Heap, table: usize, key: &str) {
+    let keys: Vec<usize> = match heap.get(table) {
+        Some(JavaObject::Map(entries)) => entries
+            .iter()
+            .filter_map(|(entry_key, _)| {
+                let id = entry_key.as_obj()?;
+                heap.get_string(id)
+                    .is_some_and(|text| text == key)
+                    .then_some(id)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if let Some(JavaObject::Map(entries)) = heap.get_mut(table) {
+        entries.retain(|(entry_key, _)| entry_key.as_obj().is_some_and(|id| !keys.contains(&id)));
+    }
+}
+
 pub fn dispatch_builtin(
     heap: &mut Heap,
     class_name: &str,
@@ -1979,6 +2092,10 @@ pub fn dispatch_builtin(
             return BuiltinResult::Handled(Value::Int(16));
         } else if method_name == "arrayIndexScale" || method_name == "arrayIndexScale0" {
             return BuiltinResult::Handled(Value::Int(8));
+        } else if method_name == "staticFieldBase0" || method_name == "staticFieldBase" {
+            // No raw memory: a static field's base is the class mirror on a
+            // JVM, and the matching `staticFieldOffset` above is a placeholder.
+            return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "objectFieldOffset"
             || method_name == "objectFieldOffset0"
             || method_name == "staticFieldOffset"
@@ -2077,6 +2194,17 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::NULL);
     }
 
+    if class_name == "jdk/internal/misc/VM" {
+        match method_name {
+            // The VM's own bootstrap step; there is no VM here to initialize.
+            "initialize" => return BuiltinResult::Handled(Value::NULL),
+            // -1 is the VM's own "no adjustment available" answer for a clock
+            // that cannot be tied to a monotonic source.
+            "getNanoTimeAdjustment" => return BuiltinResult::Handled(Value::Long(-1)),
+            _ => {}
+        }
+    }
+
     if class_name == "java/lang/System" {
         if method_name == "registerNatives" {
             return BuiltinResult::Handled(Value::NULL);
@@ -2126,22 +2254,9 @@ pub fn dispatch_builtin(
             let key = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            let value: Option<String> = match key {
-                "java.version" => Some("25".to_string()),
-                "java.vendor" => Some("Horizon Fabric Runtime".to_string()),
-                "java.vm.name" => Some("Horizon Fabric Runtime".to_string()),
-                "os.name" => Some("Linux".to_string()),
-                "os.arch" => Some(std::env::consts::ARCH.to_string()),
-                "line.separator" => Some("\n".to_string()),
-                "file.separator" => Some("/".to_string()),
-                "user.home" => std::env::var("HOME").ok(),
-                // The interpreter has no `sun.misc.Unsafe`, so JOML must take
-                // its plain-field matrix copies rather than raw memory ones.
-                "joml.nounsafe" => Some("true".to_string()),
-                _ => None,
-            };
-            if let Some(value) = value {
+                .unwrap_or("")
+                .to_string();
+            if let Some(value) = system_property(heap, &key) {
                 let sid = heap.alloc_string(value);
                 return BuiltinResult::Handled(Value::Object(Some(sid)));
             }
@@ -2149,6 +2264,54 @@ pub fn dispatch_builtin(
                 return BuiltinResult::Handled(args[1].clone());
             }
             return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "setProperty" && args.len() >= 2 {
+            let key = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let value = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .map(str::to_string);
+            let table = system_properties(heap);
+            let old = properties_get(heap, table, &key);
+            if let Some(value) = value {
+                properties_put(heap, table, &key, &value);
+            } else {
+                properties_remove(heap, table, &key);
+            }
+            return BuiltinResult::Handled(old.map_or(Value::NULL, |value| {
+                Value::Object(Some(heap.alloc_string(value)))
+            }));
+        } else if method_name == "clearProperty" && !args.is_empty() {
+            let key = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("")
+                .to_string();
+            let table = system_properties(heap);
+            let old = properties_get(heap, table, &key);
+            properties_remove(heap, table, &key);
+            return BuiltinResult::Handled(old.map_or(Value::NULL, |value| {
+                Value::Object(Some(heap.alloc_string(value)))
+            }));
+        } else if method_name == "getProperties" {
+            let id = system_properties(heap);
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if method_name == "identityHashCode" && !args.is_empty() {
+            // A JVM gives every object a stable, arbitrary number; the heap id
+            // is stable for the object's life and distinct between objects.
+            // A boxed number has no identity here, so it hashes by value.
+            let hash = match &args[0] {
+                Value::Object(Some(id)) => (*id as i32).wrapping_mul(0x9E37_79B1u32 as i32),
+                Value::Object(None) => 0,
+                Value::Int(i) => *i,
+                Value::Long(l) => (*l ^ (*l >> 32)) as i32,
+                Value::Float(f) => f.to_bits() as i32,
+                Value::Double(d) => (d.to_bits() ^ (d.to_bits() >> 32)) as i32,
+            };
+            return BuiltinResult::Handled(Value::Int(hash));
         } else if method_name == "currentTimeMillis" {
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2156,7 +2319,188 @@ pub fn dispatch_builtin(
                 .unwrap_or(0);
             return BuiltinResult::Handled(Value::Long(ms));
         } else if method_name == "nanoTime" {
-            return BuiltinResult::Handled(Value::Long(0));
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+            return BuiltinResult::Handled(Value::Long(elapsed.as_nanos() as i64));
+        }
+    }
+
+    // The JVM's own bootstrap registers the natives of these classes; the
+    // runtime answers their methods itself, so registering is a no-op.
+    if method_name == "registerNatives"
+        && matches!(
+            class_name,
+            "java/lang/Class" | "java/lang/ClassLoader" | "java/lang/Thread" | "java/lang/Object"
+        )
+    {
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    if class_name == "java/lang/Runtime" {
+        match method_name {
+            "getRuntime" => {
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/lang/Runtime".into(),
+                    fields: HashMap::new(),
+                });
+                return BuiltinResult::Handled(Value::Object(Some(id)));
+            }
+            "availableProcessors" => {
+                let count = std::thread::available_parallelism().map_or(1, |n| n.get());
+                return BuiltinResult::Handled(Value::Int(count as i32));
+            }
+            // The host's real limits: the runtime runs inside the game process.
+            "maxMemory" | "totalMemory" => return BuiltinResult::Handled(Value::Long(1 << 30)),
+            "freeMemory" => return BuiltinResult::Handled(Value::Long(1 << 29)),
+            "gc" | "runFinalization" | "halt" | "exit" => {
+                return BuiltinResult::Handled(Value::NULL);
+            }
+            _ => {}
+        }
+    }
+
+    if class_name == "jdk/internal/loader/BootLoader" {
+        if matches!(
+            method_name,
+            "setBootLoaderUnnamedModule0" | "setBootLoaderUnnamedModule"
+        ) {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    if class_name == "java/lang/Thread" {
+        match method_name {
+            // Thread ids start above this offset; the process has one thread.
+            "getNextThreadIdOffset" | "nextThreadIdOffset" => {
+                return BuiltinResult::Handled(Value::Long(1));
+            }
+            "interrupted" => return BuiltinResult::Handled(Value::from_bool(false)),
+            "isInterrupted" => return BuiltinResult::Handled(Value::from_bool(false)),
+            _ => {}
+        }
+    }
+
+    // `Class`'s native metadata: a member class names its declaring class in
+    // its binary name (`Outer$Inner`), and the runtime carries no other member
+    // information, so an enclosing method answers null as it does for a
+    // top-level or anonymous class.
+    if class_name == "java/lang/Class" {
+        match method_name {
+            "getDeclaringClass0" => {
+                let name =
+                    args.first()
+                        .and_then(|v| v.as_obj())
+                        .and_then(|id| match heap.get(id) {
+                            Some(JavaObject::Class(name)) => Some(name.clone()),
+                            _ => None,
+                        });
+                let outer = name
+                    .as_deref()
+                    .and_then(|name| name.rsplit_once('$'))
+                    .map(|(outer, _)| outer.to_string());
+                if let Some(outer) = outer {
+                    let id = heap.alloc(JavaObject::Class(outer));
+                    return BuiltinResult::Handled(Value::Object(Some(id)));
+                }
+                return BuiltinResult::Handled(Value::NULL);
+            }
+            "getEnclosingMethod0" => return BuiltinResult::Handled(Value::NULL),
+            "isHidden" | "isAnonymousClass" | "isLocalClass" => {
+                return BuiltinResult::Handled(Value::from_bool(false));
+            }
+            _ => {}
+        }
+    }
+
+    // User code never instantiates `Properties` behaviourally; the runtime
+    // models one as a heap map so `getProperty`/`setProperty` work and
+    // `load`/`store` see real entries.
+    if class_name == "java/util/Properties" {
+        // The runtime models `Properties` as a heap map (see `system_properties`),
+        // so either shape is the receiver.
+        let table = args
+            .first()
+            .and_then(|v| v.as_obj())
+            .filter(|id| match heap.get(*id) {
+                Some(JavaObject::Map(_)) => true,
+                Some(JavaObject::Instance { class_name, .. }) => {
+                    class_name == "java/util/Properties"
+                }
+                _ => false,
+            });
+        if let Some(table) = table {
+            let key = args.get(1).and_then(|v| {
+                v.as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .map(str::to_string)
+            });
+            match method_name {
+                "getProperty" | "get" => {
+                    // `user.dir` and `java.io.tmpdir` are computed from the game
+                    // folder, so they are not entries of the table.
+                    let value = key.clone().and_then(|key| {
+                        properties_get(heap, table, &key).or_else(|| system_property(heap, &key))
+                    });
+                    if let Some(value) = value {
+                        let sid = heap.alloc_string(value);
+                        return BuiltinResult::Handled(Value::Object(Some(sid)));
+                    }
+                    if method_name == "getProperty" && args.len() >= 3 {
+                        return BuiltinResult::Handled(args[2].clone());
+                    }
+                    return BuiltinResult::Handled(Value::NULL);
+                }
+                "setProperty" | "put" if args.len() >= 3 => {
+                    let Some(key) = key else {
+                        return BuiltinResult::Handled(Value::NULL);
+                    };
+                    let value = args[2]
+                        .as_obj()
+                        .and_then(|id| heap.get_string(id))
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    let old = properties_get(heap, table, &key);
+                    properties_put(heap, table, &key, &value);
+                    return BuiltinResult::Handled(old.map_or(Value::NULL, |old| {
+                        Value::Object(Some(heap.alloc_string(old)))
+                    }));
+                }
+                "containsKey" => {
+                    let found = key
+                        .and_then(|key| {
+                            properties_get(heap, table, &key)
+                                .or_else(|| system_property(heap, &key))
+                        })
+                        .is_some();
+                    return BuiltinResult::Handled(Value::from_bool(found));
+                }
+                "size" | "isEmpty" => {
+                    let entries = match heap.get(table) {
+                        Some(JavaObject::Map(entries)) => entries.len(),
+                        _ => 0,
+                    };
+                    return BuiltinResult::Handled(if method_name == "isEmpty" {
+                        Value::from_bool(entries == 0)
+                    } else {
+                        Value::Int(entries as i32)
+                    });
+                }
+                "stringPropertyNames" | "propertyNames" => {
+                    let names: Vec<Value> = match heap.get(table) {
+                        Some(JavaObject::Map(entries)) => {
+                            entries.iter().map(|(key, _)| key.clone()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    if method_name == "stringPropertyNames" {
+                        let id = heap.alloc(JavaObject::Set(names));
+                        return BuiltinResult::Handled(Value::Object(Some(id)));
+                    }
+                    let id = heap.alloc_list(names);
+                    return BuiltinResult::Handled(Value::Object(Some(id)));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2712,7 +3056,11 @@ pub fn dispatch_builtin(
     }
 
     if class_name == "java/lang/String" {
-        if method_name == "valueOf" && !args.is_empty() {
+        if method_name == "intern" && !args.is_empty() {
+            // The runtime already interns strings by their text (`Heap::alloc_string`),
+            // so the receiver is the interned instance.
+            return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "valueOf" && !args.is_empty() {
             let s = match &args[0] {
                 Value::Int(i) if descriptor.starts_with("(Z)") => (*i != 0).to_string(),
                 Value::Int(i) if descriptor.starts_with("(C)") => char::from_u32(*i as u32)
@@ -4014,15 +4362,6 @@ pub fn dispatch_builtin(
     if class_name == "java/io/Reader" || class_name == "java/io/BufferedReader" {
         if method_name == "readLine" || method_name == "close" {
             return BuiltinResult::Handled(Value::NULL);
-        }
-    }
-
-    if class_name == "java/io/File" {
-        if method_name == "exists" || method_name == "isDirectory" || method_name == "isFile" {
-            return BuiltinResult::Handled(Value::from_bool(false));
-        } else if method_name == "getPath" || method_name == "getAbsolutePath" {
-            let sid = heap.alloc_string("config");
-            return BuiltinResult::Handled(Value::Object(Some(sid)));
         }
     }
 

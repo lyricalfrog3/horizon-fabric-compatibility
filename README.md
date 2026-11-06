@@ -95,7 +95,15 @@ or for a class it deliberately replaces. What a JVM's bootstrap does for the JDK
 explicitly: it installs the JDK's own `JavaLangAccess` when `SharedSecrets` initializes,
 because `EnumMap`/`EnumSet` read an enum's constants through it, and Minecraft caches rotated
 block shapes in `EnumMap`s keyed by `Direction`. Without it those maps are empty — the shapes
-come back null and face-keyed lookups miss. The design is in
+come back null and face-keyed lookups miss.
+
+The JDK's native methods are answered at the same kind of boundary. `java.io.File` is the
+JDK's own bytecode over the runtime's file system, which is the game folder (relative paths
+resolve there, the folders above it exist, nothing outside it is listed or written);
+`System`'s properties (`user.dir`, separators, encodings), `System.identityHashCode`, a
+monotonic `nanoTime`, `Runtime.availableProcessors`, `String.intern` and the float bit
+conversions come from the host with the values a JVM reports. Mods' config files are read and
+written through it. The design is in
 [docs/architecture/fabric-runtime.md](docs/architecture/fabric-runtime.md), and the reasoning
 behind the content-first installer in
 [docs/decisions/0001-hybrid-content-first.md](docs/decisions/0001-hybrid-content-first.md).

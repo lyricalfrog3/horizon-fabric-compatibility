@@ -189,6 +189,23 @@ impl FabricBridge {
         {
             return false;
         }
+        // The key cannot see the game folder's `config/`: a mod may register
+        // different blocks after a config edit. The ids the entrypoints
+        // registered in this start must match the cached list exactly (same
+        // order, same length), or the facts would describe other blocks.
+        let cached_ids = cached.blocks.iter().map(|block| block.id.as_str());
+        let registered_ids = self
+            .interp
+            .heap
+            .registered_blocks
+            .iter()
+            .map(|block| block.id.as_str());
+        if !cached_ids.eq(registered_ids) {
+            log::info!(
+                "block facts cache: registered blocks changed since it was written; reading them again"
+            );
+            return false;
+        }
         self.interp.heap.block_facts = cached.blocks;
         self.interp.heap.block_facts_shapes = cached.shapes;
         self.block_facts_cache.from_cache = true;

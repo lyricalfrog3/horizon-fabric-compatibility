@@ -217,6 +217,42 @@ fn another_jar_set_is_a_miss() {
     assert_eq!(damaged.registered_blocks(), first);
 }
 
+/// A cache written before a config change (same jars, same key) is not served
+/// when the entrypoints register a different list of blocks this start.
+#[test]
+fn a_changed_block_list_is_a_miss_even_with_the_same_key() {
+    let (Some(api), Some(mdm)) = (
+        test_mod("fabric-api-0.165.0+26.3.jar"),
+        test_mod("mdm-3.1-fabric-26.3.jar"),
+    ) else {
+        return;
+    };
+    let jars = [api.as_path(), mdm.as_path()];
+    let cache = Cache::new("ids");
+    let Some(cold) = bridge(&jars, &cache) else {
+        return;
+    };
+    assert!(!cold.block_facts_from_cache());
+    let fresh = cold.registered_blocks();
+    let written = cold.store_block_facts_cache().expect("facts written");
+
+    // The same file and key, but one block id the entrypoints do not register:
+    // the cache cannot describe this start.
+    let mut cached: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&written).unwrap()).unwrap();
+    cached["blocks"][0]["id"] = serde_json::json!("example:not_registered");
+    std::fs::write(&written, serde_json::to_vec(&cached).unwrap()).unwrap();
+
+    let Some(reloaded) = bridge(&jars, &cache) else {
+        return;
+    };
+    assert!(
+        !reloaded.block_facts_from_cache(),
+        "a changed block list must not be served from the cache"
+    );
+    assert_eq!(reloaded.registered_blocks(), fresh);
+}
+
 /// The key covers every loaded jar and not their order.
 #[test]
 fn the_key_is_the_set_of_jars_in_any_order() {

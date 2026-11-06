@@ -706,7 +706,10 @@ jar, libraries, every mod jar), the identity (`len` and mtime) of the JDK image,
 and an older classpath's file is removed. A hit skips `collect_block_facts` and
 `read_block_shapes` and serves the cached blocks (shapes included); a miss reads them from the
 mod again and rewrites the file. Anything that does not read back exactly (a jar that cannot be
-hashed, a missing, damaged or differently keyed file) is a miss, never a guess.
+hashed, a missing, damaged or differently keyed file) is a miss, never a guess. The key cannot see
+the game folder's `config/`, which can change which blocks a mod registers, so a load also checks
+that the ids the entrypoints registered this start are exactly the cached list (same order and
+length). The other facts are trusted to depend only on the jars.
 
 The facts a cache hit serves are pinned equal to a fresh read by
 `crates/hfc-runtime/tests/block_facts_cache.rs` (every block, state, shape and note, plus the

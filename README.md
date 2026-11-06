@@ -43,7 +43,8 @@ client where noted. A mod not listed here should be treated as unsupported.
 | **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow; the tooltip body from the mod's real component list (centred title, name separator, the item model rotating in 3D); the shine that restarts per hovered stack; `legendarytooltips.toml` written with comments, allowed values and ranges, and read back | ✅ |
 | **Emerald Tools** | Its five tools, registered in code, become Horizon items with vanilla-formula tool stats, textures, names and recipes; `/give`, creative search and the tabs the mod chose (Fabric `CreativeModeTabEvents`) find them | ✅ (in vanilla's Tools and Combat tabs) |
 | **Emerald Armor** | Its four armor pieces, registered in code with `Item.Properties.humanoidArmor`, become Horizon items with vanilla-formula durability, armor and toughness, a single stack, and an equippable slot; its worn-armor model and textures (under `assets/minecraft`) are carried | ✅ (worn and rendered) |
-| **Modern Decorations** | Its 344 blocks, registered in code, become Horizon blocks from facts read by running the mod's real block code: states, hardness, light, sounds, outline and collision shapes; they render with the jar's models, drop through its loot tables, and come with their items. Placement runs the mod's own `getStateForPlacement` and `setPlacedBy` (facing, multi-block furniture); right-click runs the block's own `useWithoutItem`/`useItemOn` (a shower head toggles its water); scheduled block ticks run, with the particles they send; and the 130 storage blocks are 27-slot containers with the mod's own stack limit, per-face hopper rules, items and drops | ✅ placing, facing, storage, use |
+| **Modern Decorations** | Its 344 blocks, registered in code, become Horizon blocks from facts read by running the mod's real block code: states, hardness, light, sounds, outline and collision shapes; they render with the jar's models, drop through its loot tables, and come with their items. Placement runs the mod's own `getStateForPlacement` and `setPlacedBy` (facing, multi-block furniture); right-click runs the block's own `useWithoutItem`/`useItemOn` (a shower head toggles its water); scheduled block ticks run (they are saved in the chunk's vanilla `block_ticks`, so a running shower resumes after a reload) with the particles they send; and the 130 storage blocks are 27-slot containers with the mod's own stack limit, per-face hopper rules, items and drops | ✅ placing, facing, storage, use |
+| **Farmer's Delight** | Its 91 items and 132 of its 135 blocks, registered in code, load from facts read by running the mod's own block code; foods are edible (`Item.Properties.food` exports `minecraft:food`/`minecraft:consumable`), and the creative tab the mod builds in code runs its own item generator and appears in the creative inventory | ✅ placing, eating, own tab |
 | **JamLib, Iceberg, Placeholder API, Fabric API** | Load and initialise as libraries for the mods above | ✅ |
 
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the
@@ -51,16 +52,20 @@ Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.m
 
 - Blocks: a mod block's own right-click code (`useWithoutItem`/`useItemOn`) runs with vanilla's
   sneak and pass rules, applying the states, drops, removals, ticks and particles it makes;
-  scheduled block ticks run (a lit shower head sprays); and a container keeps the mod's stack
-  limit and per-face hopper rules. A use that changes the held stack (`shrink`, `consume`,
-  `setItemInHand`) is refused rather than leaving the item behind. Ticking block entities
-  (`getTicker`), neighbour updates and per-stack slot rules (`canPlaceItem`) don't run, and
-  blocks whose block entity is not a vanilla container stay decoration. Reading a mod's block facts and shapes makes its first
-  start slower (about 24 s with Modern Decorations; later starts reuse the cache and take about
-  9 s, the mod's own entrypoint, against about 3 s without it).
+  scheduled block ticks run (a lit shower head sprays) and are saved with the chunk; and a
+  container keeps the mod's stack limit and per-face hopper rules. A use that changes the held
+  stack (`shrink`, `consume`, `setItemInHand`) is refused rather than leaving the item behind.
+  Ticking block entities (`getTicker`), neighbour updates and per-stack slot rules
+  (`canPlaceItem`) don't run, and blocks whose block entity is not a vanilla container stay
+  decoration: Farmer's Delight's cooking pot and cutting board place but open no menu, and
+  three of its crop blocks (cabbages, onions, rice panicles) are left out. Reading a mod's
+  block facts and shapes makes its first start slower (about 24 s with Modern Decorations;
+  later starts reuse the cache and take about 9 s, the mod's own entrypoint, against about 3 s
+  without it).
 - Mods that carry blocks or entities around (Carry On) and most `Mixin`-heavy gameplay mods do
   not work.
-- Mod advancements are granted but don't appear in the advancement screen.
+- Mod advancements are granted and their tabs sit beside vanilla's; the whole tree is sent on
+  the first packet so every root's tab exists from the start.
 - Mod log messages print their `{}` placeholders unfilled.
 
 ## How it works
@@ -122,6 +127,18 @@ libudev development files on Linux.
 > The full runtime suite loads the whole Minecraft classpath and is heavy. While working,
 > run one test file at a time, for example
 > `cargo test -j2 -p hfc-runtime --test config_files -- --test-threads=1`.
+
+Two runtime tools check more than a single mod:
+
+```sh
+# Compile small Java programs and compare the interpreter with the real JVM.
+cargo test -p hfc-runtime --test jvm_diff
+# Rank what the runtime lacks across a folder of mods, by mods affected.
+cargo run --release -p hfc-runtime --example census -- --mods test-mods/corpus --alone
+```
+
+`tests/jvm/known_divergences.toml` is the maintained list of interpreter gaps; the census
+writes `census.json` and `census.md` and accepts `--compare` for a before/after.
 
 ### Using the installer
 

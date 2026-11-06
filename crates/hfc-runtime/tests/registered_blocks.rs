@@ -561,6 +561,41 @@ fn a_mod_blocks_own_use_toggles_the_state_it_sets() {
     assert_eq!(bridge.block_used(&cabinet, &event), BlockUse::NotOverridden);
 }
 
+/// A block that reschedules its tick must not grow the heap on every tick:
+/// the snapshot and the mod's per-tick objects are freed when nothing kept
+/// them.
+#[test]
+fn a_ticking_block_does_not_grow_the_heap_per_tick() {
+    let Some(mut bridge) = mdm() else { return };
+    let on = World {
+        at: [4, 1, 4],
+        id: "mdm:shower_head".into(),
+        properties: vec![
+            ("facing".into(), "north".into()),
+            ("running".into(), "true".into()),
+        ],
+        held: None,
+    };
+    // The first tick may keep its scope while a class initializer runs.
+    let _ = bridge
+        .tick_block(&on, [4, 1, 4], "mdm:shower_head")
+        .expect("the tick ran");
+    let after_warm = bridge.heap_len();
+    let mut effects = None;
+    for _ in 0..1000 {
+        effects = bridge.tick_block(&on, [4, 1, 4], "mdm:shower_head");
+    }
+    let effects = effects.expect("the tick ran");
+    assert!(!effects.particles.is_empty(), "{effects:?}");
+    assert_eq!(effects.schedules[0].delay, 2);
+    let after = bridge.heap_len();
+    eprintln!("tick heap: {after_warm} after warm, {after} after 1000 ticks");
+    assert!(
+        after <= after_warm + 64,
+        "the heap grew from {after_warm} to {after} over 1000 ticks"
+    );
+}
+
 /// The context a block's use sees carries the real click location, through
 /// the `Vec3` `HitResult.getLocation` answers.
 #[test]

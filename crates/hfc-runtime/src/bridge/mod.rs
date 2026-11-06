@@ -244,6 +244,9 @@ pub struct FabricBridge {
     /// Block ids whose use was already reported as changing the held item, so
     /// a click on one does not flood the log.
     hand_change_logged: std::collections::HashSet<String>,
+    /// Block ids whose tick had to keep its heap scope (class init, a static
+    /// or a cache kept a scoped object), logged once each.
+    scope_kept_logged: std::collections::HashSet<String>,
 }
 
 pub(crate) type HoveredTooltipKey = (String, Vec<(String, u32)>);
@@ -309,6 +312,7 @@ impl FabricBridge {
             hovered_tooltip: None,
             block_facts_cache: block_cache::BlockFactsCache::new(None),
             hand_change_logged: std::collections::HashSet::new(),
+            scope_kept_logged: std::collections::HashSet::new(),
         }
     }
 
@@ -356,6 +360,7 @@ impl FabricBridge {
             hovered_tooltip: None,
             block_facts_cache: block_cache::BlockFactsCache::new(None),
             hand_change_logged: std::collections::HashSet::new(),
+            scope_kept_logged: std::collections::HashSet::new(),
         }
     }
 

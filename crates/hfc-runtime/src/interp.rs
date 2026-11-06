@@ -2989,6 +2989,15 @@ impl Interpreter {
         None
     }
 
+    /// Whether a class static field or the runtime's static singleton cache
+    /// kept a heap id `>= mark`, which the current allocation scope would free.
+    pub(crate) fn static_refs_into(&self, mark: usize) -> bool {
+        self.static_singletons
+            .values()
+            .any(|value| value.as_obj().is_some_and(|id| id >= mark))
+            || self.loader.static_refs_into(mark)
+    }
+
     /// Resolve static field value or create fallback singleton.
     pub fn resolve_static_field(&mut self, class_name: &str, field_name: &str) -> Value {
         let owner = self

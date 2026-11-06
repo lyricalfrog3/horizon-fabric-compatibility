@@ -541,6 +541,20 @@ impl super::FabricBridge {
         }
         let started = std::time::Instant::now();
         let world = world_around(host, pos);
+        // Warm the state-object cache the snapshot will use: it holds heap ids
+        // across calls, so it must not be filled inside the scope.
+        for (_, id, _) in &world.blocks {
+            if self
+                .interp
+                .heap
+                .registered_blocks
+                .iter()
+                .any(|block| &block.id == id)
+            {
+                let _ = self.interp.mod_state_objects(id);
+            }
+        }
+        self.interp.heap.begin_scope();
         let previous = self.interp.step_budget;
         self.interp.step_budget = Some(crate::place_builtins::TICK_BUDGET);
         let result = self.interp.block_tick(block_id, pos, &world);
@@ -550,13 +564,44 @@ impl super::FabricBridge {
         if took.as_millis() > 20 {
             log::warn!("tick of {block_id} took {took:?} ({used} instructions)");
         }
-        match result {
+        let effects = match result {
             Ok(level) => self.effects_of(level).ok(),
             Err(error) => {
                 log::warn!("Fabric: {block_id}'s tick failed: {error}");
                 None
             }
+        };
+        // The snapshot and whatever the tick allocated are freed unless a
+        // scoped object escaped into a static, a cache or an older object.
+        let mark = self.interp.heap.scope_mark().unwrap_or(0);
+        let kept = self.interp.heap.scope_escaped()
+            || self.interp.heap.refs_into(mark)
+            || self.interp.static_refs_into(mark)
+            || self.bridge_refs_into(mark);
+        if !self.interp.heap.end_scope(kept) && self.scope_kept_logged.insert(block_id.to_string())
+        {
+            log::debug!(
+                "block {block_id}'s tick kept heap objects (a class initializer, a static or a cache); its scope was not released"
+            );
         }
+        effects
+    }
+
+    /// Whether a heap id the bridge keeps between calls is in the open scope.
+    fn bridge_refs_into(&self, mark: usize) -> bool {
+        let id = |id: Option<usize>| id.is_some_and(|id| id >= mark);
+        id(self.screen_id)
+            || id(self.menu_screen)
+            || self
+                .hovered_tooltip
+                .as_ref()
+                .is_some_and(|(_, stack, screen)| *stack >= mark || id(*screen))
+    }
+
+    /// The number of heap slots, for the tick-scope test.
+    #[doc(hidden)]
+    pub fn heap_len(&self) -> usize {
+        self.interp.heap.object_count()
     }
 
     /// The changes, block ticks and particles a level a mod's code wrote is

@@ -54,6 +54,12 @@ pub struct Heap {
     pub(crate) creative_tab_additions: Vec<crate::bridge::items::CreativeTabAddition>,
     /// Creative-tab output calls the runtime does not model, each logged once.
     pub unsupported_creative_tab_calls: Vec<String>,
+    /// The object count when the current block-code call opened its scope.
+    /// Ids from here on are freed when it ends, unless something kept one.
+    scope: Option<usize>,
+    /// A scoped object was stored where the final reference scan cannot see
+    /// it (a class's static fields, the interpreter's caches).
+    escaped: bool,
 }
 
 impl Heap {
@@ -81,6 +87,8 @@ impl Heap {
             unsupported_item_properties: Vec::new(),
             creative_tab_additions: Vec::new(),
             unsupported_creative_tab_calls: Vec::new(),
+            scope: None,
+            escaped: false,
         }
     }
 
@@ -121,6 +129,81 @@ impl Heap {
     /// Look up a mod's metadata by ID.
     pub fn get_mod(&self, id: &str) -> Option<&crate::bridge::FabricModMetadata> {
         self.loaded_mods.get(id)
+    }
+
+    /// Number of heap slots, allocated or not; tests use it to see growth.
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Open a scope at the current heap end: everything allocated from now
+    /// until [`Heap::end_scope`] may be freed if nothing kept a reference.
+    pub fn begin_scope(&mut self) {
+        self.scope = Some(self.objects.len());
+        self.escaped = false;
+    }
+
+    /// The open scope's first id, when one is open.
+    pub fn scope_mark(&self) -> Option<usize> {
+        self.scope
+    }
+
+    /// Something outside the heap's own reference scan kept a scoped object.
+    pub fn note_escape(&mut self) {
+        if self.scope.is_some() {
+            self.escaped = true;
+        }
+    }
+
+    /// Whether something a scan cannot see marked the scope as escaped.
+    pub fn scope_escaped(&self) -> bool {
+        self.escaped
+    }
+
+    /// Close the open scope, truncating the objects allocated inside it unless
+    /// `escaped` (or an earlier [`Heap::note_escape`]) says something kept
+    /// one. Returns whether it truncated.
+    pub fn end_scope(&mut self, escaped: bool) -> bool {
+        let Some(mark) = self.scope.take() else {
+            return false;
+        };
+        let escaped = escaped || self.escaped;
+        self.escaped = false;
+        if !escaped {
+            self.objects.truncate(mark);
+        }
+        !escaped
+    }
+
+    /// Whether an id `>= mark` is reachable from what the heap keeps between
+    /// calls (interned ids, singletons, registrations, the block state cache)
+    /// or from any object older than `mark`.
+    pub fn refs_into(&self, mark: usize) -> bool {
+        let value = |value: &Value| value.as_obj().is_some_and(|id| id >= mark);
+        if self.interned_strings.values().any(|id| *id >= mark)
+            || self.interned_classes.values().any(|id| *id >= mark)
+            || self.singletons.values().any(|id| *id >= mark)
+            || self.identifiers.values().any(|id| *id >= mark)
+            || self
+                .registered_blocks
+                .iter()
+                .any(|block| block.object >= mark)
+            || self.registered_items.iter().any(|item| item.object >= mark)
+            || self
+                .registered_block_items
+                .iter()
+                .any(|(_, block, item)| *block >= mark || *item >= mark)
+            || self
+                .block_state_objects
+                .values()
+                .any(|states| states.values().any(value))
+        {
+            return true;
+        }
+        self.objects[..mark.min(self.objects.len())]
+            .iter()
+            .flatten()
+            .any(|object| object_refs_into(object, mark))
     }
 
     /// Allocate a new object and return its ID.
@@ -240,5 +323,124 @@ impl Heap {
     /// Allocate a Java Iterator object.
     pub fn alloc_iterator(&mut self, items: Vec<Value>) -> usize {
         self.alloc(JavaObject::Iterator { items, cursor: 0 })
+    }
+}
+
+/// Whether `object` refers to a heap id `>= mark`.
+fn object_refs_into(object: &JavaObject, mark: usize) -> bool {
+    let value = |value: &Value| value.as_obj().is_some_and(|id| id >= mark);
+    match object {
+        JavaObject::Instance { fields, .. } => fields.values().any(value),
+        JavaObject::Array { elements, .. } => elements.iter().any(value),
+        JavaObject::List(items) | JavaObject::Set(items) | JavaObject::Stream(items) => {
+            items.iter().any(value)
+        }
+        JavaObject::Map(entries) => entries
+            .iter()
+            .any(|(key, value_)| value(key) || value(value_)),
+        JavaObject::Iterator { items, .. } => items.iter().any(value),
+        JavaObject::Lambda { captured, .. } => captured.iter().any(value),
+        JavaObject::Native(native) => native_refs_into(native.as_any(), mark),
+        JavaObject::String(_) | JavaObject::Class(_) => false,
+    }
+}
+
+/// The heap ids the runtime's own native objects hold.
+fn native_refs_into(object: &dyn std::any::Any, mark: usize) -> bool {
+    use crate::minecraft::{BlockHitResult, EventResult, GuiGraphics, Level, Player};
+    use crate::place_builtins::PlaceContext;
+    let value = |value: &Value| value.as_obj().is_some_and(|id| id >= mark);
+    if let Some(level) = object.downcast_ref::<Level>() {
+        return level.mod_states.values().any(|id| *id >= mark)
+            || level.placed.iter().any(|(_, id)| *id >= mark)
+            || level.scheduled.iter().any(|(_, id, _)| *id >= mark);
+    }
+    if let Some(player) = object.downcast_ref::<Player>() {
+        return player.level_id >= mark
+            || player.uuid.is_some_and(|id| id >= mark)
+            || player.hand_stack.is_some_and(|id| id >= mark)
+            || player.hand_replaced.flatten().is_some_and(|id| id >= mark);
+    }
+    if let Some(context) = object.downcast_ref::<PlaceContext>() {
+        return [
+            &context.level,
+            &context.player,
+            &context.stack,
+            &context.pos,
+            &context.hit_pos,
+            &context.face,
+            &context.click_location,
+            &context.hit_result,
+            &context.horizontal,
+            &context.vertical,
+        ]
+        .into_iter()
+        .any(value)
+            || context.nearest.iter().any(value);
+    }
+    if let Some(hit) = object.downcast_ref::<BlockHitResult>() {
+        return hit.location.is_some_and(|id| id >= mark);
+    }
+    if let Some(result) = object.downcast_ref::<EventResult>() {
+        return value(&result.value);
+    }
+    if let Some(graphics) = object.downcast_ref::<GuiGraphics>() {
+        return graphics.pose.is_some_and(|id| id >= mark);
+    }
+    false
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::{Heap, JavaObject};
+    use std::collections::HashMap;
+
+    fn instance() -> JavaObject {
+        JavaObject::Instance {
+            class_name: "example.Temp".into(),
+            fields: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_scope_frees_what_nothing_kept() {
+        let mut heap = Heap::new();
+        let before = heap.object_count();
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        assert_eq!(mark, before);
+        heap.alloc(instance());
+        heap.alloc(JavaObject::String("temp".into()));
+        assert_eq!(heap.object_count(), mark + 2);
+        assert!(!heap.refs_into(mark));
+        assert!(heap.end_scope(false));
+        assert_eq!(heap.object_count(), mark);
+    }
+
+    #[test]
+    fn a_scoped_object_stored_in_an_older_one_keeps_the_scope() {
+        let mut heap = Heap::new();
+        let old = heap.alloc(instance());
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        let fresh = heap.alloc(instance());
+        // A write the runtime's older object would keep after the call.
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(old) {
+            fields.insert("kept".into(), super::Value::Object(Some(fresh)));
+        }
+        assert!(heap.refs_into(mark));
+        assert!(!heap.end_scope(true));
+        assert_eq!(heap.object_count(), mark + 1);
+    }
+
+    #[test]
+    fn an_interned_id_kept_by_the_heap_keeps_the_scope() {
+        let mut heap = Heap::new();
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        heap.alloc_string("fresh string");
+        // The intern table hands the id out later, so it must survive.
+        assert!(heap.refs_into(mark));
+        assert!(!heap.end_scope(true));
     }
 }

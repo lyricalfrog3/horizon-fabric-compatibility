@@ -690,6 +690,18 @@ out; each tick sends one `minecraft:falling_water` particle at each outlet and r
 turning it off returns before sending. One such tick costs about 0.95 ms in release (measured
 through `FabricBridge::tick_block`, the `Level` snapshot included).
 
+A tick runs in an allocation scope. `Heap::begin_scope` marks the heap end; after
+`effects_of` has turned the level into Rust values, the objects allocated during the call are
+freed unless something kept one. The escape scan looks at what the runtime keeps between calls
+(interned ids, singletons, registered items/blocks, the block-state cache), every loaded class's
+static fields, the interpreter's static cache, objects older than the scope, the bridge's own
+hovered ids, and the heap ids the runtime's native objects hold (`Level`, `Player`,
+`PlaceContext`, `BlockHitResult`, `EventResult`, `GuiGraphics`). A first tick that runs a class
+initializer keeps its scope; later ticks do not. Measured with the shower head: 1,000 ticks left
+the heap at 309,646 slots, exactly as after the warm-up tick; the same run without the scope
+added 4,000 slots (four per tick: the `Level` snapshot, a `BlockPos`, a `RandomSource` and one
+more object the mod's code allocates).
+
 ### Load time (stage D): the block facts and shapes cache
 
 `FabricBridge::init` reads the facts of every registered block out of the mod's own objects

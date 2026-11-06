@@ -95,6 +95,16 @@ impl ClassLoader {
         self.jars.iter().map(|jar| jar.path.as_path()).collect()
     }
 
+    /// Whether any loaded class's static field refers to a heap id `>= mark`.
+    pub fn static_refs_into(&self, mark: usize) -> bool {
+        self.classes.values().any(|class| {
+            class
+                .static_fields
+                .values()
+                .any(|value| value.as_obj().is_some_and(|id| id >= mark))
+        })
+    }
+
     /// The JDK images registered with the loader, in registration order.
     pub fn jimage_paths(&self) -> Vec<&Path> {
         self.jimages.iter().map(|image| image.path()).collect()

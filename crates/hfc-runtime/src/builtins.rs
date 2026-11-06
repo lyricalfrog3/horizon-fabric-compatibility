@@ -6223,10 +6223,15 @@ pub fn dispatch_builtin(
             }
         } else if (method_name == "removeBlock" || method_name == "destroyBlock") && args.len() >= 2
         {
+            // `removeBlock(pos, isMoving)` never drops; every `destroyBlock`
+            // overload takes `dropBlock` as its boolean after the position.
+            let drop = method_name == "destroyBlock" && args.get(2).is_some_and(Value::as_bool);
             if let (Some(id), Some(pos_id)) = (args[0].as_obj(), args[1].as_obj()) {
                 if let Some(pos) = heap.get_native::<BlockPos>(pos_id).cloned() {
                     if let Some(level) = heap.get_native_mut::<Level>(id) {
-                        return BuiltinResult::Handled(Value::from_bool(level.destroy_block(&pos)));
+                        return BuiltinResult::Handled(Value::from_bool(
+                            level.destroy_block(&pos, drop),
+                        ));
                     }
                 }
             }
@@ -6251,7 +6256,9 @@ pub fn dispatch_builtin(
             .cloned();
         if let (Some(level_id), Some(pos)) = (level_id, pos) {
             if let Some(level) = heap.get_native_mut::<Level>(level_id) {
-                return BuiltinResult::Handled(Value::from_bool(level.destroy_block(&pos)));
+                // `ServerPlayerGameMode.destroyBlock` breaks the block with its
+                // drops.
+                return BuiltinResult::Handled(Value::from_bool(level.destroy_block(&pos, true)));
             }
         }
         return BuiltinResult::Handled(Value::from_bool(false));

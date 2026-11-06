@@ -14,8 +14,8 @@ use std::path::Path;
 
 pub use crate::place_builtins::PlacementRequest;
 pub use blocks::{
-    BlockChange, BlockContainer, BlockEffects, BlockSchedule, BlockSound, BlockUse, ContainerRead,
-    ItemDrop, ParticleBurst, PlacedBy, Placement, RegisteredBlock, RegisteredState,
+    BlockChange, BlockContainer, BlockEffects, BlockRemoval, BlockSchedule, BlockSound, BlockUse,
+    ContainerRead, ItemDrop, ParticleBurst, PlacedBy, Placement, RegisteredBlock, RegisteredState,
 };
 pub use items::{CreativeTabAddition, RegisteredItem, TabPlacement};
 
@@ -75,6 +75,17 @@ pub trait HostBridge {
     /// `count` particles at `at`, spread by `spread`, with `speed`.
     fn particle(&mut self, id: &str, at: [f64; 3], count: u32, spread: [f64; 3], speed: f64) {
         let _ = (id, at, count, spread, speed);
+    }
+    /// Remove the block at `pos` as `Level.removeBlock`/`destroyBlock` would:
+    /// set it to air, dropping its loot when `drop`. Hosts that cannot leave
+    /// the default, which reports nothing was removed.
+    fn remove_block(&mut self, pos: [i32; 3], drop: bool) -> bool {
+        let _ = (pos, drop);
+        false
+    }
+    /// Whether `remove_block` works on this host.
+    fn can_remove_blocks(&self) -> bool {
+        false
     }
 }
 

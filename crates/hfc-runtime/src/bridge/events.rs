@@ -117,9 +117,13 @@ impl FabricBridge {
             .get_native::<Level>(level_id)
             .map(|level| level.broken.clone())
             .unwrap_or_default();
-        for at in broken {
+        for (at, drop) in broken {
             if at.x != pos[0] || at.y != pos[1] || at.z != pos[2] {
-                host.break_block([at.x, at.y, at.z]);
+                if drop {
+                    host.break_block([at.x, at.y, at.z]);
+                } else {
+                    host.remove_block([at.x, at.y, at.z], false);
+                }
             }
         }
         flow

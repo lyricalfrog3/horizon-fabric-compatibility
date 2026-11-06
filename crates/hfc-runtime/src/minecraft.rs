@@ -586,8 +586,9 @@ pub struct Level {
     pub max_y: i32,
     pub dropped_stacks: Vec<(BlockPos, String, i32)>,
     pub replanted: Vec<(BlockPos, BlockState)>,
-    /// Positions a mod removed with `destroyBlock`/`removeBlock`, in order.
-    pub broken: Vec<BlockPos>,
+    /// Positions a mod removed with `destroyBlock`/`removeBlock`, in order,
+    /// and whether the removal drops the block's items.
+    pub broken: Vec<(BlockPos, bool)>,
     /// `ServerLevel.sendParticles` calls, in order, for the host to show.
     pub particles: Vec<ParticleCall>,
     /// `Level.scheduleTick` calls, in order: position, the block's heap id and
@@ -613,16 +614,19 @@ impl Level {
         }
     }
 
-    /// Remove the block at `pos`; false when there was nothing to remove.
-    pub fn destroy_block(&mut self, pos: &BlockPos) -> bool {
+    /// Remove the block at `pos`, a mod's own state or a native one; false
+    /// when there was nothing to remove. `drop` is `destroyBlock`'s
+    /// `dropBlock`.
+    pub fn destroy_block(&mut self, pos: &BlockPos, drop: bool) -> bool {
         let key = [pos.x, pos.y, pos.z];
-        let existed = self
-            .blocks
-            .get(&key)
-            .is_some_and(|state| state.block.id != "minecraft:air");
+        let existed = self.mod_states.remove(&key).is_some()
+            || self
+                .blocks
+                .get(&key)
+                .is_some_and(|state| state.block.id != "minecraft:air");
         if existed {
             self.blocks.insert(key, BlockState::new("minecraft:air"));
-            self.broken.push(pos.clone());
+            self.broken.push((pos.clone(), drop));
         }
         existed
     }

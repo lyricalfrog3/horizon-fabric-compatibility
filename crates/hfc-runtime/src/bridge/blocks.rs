@@ -352,6 +352,14 @@ pub struct ItemDrop {
     pub count: u32,
 }
 
+/// A block a mod's code removed (`Level.removeBlock`, `destroyBlock`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRemoval {
+    pub pos: [i32; 3],
+    /// `destroyBlock`'s `dropBlock`: the block's loot drops when true.
+    pub drop: bool,
+}
+
 /// What a mod's block code changed, for the host to apply.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BlockEffects {
@@ -363,6 +371,8 @@ pub struct BlockEffects {
     pub particles: Vec<ParticleBurst>,
     /// The items it dropped.
     pub drops: Vec<ItemDrop>,
+    /// The blocks it removed.
+    pub removals: Vec<BlockRemoval>,
 }
 
 /// What using a registered block (right-click) did.
@@ -465,7 +475,17 @@ impl super::FabricBridge {
         match result {
             Ok(None) => BlockUse::Passed,
             Ok(Some(level)) => match self.effects_of(level) {
-                Ok(effects) => BlockUse::Handled(effects),
+                Ok(effects) => {
+                    // Do not consume a click whose removal the host cannot
+                    // carry out: its own path stays in charge.
+                    if !effects.removals.is_empty() && !host.can_remove_blocks() {
+                        BlockUse::Failed(
+                            "block code removed a block, which this host cannot do".into(),
+                        )
+                    } else {
+                        BlockUse::Handled(effects)
+                    }
+                }
                 Err(error) => BlockUse::Failed(error.to_string()),
             },
             Err(error) => BlockUse::Failed(error.to_string()),
@@ -513,15 +533,16 @@ impl super::FabricBridge {
     /// The changes, block ticks and particles a level a mod's code wrote is
     /// holding, drained.
     fn effects_of(&mut self, level: usize) -> hfc_core::Result<BlockEffects> {
-        let (particles, scheduled, dropped) = match self.interp.heap.get_native_mut::<Level>(level)
-        {
-            Some(level) => (
-                std::mem::take(&mut level.particles),
-                std::mem::take(&mut level.scheduled),
-                std::mem::take(&mut level.dropped_stacks),
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new()),
-        };
+        let (particles, scheduled, dropped, broken) =
+            match self.interp.heap.get_native_mut::<Level>(level) {
+                Some(level) => (
+                    std::mem::take(&mut level.particles),
+                    std::mem::take(&mut level.scheduled),
+                    std::mem::take(&mut level.dropped_stacks),
+                    std::mem::take(&mut level.broken),
+                ),
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
         let schedules = scheduled
             .into_iter()
             .filter_map(|(pos, object, delay)| {
@@ -551,7 +572,7 @@ impl super::FabricBridge {
                 speed: call.speed,
             })
             .collect();
-        let changes = self
+        let changes: Vec<BlockChange> = self
             .interp
             .level_writes(level)?
             .into_iter()
@@ -561,6 +582,25 @@ impl super::FabricBridge {
                 properties: crate::place_builtins::parse_state_key(&key),
             })
             .collect();
+        let removals: Vec<BlockRemoval> = broken
+            .into_iter()
+            .map(|(pos, drop)| BlockRemoval {
+                pos: [pos.x, pos.y, pos.z],
+                drop,
+            })
+            .collect();
+        // `level_writes` keeps the last write per position, and a removal has
+        // no sequence beside it: if both touched a position, the order is not
+        // known, so nothing is applied rather than guessing.
+        if let Some(change) = changes
+            .iter()
+            .find(|change| removals.iter().any(|removal| removal.pos == change.pos))
+        {
+            return Err(hfc_core::Error::new(
+                "interpreter",
+                format!("block code both set and removed {:?}", change.pos),
+            ));
+        }
         let drops = dropped
             .into_iter()
             .filter(|(_, item, count)| *count > 0 && !item.is_empty() && item != "minecraft:air")
@@ -575,6 +615,7 @@ impl super::FabricBridge {
             schedules,
             particles,
             drops,
+            removals,
         })
     }
 
@@ -603,6 +644,14 @@ impl super::FabricBridge {
                         change.pos
                     );
                 }
+            }
+        }
+        for removal in &effects.removals {
+            if !host.remove_block(removal.pos, removal.drop) {
+                log::warn!(
+                    "Fabric: block code removed {:?}, which the host refused",
+                    removal.pos
+                );
             }
         }
         for drop in &effects.drops {
@@ -685,5 +734,21 @@ mod tests {
         );
         // Drained, not left for the next call to apply twice.
         assert!(bridge.effects_of(level_id).unwrap().drops.is_empty());
+    }
+
+    /// The level holds a mod's own state for a position; a removal must find
+    /// it, not only the native block map.
+    #[test]
+    fn removing_a_mod_state_leaves_air_and_records_the_removal() {
+        let mut level = Level::new(false);
+        let pos = BlockPos { x: 4, y: 1, z: 4 };
+        level.mod_states.insert([4, 1, 4], 1234);
+        assert!(level.destroy_block(&pos, false));
+        assert_eq!(level.get_block_state(&pos).block.id, "minecraft:air");
+        assert!(level.mod_states.get(&[4, 1, 4]).is_none());
+        assert_eq!(level.broken, [(pos.clone(), false)]);
+        // Nothing is there now: no removal is recorded.
+        assert!(!level.destroy_block(&pos, true));
+        assert_eq!(level.broken.len(), 1);
     }
 }

@@ -114,12 +114,17 @@ impl Vfs {
             if let Some(dir) = real.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
+            if !append {
+                // A truncating write replaces the file: write a temporary
+                // sibling and rename it into place, so a crash never leaves a
+                // half-written config.
+                return hfc_core::atomic_write(&real, bytes).is_ok();
+            }
             use std::io::Write;
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
-                .append(append)
-                .truncate(!append)
+                .append(true)
                 .open(real);
             return file.and_then(|mut f| f.write_all(bytes)).is_ok();
         }

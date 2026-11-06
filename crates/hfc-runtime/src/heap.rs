@@ -41,6 +41,9 @@ pub struct Heap {
     pub(crate) registered_block_items: Vec<(String, usize, usize)>,
     /// What `collect_block_facts` read from the registered blocks.
     pub(crate) block_facts: Vec<crate::bridge::RegisteredBlock>,
+    /// The ids of the registered blocks, for an O(1) membership test on the
+    /// scheduled-tick path.
+    pub(crate) block_ids: std::collections::HashSet<String>,
     /// Whether `block_facts` carries the blocks' outline and collision shapes:
     /// `read_block_shapes` read them for every block. Facts cached without
     /// shapes are still valid facts, but whoever reads them must ask for the
@@ -82,6 +85,7 @@ impl Heap {
             registered_blocks: Vec::new(),
             registered_block_items: Vec::new(),
             block_facts: Vec::new(),
+            block_ids: std::collections::HashSet::new(),
             block_facts_shapes: false,
             block_state_objects: HashMap::new(),
             unsupported_item_properties: Vec::new(),

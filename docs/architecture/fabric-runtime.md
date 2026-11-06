@@ -691,8 +691,19 @@ the client's **Particles** option gates it: at *Minimal*, a normal type such as 
 is not drawn (only particles that override the limiter are), so a running block that draws with
 particles looks inert until the option is *All* or *Decreased*.
 
-The schedule lives in memory: it is not saved with the world, so a block that ticks itself (a
-running shower) stops when the world is reloaded. Vanilla saves its scheduled ticks.
+Fabric ticks go through the level's vanilla `Ticks` scheduler rather than a list of their own.
+`HostBridge::schedule_block_tick` resolves the block's default state and schedules its `BlockId`
+at the game time plus the delay, so a position/block pair is deduplicated, the schedule follows
+the dimension, and it is saved in the chunk's vanilla `block_ticks` list (the `i` field is the
+block's name, which includes content-mod blocks) and restored when the chunk loads. When the
+scheduler makes one due, `GameLevel::before_tick_block` queues it after native mods had their
+chance, and the server thread runs `FabricBridge::tick_block` right after the level's own block
+ticks. At most 10 ms of Fabric ticks run in one game tick; the rest are rescheduled one tick out
+(vanilla runs every due tick, so this is a deliberate difference).
+
+Measured: a running shower head saved `block_ticks: [{i: mdm:shower_head, x: -20, y: 70, z: 9,
+t: 1}]` in its chunk, and after `save`/`quit` and a relaunch it sprayed without a click. A
+Fabric container block's items (a cabinet with 5 stone) survived the same reload.
 
 mdm's shower head is the worked example: right-click toggles `running` and schedules a tick 2 ticks
 out; each tick sends one `minecraft:falling_water` particle at each outlet and re-schedules itself;

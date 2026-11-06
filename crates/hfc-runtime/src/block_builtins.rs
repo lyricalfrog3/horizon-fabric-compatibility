@@ -573,6 +573,7 @@ impl Interpreter {
             }
             facts.push(block);
         }
+        self.heap.block_ids = facts.iter().map(|block| block.id.clone()).collect();
         self.heap.block_facts = facts;
     }
 

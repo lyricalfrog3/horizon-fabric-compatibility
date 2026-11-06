@@ -143,6 +143,11 @@ impl FabricBridge {
         Some(key)
     }
 
+    /// Whether `id` is a block a mod registered in code, from the facts list.
+    pub fn is_registered_block(&self, id: &str) -> bool {
+        self.interp.heap.block_ids.contains(id)
+    }
+
     /// Whether the facts in the heap came back from the cache instead of being
     /// read from the mod's blocks.
     pub fn block_facts_from_cache(&self) -> bool {
@@ -206,6 +211,7 @@ impl FabricBridge {
             );
             return false;
         }
+        self.interp.heap.block_ids = cached.blocks.iter().map(|block| block.id.clone()).collect();
         self.interp.heap.block_facts = cached.blocks;
         self.interp.heap.block_facts_shapes = cached.shapes;
         self.block_facts_cache.from_cache = true;

@@ -34,7 +34,7 @@ use std::time::SystemTime;
 /// Bumped when the facts a start reads out of a block change meaning: a field
 /// added to [`RegisteredBlock`] or its states, or a different way of reading
 /// them in `block_builtins.rs`. A cache from another version is a miss.
-pub const BLOCK_FACTS_CACHE_VERSION: u32 = 1;
+pub const BLOCK_FACTS_CACHE_VERSION: u32 = 2;
 
 /// `fabric-blocks` under the game folder's `.horizon-cache/`.
 pub const CACHE_DIR: &str = "fabric-blocks";

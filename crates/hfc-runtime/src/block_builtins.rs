@@ -11,9 +11,11 @@
 
 use crate::bridge::items::ItemProperties;
 use crate::bridge::{BlockSound, RegisteredBlock, RegisteredState};
-use crate::builtins::{identifier_text, registry_kind};
+use crate::builtins::{BuiltinResult, identifier_text, registry_kind};
+use crate::heap::Heap;
 use crate::interp::Interpreter;
 use crate::item_builtins::ITEM_FIELD;
+use crate::minecraft::{EnumProperty, IntegerProperty, TagKey};
 use crate::value::{JavaObject, Value};
 use hfc_core::{Error, Result};
 use std::collections::BTreeMap;
@@ -38,6 +40,139 @@ pub(crate) struct BlockRecord {
 
 fn failure(what: impl Into<String>) -> Error {
     Error::new("interpreter", what.into())
+}
+
+/// Calls on a block-state `Property`. A native [`IntegerProperty`] has no
+/// Java fields, so its `getName`/`getPossibleValues`/name-of-a-value are
+/// answered here instead of running the abstract Java methods.
+pub(crate) fn property_method(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    if class_name != PROPERTY {
+        return None;
+    }
+    let this = args.first()?.as_obj()?;
+    let name = |heap: &Heap| -> Option<String> {
+        if let Some(property) = heap.get_native::<IntegerProperty>(this) {
+            return Some(property.name.clone());
+        }
+        if let Some(property) = heap.get_native::<EnumProperty>(this) {
+            return Some(property.name.clone());
+        }
+        // An unset `BlockStateProperties` static is the runtime's TagKey
+        // placeholder; its id is the property's field name (`waterlogged`).
+        if let Some(tag) = heap.get_native::<TagKey>(this) {
+            return Some(tag.id.clone());
+        }
+        match heap.get(this)? {
+            JavaObject::Instance { fields, .. } => heap
+                .get_string(fields.get("name")?.as_obj()?)
+                .map(str::to_string),
+            _ => None,
+        }
+    };
+    let string = |heap: &mut Heap, text: String| {
+        let id = heap.alloc_string(text);
+        Value::Object(Some(id))
+    };
+    match (method_name, descriptor) {
+        ("getName", "()Ljava/lang/String;") => {
+            Some(BuiltinResult::Handled(string(heap, name(heap)?)))
+        }
+        ("getName", "(Ljava/lang/Comparable;)Ljava/lang/String;") => {
+            if let Some(property) = heap.get_native::<IntegerProperty>(this) {
+                let value = args.get(1).map(Value::as_int).unwrap_or(property.min);
+                return Some(BuiltinResult::Handled(string(heap, value.to_string())));
+            }
+            if heap
+                .get_native::<TagKey>(this)
+                .is_some_and(|tag| tag.id == "half")
+            {
+                let text = args
+                    .get(1)
+                    .and_then(|value| match value.as_obj().and_then(|id| heap.get(id)) {
+                        Some(JavaObject::String(text)) => Some(text.clone()),
+                        Some(JavaObject::Instance { fields, .. }) => fields
+                            .get("name")
+                            .and_then(Value::as_obj)
+                            .and_then(|id| heap.get_string(id))
+                            .map(str::to_string),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "lower".into())
+                    .to_ascii_lowercase();
+                return Some(BuiltinResult::Handled(string(heap, text)));
+            }
+            if let Some(property) = heap.get_native::<EnumProperty>(this) {
+                let wanted = args.get(1).cloned().unwrap_or(Value::NULL);
+                let text = wanted
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .map(str::to_string)
+                    .or_else(|| {
+                        let JavaObject::Instance { fields, .. } = heap.get(wanted.as_obj()?)?
+                        else {
+                            return None;
+                        };
+                        fields
+                            .get("name")
+                            .and_then(Value::as_obj)
+                            .and_then(|id| heap.get_string(id))
+                            .map(str::to_string)
+                    })
+                    .or_else(|| property.values.first().cloned())?;
+                let text = text.to_ascii_lowercase();
+                return Some(BuiltinResult::Handled(string(heap, text)));
+            }
+            if heap.get_native::<TagKey>(this).is_some() {
+                let text = args
+                    .get(1)
+                    .and_then(|value| {
+                        value
+                            .as_obj()
+                            .and_then(|id| heap.get_string(id))
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| {
+                        if args.get(1).map(Value::as_int).unwrap_or(0) != 0 {
+                            "true".into()
+                        } else {
+                            "false".into()
+                        }
+                    });
+                return Some(BuiltinResult::Handled(string(heap, text)));
+            }
+            None
+        }
+        ("getPossibleValues", "()Ljava/util/List;") => {
+            let values: Vec<Value> =
+                if let Some(property) = heap.get_native::<IntegerProperty>(this) {
+                    (property.min..=property.max).map(Value::Int).collect()
+                } else if heap
+                    .get_native::<TagKey>(this)
+                    .is_some_and(|tag| tag.id == "half")
+                {
+                    vec![
+                        Value::Object(Some(heap.alloc_string("lower".to_string()))),
+                        Value::Object(Some(heap.alloc_string("upper".to_string()))),
+                    ]
+                } else if heap.get_native::<TagKey>(this).is_some() {
+                    vec![
+                        Value::Object(Some(heap.alloc_string("true".to_string()))),
+                        Value::Object(Some(heap.alloc_string("false".to_string()))),
+                    ]
+                } else {
+                    return None;
+                };
+            let list = heap.alloc_list(values);
+            Some(BuiltinResult::Handled(Value::Object(Some(list))))
+        }
+        _ => None,
+    }
 }
 
 impl Interpreter {
@@ -240,12 +375,26 @@ impl Interpreter {
     }
 
     fn sound_type(&mut self, state: &Value) -> Result<BlockSound> {
-        let sound = self.call_object(
+        // A block whose `Properties` did not carry a `SoundType` still has
+        // vanilla's default (stone); a missing sound must not drop the block.
+        let default = || BlockSound {
+            volume: 1.0,
+            pitch: 1.0,
+            break_sound: "minecraft:block.stone.break".into(),
+            step: "minecraft:block.stone.step".into(),
+            place: "minecraft:block.stone.place".into(),
+            hit: "minecraft:block.stone.hit".into(),
+            fall: "minecraft:block.stone.fall".into(),
+        };
+        let sound = match self.call_object(
             STATE_BASE,
             "getSoundType",
             "()Lnet/minecraft/world/level/block/SoundType;",
             std::slice::from_ref(state),
-        )?;
+        ) {
+            Ok(sound) => sound,
+            Err(_) => return Ok(default()),
+        };
         let event = |interp: &Interpreter, name: &str| {
             interp
                 .instance_field(&sound, name)
@@ -259,15 +408,29 @@ impl Interpreter {
                 .map(|v| v.as_float())
                 .ok_or_else(|| failure(format!("SoundType.{name} is missing")))
         };
-        Ok(BlockSound {
-            volume: number(self, "volume")?,
-            pitch: number(self, "pitch")?,
-            break_sound: event(self, "breakSound")?,
-            step: event(self, "stepSound")?,
-            place: event(self, "placeSound")?,
-            hit: event(self, "hitSound")?,
-            fall: event(self, "fallSound")?,
-        })
+        let parts = (
+            number(self, "volume"),
+            number(self, "pitch"),
+            event(self, "breakSound"),
+            event(self, "stepSound"),
+            event(self, "placeSound"),
+            event(self, "hitSound"),
+            event(self, "fallSound"),
+        );
+        match parts {
+            (Ok(volume), Ok(pitch), Ok(break_sound), Ok(step), Ok(place), Ok(hit), Ok(fall)) => {
+                Ok(BlockSound {
+                    volume,
+                    pitch,
+                    break_sound,
+                    step,
+                    place,
+                    hit,
+                    fall,
+                })
+            }
+            _ => Ok(default()),
+        }
     }
 
     /// The facts of a state that are fields its constructor stored or trivial
@@ -298,16 +461,18 @@ impl Interpreter {
             .execute_method(STATE_BASE, "canOcclude", "()Z", this)?
             .as_int()
             != 0;
-        let color = self.call_object(
-            STATE_BASE,
-            "getMapColor",
-            "(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/material/MapColor;",
-            &[state.clone(), getter.clone(), pos.clone()],
-        )?;
+        // A mod block without a map colour is still a block; the colour is
+        // only what the map draws it as, so a missing one is 0, not an error.
         let map_color_id = self
-            .instance_field(&color, "id")
-            .ok_or_else(|| failure("MapColor has no id"))?
-            .as_int();
+            .call_object(
+                STATE_BASE,
+                "getMapColor",
+                "(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/material/MapColor;",
+                &[state.clone(), getter.clone(), pos.clone()],
+            )
+            .ok()
+            .and_then(|color| self.instance_field(&color, "id"))
+            .map_or(0, |id| id.as_int());
         let sound = self.sound_type(state)?;
         Ok(RegisteredState {
             hardness,
@@ -552,8 +717,10 @@ impl Interpreter {
         if records.is_empty() {
             return;
         }
+        let previous_budget = self.step_budget;
         self.step_budget = Some(budget);
         let Some((getter, pos)) = self.fact_arguments() else {
+            self.step_budget = previous_budget;
             return;
         };
         let mut facts = Vec::with_capacity(records.len());
@@ -575,6 +742,7 @@ impl Interpreter {
         }
         self.heap.block_ids = facts.iter().map(|block| block.id.clone()).collect();
         self.heap.block_facts = facts;
+        self.step_budget = previous_budget;
     }
 
     /// Compute the outline and collision shapes of the registered blocks named
@@ -587,6 +755,7 @@ impl Interpreter {
         let Some((getter, pos)) = self.fact_arguments() else {
             return;
         };
+        let previous_budget = self.step_budget;
         let records = self.heap.registered_blocks.clone();
         let mut facts = std::mem::take(&mut self.heap.block_facts);
         let total = if only.is_empty() {
@@ -658,5 +827,6 @@ impl Interpreter {
             self.heap.block_facts_shapes = true;
         }
         self.heap.block_facts = facts;
+        self.step_budget = previous_budget;
     }
 }

@@ -830,11 +830,26 @@ pub(crate) fn registry_kind(heap: &Heap, value: &Value) -> Option<String> {
     let id = value.as_obj()?;
     match heap.get(id)? {
         JavaObject::String(s) => Some(s.clone()),
-        JavaObject::Instance { fields, .. } => fields
-            .get("kind")
-            .and_then(|k| k.as_obj())
-            .and_then(|k| heap.get_string(k))
-            .map(str::to_string),
+        JavaObject::Instance { fields, .. } => {
+            if let Some(kind) = fields
+                .get("kind")
+                .and_then(|k| k.as_obj())
+                .and_then(|k| heap.get_string(k))
+            {
+                return Some(kind.to_string());
+            }
+            // A real `MappedRegistry`: its `key` is `minecraft:<registry path>`.
+            // The synthetic kinds are the upper-cased path (`BLOCK` for
+            // `minecraft:block`), so both forms answer the same token.
+            let key = fields.get("key")?.as_obj()?;
+            let JavaObject::Instance { fields: key, .. } = heap.get(key)? else {
+                return None;
+            };
+            let location = key.get("location")?;
+            let text = identifier_text(heap, location)?;
+            let (_, path) = text.split_once(':')?;
+            Some(path.to_ascii_uppercase())
+        }
         _ => None,
     }
 }
@@ -1346,10 +1361,21 @@ pub fn dispatch_builtin(
         return result;
     }
 
+    // Block-state properties: a native IntegerProperty has no Java fields.
+    if let Some(result) =
+        crate::block_builtins::property_method(heap, class_name, method_name, descriptor, args)
+    {
+        return result;
+    }
+
     // The item list a creative tab event listener records into.
     if let Some(result) =
         crate::creative_tab_builtins::output_method(heap, method_name, descriptor, args)
     {
+        return result;
+    }
+    // A mod's own tab generator writes into its list with the same calls.
+    if let Some(result) = crate::creative_tab_builtins::tab_items_method(heap, method_name, args) {
         return result;
     }
 

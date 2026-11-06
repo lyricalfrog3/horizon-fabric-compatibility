@@ -207,6 +207,18 @@ impl ItemProperties {
         self.set("minecraft:enchantable", json!({ "value": value }));
     }
 
+    /// `Properties.food(FoodProperties, Consumable)`: the food component and
+    /// what consuming it does.
+    pub fn food(&mut self, food: Value, consumable: Value) {
+        self.set("minecraft:food", food);
+        self.set("minecraft:consumable", consumable);
+    }
+
+    /// `Properties.craftRemainder(Item)`.
+    pub fn craft_remainder(&mut self, item: &str) {
+        self.set("minecraft:use_remainder", json!({ "id": item }));
+    }
+
     /// `Properties.repairable(TagKey)`.
     pub fn repairable_tag(&mut self, tag: &str) {
         self.set(
@@ -480,6 +492,14 @@ pub(crate) fn export(id: &str, properties: &ItemProperties) -> RegisteredItem {
 }
 
 impl super::FabricBridge {
+    /// The creative tabs mods registered in code, with the items their
+    /// generators accepted.
+    pub fn registered_creative_tabs(
+        &self,
+    ) -> Vec<crate::creative_tab_builtins::ExportedCreativeTab> {
+        self.interp.heap.creative_tab_exports.clone()
+    }
+
     /// The items mods registered in the item registry, in registration order, as
     /// Horizon content items. Only data crosses: a custom `Item` subclass's
     /// behaviour does not.

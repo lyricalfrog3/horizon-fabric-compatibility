@@ -1,5 +1,6 @@
 //! Bridge connecting Horizon's native host hooks to the dynamic Fabric runtime.
 
+pub use crate::creative_tab_builtins::ExportedCreativeTab;
 use crate::interp::Interpreter;
 use crate::loader::ClassLoader;
 use crate::minecraft::{
@@ -484,7 +485,8 @@ impl FabricBridge {
         (
             self.interp.heap.registered_blocks.len(),
             self.interp.heap.registered_items.len(),
-            self.interp.heap.creative_tab_additions.len(),
+            self.interp.heap.creative_tab_additions.len()
+                + self.interp.heap.creative_tab_exports.len(),
         )
     }
 

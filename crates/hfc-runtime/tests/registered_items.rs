@@ -577,3 +577,76 @@ fn a_passing_use_block_listener_lets_vanilla_handle_the_click() {
         hfc_runtime::bridge::Flow::Continue
     );
 }
+
+/// Farmer's Delight is the broadest content mod used for development: its food
+/// comes from `Item.Properties.food`, its tab from a `CreativeModeTab` it
+/// builds in code, and most of its blocks carry a map colour the facts do not
+/// need. The test needs the jar under `test-mods/corpus/`; it skips without it.
+#[test]
+fn farmers_delight_food_its_tab_and_blocks_are_exported() {
+    let jar = root()
+        .join("test-mods/corpus")
+        .join("FarmersDelight-26.3-3.6.30+refabricated.jar");
+    let api = root().join("test-mods").join("fabric-api-0.165.0+26.3.jar");
+    if !jar.exists() || !api.exists() {
+        eprintln!("skipped: Farmer's Delight or Fabric API is not present");
+        return;
+    }
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        return;
+    };
+    bridge.load_mod_jar(api).unwrap();
+    bridge.load_mod_jar(jar).unwrap();
+    bridge.init().unwrap();
+
+    let items = bridge.registered_items();
+    let bacon = items
+        .iter()
+        .find(|item| item.id == "farmersdelight:bacon")
+        .expect("Farmer's Delight registers bacon");
+    assert!(
+        bacon.components.contains_key("minecraft:food"),
+        "food is modelled: {:?}",
+        bacon.components.keys().collect::<Vec<_>>()
+    );
+    assert!(bacon.components.contains_key("minecraft:consumable"));
+
+    let tabs = bridge.registered_creative_tabs();
+    let tab = tabs
+        .iter()
+        .find(|tab| tab.id.starts_with("farmersdelight:"))
+        .expect("Farmer's Delight registers a creative tab");
+    assert!(!tab.title.is_empty(), "{tab:?}");
+    assert!(
+        tab.items
+            .iter()
+            .any(|item| item.starts_with("farmersdelight:")),
+        "{tab:?}"
+    );
+
+    let blocks = bridge.registered_blocks();
+    let stove = blocks
+        .iter()
+        .find(|block| block.id == "farmersdelight:stove")
+        .expect("the stove is a block");
+    assert!(!stove.states.is_empty(), "{stove:?}");
+    assert!(stove.unreadable.is_empty(), "{:?}", stove.unreadable);
+    // Signs name their properties through a native IntegerProperty, which the
+    // facts used to read as null; they are declared now too.
+    let sign = blocks
+        .iter()
+        .find(|block| block.id == "farmersdelight:canvas_sign")
+        .expect("the canvas sign is a block");
+    assert!(!sign.states.is_empty(), "{sign:?}");
+    assert!(sign.unreadable.is_empty(), "{:?}", sign.unreadable);
+    // `BlockStateProperties.HALF` is an enum (lower/upper), not a boolean.
+    let rice = blocks
+        .iter()
+        .find(|block| block.id == "farmersdelight:wild_rice")
+        .expect("wild rice is a block");
+    assert_eq!(
+        rice.properties.get("half"),
+        Some(&vec!["lower".to_string(), "upper".to_string()]),
+        "{rice:?}"
+    );
+}

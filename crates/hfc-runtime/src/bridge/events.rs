@@ -982,7 +982,9 @@ impl FabricBridge {
         let border_end = Value::Int(*border_bottom as i32);
 
         for listener in listeners {
-            let res = self.interp.execute_method(
+            let res = self
+                .interp
+                .with_budget(super::ENTRYPOINT_BUDGET, |interp| interp.execute_method(
                 "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents$ColorExt",
                 "onColor",
                 "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/client/gui/GuiGraphicsExtractor;IILnet/minecraft/client/gui/Font;IIIILjava/util/List;ZILnet/minecraft/resources/Identifier;ZZ)Lcom/anthonyhilyard/iceberg/events/client/RenderTooltipEvents$ColorExtResult;",
@@ -1004,7 +1006,8 @@ impl FabricBridge {
                     Value::from_bool(false),
                     Value::from_bool(false),
                 ],
-            );
+            ))
+            ;
 
             if let Ok(Value::Object(Some(res_id))) = res {
                 if let Some(JavaObject::Instance { fields, .. }) = self.interp.heap.get(res_id) {

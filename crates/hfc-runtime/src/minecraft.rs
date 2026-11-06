@@ -521,6 +521,26 @@ impl NativeObject for TagKey {
     }
 }
 
+/// An EnumProperty for block state properties whose Java initializer did not
+/// produce one (`BlockStateProperties.HALF`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumProperty {
+    pub name: String,
+    pub values: Vec<String>,
+}
+
+impl NativeObject for EnumProperty {
+    fn class_name(&self) -> &str {
+        "net/minecraft/world/level/block/state/properties/EnumProperty"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// An IntegerProperty for block state properties (e.g. AGE).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegerProperty {
@@ -560,6 +580,7 @@ pub fn native_classes() -> &'static [&'static str] {
         "net/minecraft/world/level/block/CactusBlock",
         "net/minecraft/world/level/block/state/BlockState",
         "net/minecraft/world/level/block/state/properties/IntegerProperty",
+        "net/minecraft/world/level/block/state/properties/EnumProperty",
         "net/minecraft/core/BlockPos",
         "net/minecraft/core/Direction",
         "net/minecraft/world/phys/BlockHitResult",

@@ -75,18 +75,22 @@ impl FabricBridge {
             .heap
             .get_singleton("net/minecraft/client/Minecraft");
         for listener in listeners {
-            let _ = self.interp.execute_method(
-                "net/fabricmc/fabric/api/client/screen/v1/ScreenEvents$AfterInit",
-                "afterInit",
-                "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/client/gui/screens/Screen;II)V",
-                &[
-                    listener,
-                    mc.map(|id| Value::Object(Some(id))).unwrap_or(Value::NULL),
-                    screen.clone(),
-                    Value::Int(width),
-                    Value::Int(height),
-                ],
-            );
+            let _ = self
+                .interp
+                .with_budget(super::ENTRYPOINT_BUDGET, |interp| {
+                    interp.execute_method(
+                        "net/fabricmc/fabric/api/client/screen/v1/ScreenEvents$AfterInit",
+                        "afterInit",
+                        "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/client/gui/screens/Screen;II)V",
+                        &[
+                            listener,
+                            mc.map(|id| Value::Object(Some(id))).unwrap_or(Value::NULL),
+                            screen.clone(),
+                            Value::Int(width),
+                            Value::Int(height),
+                        ],
+                    )
+                });
         }
     }
 
@@ -105,18 +109,21 @@ impl FabricBridge {
             .interp
             .heap
             .alloc_native(GuiGraphics::new(width, height));
-        self.interp.execute_method(
-            "net/minecraft/client/gui/screens/Screen",
-            "extractRenderStateWithTooltipAndSubtitles",
-            "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V",
-            &[
-                screen,
-                Value::Object(Some(graphics)),
-                Value::Int(0),
-                Value::Int(0),
-                Value::Float(partial_tick),
-            ],
-        )?;
+        self.interp
+            .with_budget(super::ENTRYPOINT_BUDGET, |interp| {
+                interp.execute_method(
+                    "net/minecraft/client/gui/screens/Screen",
+                    "extractRenderStateWithTooltipAndSubtitles",
+                    "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V",
+                    &[
+                        screen,
+                        Value::Object(Some(graphics)),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Float(partial_tick),
+                    ],
+                )
+            })?;
         let draws = self
             .interp
             .heap

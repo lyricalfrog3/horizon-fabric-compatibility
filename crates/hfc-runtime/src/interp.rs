@@ -156,6 +156,17 @@ impl Interpreter {
         }
     }
 
+    /// Run `f` under a fresh instruction budget, restoring the previous one
+    /// afterwards. A callback that runs out of budget leaves the interpreter
+    /// with none, which made every later callback fail at its first
+    /// instruction; this keeps one failure from poisoning the next.
+    pub(crate) fn with_budget<R>(&mut self, budget: u64, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.step_budget, Some(budget));
+        let result = f(self);
+        self.step_budget = previous;
+        result
+    }
+
     fn note_missing(&mut self, what: String) {
         if self.trace_missing {
             let caller = if self.trace_calls {
@@ -1571,6 +1582,9 @@ impl Interpreter {
             return Ok(value);
         }
         if let Some(value) = self.register_block(class_name, method_name, args) {
+            return Ok(value);
+        }
+        if let Some(value) = self.register_creative_tab(class_name, method_name, args) {
             return Ok(value);
         }
 

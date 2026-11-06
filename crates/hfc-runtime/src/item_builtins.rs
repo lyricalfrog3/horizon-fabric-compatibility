@@ -140,6 +140,53 @@ fn enum_name(heap: &Heap, value: &Value) -> Option<String> {
     }
 }
 
+/// `FoodProperties`'s record fields as the host's `minecraft:food` component.
+fn food_component(heap: &Heap, value: &Value) -> Option<Json> {
+    let JavaObject::Instance { fields, .. } = heap.get(value.as_obj()?)? else {
+        return None;
+    };
+    let nutrition = fields.get("nutrition")?.as_int();
+    let saturation = fields.get("saturation")?.as_float();
+    let can_always_eat = fields.get("canAlwaysEat").is_some_and(|v| v.as_int() != 0);
+    Some(serde_json::json!({
+        "nutrition": nutrition,
+        "saturation": saturation,
+        "can_always_eat": can_always_eat,
+    }))
+}
+
+/// The duration, animation, sound and particle flag of a `Consumable`.
+fn consumable_component(heap: &Heap, value: &Value) -> Json {
+    let mut json = serde_json::json!({
+        "consume_seconds": 1.6,
+        "animation": "eat",
+        "sound": "minecraft:entity.generic.eat",
+        "has_consume_particles": true,
+    });
+    let Some(JavaObject::Instance { fields, .. }) = value.as_obj().and_then(|id| heap.get(id))
+    else {
+        return json;
+    };
+    if let Some(seconds) = fields.get("consumeSeconds") {
+        json["consume_seconds"] = Json::from(f64::from(seconds.as_float()));
+    }
+    if let Some(particles) = fields.get("hasConsumeParticles") {
+        json["has_consume_particles"] = Json::from(particles.as_int() != 0);
+    }
+    if let Some(animation) = fields.get("animation").and_then(|a| a.as_obj()) {
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get(animation) {
+            if let Some(name) = fields
+                .get("name")
+                .and_then(Value::as_obj)
+                .and_then(|id| heap.get_string(id))
+            {
+                json["animation"] = Json::from(name.to_ascii_lowercase());
+            }
+        }
+    }
+    json
+}
+
 /// The methods of `Item.Properties` and `Item.<init>`.
 pub(crate) fn item_method(
     heap: &mut Heap,
@@ -204,6 +251,8 @@ fn properties_method(
         .as_obj()
         .and_then(|id| heap.get_native::<Item>(id))
         .map(|item| item.id.clone());
+    let food = food_component(heap, &arg(1));
+    let consumable = arg(2).as_obj().map(|_| consumable_component(heap, &arg(2)));
 
     let Some(properties) = heap.get_native_mut::<ItemProperties>(record) else {
         return BuiltinResult::Handled(this);
@@ -278,6 +327,27 @@ fn properties_method(
             }
             None => modelled = false,
         },
+        "food" => match food {
+            Some(food) => {
+                let consumable = consumable.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "consume_seconds": 1.6,
+                        "animation": "eat",
+                        "sound": "minecraft:entity.generic.eat",
+                        "has_consume_particles": true,
+                    })
+                });
+                properties.food(food, consumable);
+            }
+            None => modelled = false,
+        },
+        "craftRemainder" => match item {
+            Some(item) => properties.craft_remainder(&item),
+            None => modelled = false,
+        },
+        // Only the description key's prefix changes (`block.` instead of
+        // `item.`); the host looks up both, so there is nothing to export.
+        "useBlockDescriptionPrefix" => {}
         _ => modelled = false,
     }
     if !modelled {

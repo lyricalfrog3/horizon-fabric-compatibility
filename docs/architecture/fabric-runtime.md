@@ -368,16 +368,20 @@ value.
 
 Modelled `Properties` methods: `setId`, `stacksTo`, `durability`, `rarity`, `fireResistant`
 (`damage_resistant: #minecraft:is_fire`), `enchantable`, `repairable` (tag or a vanilla
-item), `tool`, `pickaxe`, `axe`, `hoe`, `shovel`, `sword`. Every other method (`food`,
-`component`, `attributes`, `spear`, `equippable`, armor, `requiredFeatures`, ...) is recorded
-as unsupported and logged once; `FabricBridge::unsupported_item_properties()` lists them.
-The exported item lacks what they would have set.
+item), `tool`, `pickaxe`, `axe`, `hoe`, `shovel`, `sword`, `food` (the `FoodProperties`
+record's nutrition, saturation and can-always-eat, plus a `Consumable` or vanilla's default
+eat), `craftRemainder` (`use_remainder`) and `useBlockDescriptionPrefix` (the host looks up
+both name forms). Other methods (`component`, `attributes`, `spear`, `equippable`, armor,
+`requiredFeatures`, ...) are recorded as unsupported and logged once;
+`FabricBridge::unsupported_item_properties()` lists them. The exported item lacks what they
+would have set.
 
 Templates. The vanilla tool of the same kind, so the item keeps vanilla's behaviour class
 (an axe strips logs, a hoe tills): `diamond_pickaxe` for pickaxes and `tool`,
 `diamond_axe`, `diamond_shovel`, `diamond_hoe`, `diamond_sword`. A plain item uses
 `minecraft:flint`, which vanilla builds with `new Item(new Properties())` and which carries
-only the components every item has (no fuel value, trim material or food). The patch sets
+only the components every item has (no fuel value or trim material; a food item sets
+`minecraft:food` and `minecraft:consumable` from its properties). The patch sets
 every component the properties determine and removes (`!minecraft:x`) a component the
 template carries that they did not set. `item_model` and `item_name` are not set: Horizon
 renames the template's id inside the copied item, which rewrites both. `max_stack_size` and
@@ -415,9 +419,20 @@ records each `accept`/`prepend`/`insertAfter`/`insertBefore`. Items resolve to i
 mod-registered item object, a vanilla `Items.X` (also as an anchor) or an `ItemStack`'s
 item. Only data crosses: stack components on an `ItemStack` are not exported.
 
-Verified by `emerald_tools_creative_tab_placement`: `tools_and_utilities` gets the pickaxe,
-axe, shovel and hoe with `End`, `combat` gets the sword. No fixture mod uses
-`insertAfter`/`insertBefore`/`prepend`; their ordering is untested.
+A mod can also build and register **its own tab** (`CreativeModeTab.builder()` and
+`Registry.register(..., CREATIVE_MODE_TAB, ...)`). The runtime records it by the value's
+class, runs its `displayItems` generator into a native item list (`CreativeTabItems`, the
+same host boundary as above) and exports a content-mod `data/<ns>/horizon/creative_tab/`
+file with the title (the component's English text), the icon item and the items in generator
+order. If the icon supplier answers a stack shape the runtime does not read, the first item
+stands in as the icon; otherwise the tab is rejected by the content fence and takes its
+whole mod down, so the fallback is required.
+
+Verified by `farmers_delight_food_its_tab_and_blocks_are_exported`: Farmer's Delight's own
+tab exports its foods and tools, its bacon carries `minecraft:food`, and a live run shows
+the tab in the creative inventory. `emerald_tools_creative_tab_placement` covers the
+existing tabs; no fixture mod uses `insertAfter`/`insertBefore`/`prepend`, so their ordering
+is untested.
 
 Also changed: `BlockTags.X`/`ItemTags.X` constants now carry their real id
 (`minecraft:mineable/pickaxe`), read from the tag class's initializer, instead of the
@@ -546,7 +561,11 @@ by calling the real bytecode: `Block` getters, `StateDefinition.getProperties` a
 sound type, occlusion) and the `defaultBlockState` field. `FabricBridge::registered_blocks`
 returns them as `RegisteredBlock`. A fact that fails to read goes into `unreadable`; nothing
 is guessed. The BlockItem of each block comes from the item registration (`BlockItem.block`),
-with the components its `Item.Properties` set (`item_components`). `overrides` lists the
+with the components its `Item.Properties` set (`item_components`). A state without a map
+colour or sound type keeps vanilla's defaults (0 and stone) instead of dropping the block;
+properties whose Java initializer did not complete (`BlockStateProperties.HALF`,
+`WATERLOGGED`) are answered from their native stand-ins. The facts cache version is bumped
+when any of this changes. `overrides` lists the
 vanilla methods the mod's own classes override, as `<vanilla class>.<method>` (the most derived
 vanilla class in the chain declaring the same name and descriptor; constructors, static and
 private methods left out), read from the loaded class files: it tells which vanilla behaviour

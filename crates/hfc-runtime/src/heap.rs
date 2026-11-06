@@ -55,6 +55,10 @@ pub struct Heap {
     pub unsupported_item_properties: Vec<String>,
     /// Creative-tab placements the tab events' listeners made, in call order.
     pub(crate) creative_tab_additions: Vec<crate::bridge::items::CreativeTabAddition>,
+    /// Tabs mods registered in code, whose generators run after the entrypoints.
+    pub(crate) registered_creative_tabs: Vec<crate::creative_tab_builtins::CreativeTabRecord>,
+    /// Those tabs' contents, as the host content loader reads them.
+    pub(crate) creative_tab_exports: Vec<crate::creative_tab_builtins::ExportedCreativeTab>,
     /// Creative-tab output calls the runtime does not model, each logged once.
     pub unsupported_creative_tab_calls: Vec<String>,
     /// The object count when the current block-code call opened its scope.
@@ -90,6 +94,8 @@ impl Heap {
             block_state_objects: HashMap::new(),
             unsupported_item_properties: Vec::new(),
             creative_tab_additions: Vec::new(),
+            registered_creative_tabs: Vec::new(),
+            creative_tab_exports: Vec::new(),
             unsupported_creative_tab_calls: Vec::new(),
             scope: None,
             escaped: false,

@@ -368,18 +368,20 @@ impl FabricBridge {
             .interp
             .heap
             .alloc_native(GuiGraphics::new(width, height));
-        let result = self.interp.execute_method(
-            "net/minecraft/client/gui/components/AbstractWidget",
-            "extractRenderState",
-            "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V",
-            &[
-                Value::Object(Some(id)),
-                Value::Object(Some(graphics)),
-                Value::Int(mouse_x),
-                Value::Int(mouse_y),
-                Value::Float(0.0),
-            ],
-        );
+        let result = self.interp.with_budget(super::ENTRYPOINT_BUDGET, |interp| {
+            interp.execute_method(
+                "net/minecraft/client/gui/components/AbstractWidget",
+                "extractRenderState",
+                "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V",
+                &[
+                    Value::Object(Some(id)),
+                    Value::Object(Some(graphics)),
+                    Value::Int(mouse_x),
+                    Value::Int(mouse_y),
+                    Value::Float(0.0),
+                ],
+            )
+        });
         if let Err(error) = result {
             log::warn!("Menu widget render failed: {error}");
             return Vec::new();

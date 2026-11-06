@@ -1172,6 +1172,68 @@ fn push_gui_draw(heap: &mut Heap, graphics: usize, draw: GuiDraw) {
     }
 }
 
+/// Where one `ServerLevel.sendParticles` overload keeps the arguments the
+/// runtime reads: `[receiver, ...]` positions of the particle type, the
+/// first coordinate (x; y and z follow), the count, the first spread (dx; dy
+/// and dz follow), and the speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParticleLayout {
+    particle: usize,
+    x: usize,
+    count: usize,
+    spread: usize,
+    speed: usize,
+    /// The `ServerPlayer`-first overload answers a boolean.
+    returns_bool: bool,
+}
+
+/// The argument layout of a 26.3 `ServerLevel.sendParticles` descriptor, or
+/// `None` for one the runtime does not model.
+fn particle_layout(descriptor: &str) -> Option<ParticleLayout> {
+    const PLAIN: &str = "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDD)I";
+    let plain = ParticleLayout {
+        particle: 1,
+        x: 2,
+        count: 5,
+        spread: 6,
+        speed: 9,
+        returns_bool: false,
+    };
+    let flagged = ParticleLayout {
+        particle: 1,
+        x: 4,
+        count: 7,
+        spread: 8,
+        speed: 11,
+        returns_bool: false,
+    };
+    let player = ParticleLayout {
+        particle: 2,
+        x: 5,
+        count: 8,
+        spread: 9,
+        speed: 12,
+        returns_bool: true,
+    };
+    match descriptor {
+        PLAIN
+        | "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDDDD)I"
+        | "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I"
+        | "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I" => {
+            Some(plain)
+        }
+        "(Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDD)I"
+        | "(Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I"
+        | "(Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I" => {
+            Some(flagged)
+        }
+        "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDD)Z" => {
+            Some(player)
+        }
+        _ => None,
+    }
+}
+
 pub fn dispatch_builtin(
     heap: &mut Heap,
     class_name: &str,
@@ -6074,35 +6136,52 @@ pub fn dispatch_builtin(
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
-        } else if method_name == "sendParticles" && args.len() >= 10 {
-            // `sendParticles(ParticleOptions, x, y, z, count, dx, dy, dz,
-            // speed)`: a simple particle type's id comes from the synthetic
-            // `ParticleTypes` constant.
-            let id = args[1]
-                .as_obj()
-                .and_then(|id| heap.get_native::<ParticleType>(id))
-                .map(|particle| particle.id.clone());
-            if let (Some(level_id), Some(id)) = (args[0].as_obj(), id) {
-                let call = ParticleCall {
-                    id,
-                    at: [
-                        args[2].as_double(),
-                        args[3].as_double(),
-                        args[4].as_double(),
-                    ],
-                    count: args[5].as_int(),
-                    spread: [
-                        args[6].as_double(),
-                        args[7].as_double(),
-                        args[8].as_double(),
-                    ],
-                    speed: args[9].as_double(),
-                };
-                if let Some(level) = heap.get_native_mut::<Level>(level_id) {
-                    level.particles.push(call);
+        } else if method_name == "sendParticles" {
+            // 26.3's overloads (`javap -s net.minecraft.server.level.ServerLevel`):
+            //   (ParticleOptions; DDD I DDD D)I
+            //   (ParticleOptions; DDD I DDD D RandomizationType)I
+            //   (ParticleOptions; DDD I DDD DD)I
+            //   (ParticleOptions; DDD I DDD DD RandomizationType)I
+            //   (ParticleOptions; ZZ DDD I DDD D)I
+            //   (ParticleOptions; ZZ DDD I DDD D RandomizationType)I
+            //   (ParticleOptions; ZZ DDD I DDD DD RandomizationType)I
+            //   (ServerPlayer; ParticleOptions; ZZ DDD I DDD D)Z
+            // Read the arguments where this descriptor puts them; an overload
+            // the runtime does not know falls through instead of being read
+            // with the wrong indices.
+            if let Some(layout) = particle_layout(descriptor) {
+                let id = args
+                    .get(layout.particle)
+                    .and_then(Value::as_obj)
+                    .and_then(|id| heap.get_native::<ParticleType>(id))
+                    .map(|particle| particle.id.clone());
+                if let (Some(level_id), Some(id)) = (args[0].as_obj(), id) {
+                    let call = ParticleCall {
+                        id,
+                        at: [
+                            args[layout.x].as_double(),
+                            args[layout.x + 1].as_double(),
+                            args[layout.x + 2].as_double(),
+                        ],
+                        count: args[layout.count].as_int(),
+                        spread: [
+                            args[layout.spread].as_double(),
+                            args[layout.spread + 1].as_double(),
+                            args[layout.spread + 2].as_double(),
+                        ],
+                        speed: args[layout.speed].as_double(),
+                    };
+                    if let Some(level) = heap.get_native_mut::<Level>(level_id) {
+                        level.particles.push(call);
+                    }
                 }
+                let count = args.get(layout.count).map_or(0, Value::as_int);
+                return BuiltinResult::Handled(if layout.returns_bool {
+                    Value::from_bool(true)
+                } else {
+                    Value::Int(count)
+                });
             }
-            return BuiltinResult::Handled(Value::Int(args[5].as_int()));
         } else if method_name == "setBlock" && args.len() >= 4 {
             // `setBlock(pos, state, flags)`: the state is a native one or a
             // mod block's own object; the bridge reads which when it hands the
@@ -6944,4 +7023,66 @@ pub(crate) fn direction_of(heap: &Heap, value: &Value) -> Option<Direction> {
         "east" | "EAST" => Direction::EAST,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ParticleLayout, particle_layout};
+
+    #[test]
+    fn every_26_3_send_particles_overload_keeps_its_argument_positions() {
+        let plain = ParticleLayout {
+            particle: 1,
+            x: 2,
+            count: 5,
+            spread: 6,
+            speed: 9,
+            returns_bool: false,
+        };
+        let flagged = ParticleLayout {
+            particle: 1,
+            x: 4,
+            count: 7,
+            spread: 8,
+            speed: 11,
+            returns_bool: false,
+        };
+        let player = ParticleLayout {
+            particle: 2,
+            x: 5,
+            count: 8,
+            spread: 9,
+            speed: 12,
+            returns_bool: true,
+        };
+        // The descriptors `javap -s net.minecraft.server.level.ServerLevel`
+        // prints for sendParticles.
+        for descriptor in [
+            "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDD)I",
+            "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDDDD)I",
+            "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I",
+            "(Lnet/minecraft/core/particles/ParticleOptions;DDDIDDDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I",
+        ] {
+            assert_eq!(particle_layout(descriptor), Some(plain), "{descriptor}");
+        }
+        for descriptor in [
+            "(Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDD)I",
+            "(Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I",
+            "(Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDDDDLnet/minecraft/network/protocol/game/ClientboundLevelParticlesPacket$RandomizationType;)I",
+        ] {
+            assert_eq!(particle_layout(descriptor), Some(flagged), "{descriptor}");
+        }
+        assert_eq!(
+            particle_layout(
+                "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/core/particles/ParticleOptions;ZZDDDIDDDD)Z"
+            ),
+            Some(player)
+        );
+        // An overload the runtime does not know is not guessed at.
+        assert_eq!(
+            particle_layout("(Lnet/minecraft/core/particles/ParticleOptions;I)I"),
+            None
+        );
+        assert_eq!(particle_layout("()V"), None);
+    }
 }

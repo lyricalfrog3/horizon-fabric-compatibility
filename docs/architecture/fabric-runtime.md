@@ -574,8 +574,37 @@ the mod replaced (mdm's beds override `AbstractBedBlock.setPlacedBy`).
 Shapes are not read in `init`: `Shapes.or` over many fine boxes costs tens of millions of
 instructions (three `electric_guitar_*` blocks ~40M each, ~168M for all 344 blocks, ~13 s
 release). `FabricBridge::read_block_shapes(ids)` runs `getShape`/`getCollisionShape` with
-`EmptyBlockGetter`, `BlockPos.ZERO` and `toAabbs()` for the given ids (empty = all), each
-under `BLOCK_SHAPE_BUDGET`.
+`EmptyBlockGetter`, `BlockPos.ZERO` and `toAabbs()` for the given ids (empty = all).
+
+That pass is bounded and memoized, because a cold start spends most of its shape time there:
+
+- every call runs under `BLOCK_SHAPE_BUDGET`, and every block under the same total, so one
+  block with thousands of states cannot hold the start. A state whose shape does not fit stays
+  `None` and the block's `unreadable` says so (the host then keeps the template's shape);
+- a `VoxelShape` is immutable, so its `toAabbs()` boxes are read once per shape object for the
+  whole pass. States that differ only in a property the shape ignores (waterlogged, lit) and
+  blocks whose outline is their collision shape share one read: Farmer's Delight's 2,580 states
+  went from 1.4 s to 0.26 s of shape reading;
+- a block whose classes do not replace `getShape`/`getCollisionShape` answers the same shapes
+  for every state (`BlockBehaviour`'s implementations ignore the state: `Shapes.block()`, and
+  that or `Shapes.empty()` from the block-wide `hasCollision`), so one state's pair is read and
+  given to the rest (27 of Farmer's Delight's 135 blocks, all their 4 to 8 states).
+
+### Shape maps keyed by an enum
+
+Minecraft caches rotated shapes in `java.util.EnumMap`s keyed by `Direction` (`Shapes`
+rotate helpers, `WallSignBlock.SHAPES`, `Direction.COUNTER_CLOCKWISE`, ...). `EnumMap` reads an
+enum's constants through `SharedSecrets.getJavaLangAccess()`, which on a JVM is filled in by the
+bootstrap (`System.initPhase1`), not by any class initializer, so the runtime installs the JDK's
+own `JavaLangAccess` (`java/lang/System$1`) when `SharedSecrets` initializes. Without it those
+maps were built over no constants: `Map.get(Direction.NORTH)` answered null for every facing,
+`getShape` answered null for 448 of Farmer's Delight's 2,580 states (signs, pies, baked feasts,
+baskets, beds) and the host fell back to the template's shape, and `Direction.getClockWise`/
+`getCounterClockWise` (which `BlockBehaviour.rotate`/`mirror` reach through
+`Rotation.rotate`/`Mirror.mirror`) answered null, so rotating a block's state could not produce
+the rotated facing at all. `crates/hfc-runtime/tests/vanilla_shape_maps.rs` pins the vanilla
+wall-sign table per facing, and the Farmer's Delight test pins the canvas wall sign's per-facing
+shapes and that every state of every block it registers now has one.
 
 General runtime fixes this needed: `Collection.toArray(T[])`, structural List map keys,
 adopting bytecode collections (Guava `ImmutableList`) into heap lists in `copyOf`/copy
@@ -788,7 +817,24 @@ scratch game for the cold and warm runs, a fresh one without mdm):
 Inside the cold start: mdm's entrypoint 5.1 s, facts 0.6 s, shapes 13.8 s, declarations 0.15 s.
 Inside the warm start: the same entrypoint 5.1 s, facts read back from the cache in 74 ms (key
 hashing included), no shape reading, declarations 0.16 s. The export (`content mod`) and the
-declaration run once per start in these runs, not twice.
+declaration run once per start in these runs, not twice. Re-measured after the shape pass was
+memoized and bounded: cold 23.6 s, warm 9.8 s (the entrypoint 46.1M instructions / 5.1 s
+either way), mdm's 344 blocks in 13.0 s, which is mostly the three `electric_guitar_*` blocks
+(~39M instructions each) and the shape algebra the mod's own code runs.
+
+Farmer's Delight (135 blocks, 2,580 states; release runtime, same scratch-game method, cold
+start measured before and after the shape pass was memoized and bounded): facts 0.14-0.15 s
+either way; shapes 0.61-0.64 s before, when 448 of the 2,580 states answered null and every one
+of them cost a full call, and 0.24-0.27 s after; declarations 0.12-0.14 s (132 of 135 blocks
+declared — the three crop blocks have no default state); `onInitialize` 25.2M instructions
+(2.8 s) before and 33.7M (3.0 s) after, because the mod's own code now runs the parts of its
+initialization that the empty shape maps used to cut short.
+`cargo run --release -p hfc-runtime --example block_profile -- <jars...>` prints the same
+phases without a client and, with `RUST_LOG=debug`, one line per block with its states,
+instructions and time: Farmer's Delight is dominated by `stuffed_pumpkin_block`,
+`shepherds_pie_block`, `honey_glazed_ham_block`, `cooking_pot` and the two `basket` blocks
+(0.5M-1.5M instructions each); mdm by the three `electric_guitar_*` blocks (~39M each, 3.6 s
+of the 13 s).
 
 What a hit cannot skip is `MdmMod.onInitialize` (~46M instructions, release ~5.1 s): it builds the
 `Block` objects the later stages run. That is the warm start's remaining gap to a game without

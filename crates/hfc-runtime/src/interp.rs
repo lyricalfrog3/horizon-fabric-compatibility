@@ -9,6 +9,9 @@ use crate::value::{JavaObject, Value};
 use hfc_core::{Error, Result};
 use std::collections::HashMap;
 
+/// `jdk.internal.access.SharedSecrets`, which the JVM's bootstrap fills in.
+const SHARED_SECRETS: &str = "jdk/internal/access/SharedSecrets";
+
 /// Classes whose static fields the runtime supplies itself
 /// ([`Interpreter::create_static_field_val`]). Running their real `<clinit>`
 /// builds Minecraft's whole item/block/tag registry, which takes tens of
@@ -238,8 +241,64 @@ impl Interpreter {
                     }
                 }
             }
+            if class_name == SHARED_SECRETS {
+                self.install_java_lang_access();
+            }
         }
         Ok(())
+    }
+
+    /// Do what `System.initPhase1` does for `SharedSecrets`: hand it the
+    /// JDK's own `JavaLangAccess` (the anonymous class `System` declares).
+    /// No JVM bootstrap runs here, so without this `getJavaLangAccess()`
+    /// answers null, and `EnumMap`/`EnumSet`, which read an enum's constants
+    /// through it, are built over no constants.
+    fn install_java_lang_access(&mut self) {
+        const ACCESS: &str = "jdk/internal/access/JavaLangAccess";
+        let assigned = self
+            .loader
+            .get(SHARED_SECRETS)
+            .and_then(|c| c.static_fields.get("javaLangAccess"))
+            .is_some_and(|v| !v.is_null());
+        if assigned {
+            return;
+        }
+        // `System`'s anonymous classes are numbered by the compiler; the one
+        // implementing the interface is the implementation.
+        let implementation = (1..64)
+            .map(|n| format!("java/lang/System${n}"))
+            .find(|name| {
+                matches!(self.loader.get_or_load(name), Ok(Some(class))
+                if class.interfaces.iter().any(|i| i == ACCESS)
+                    && class.methods.contains_key(&("<init>".into(), "()V".into())))
+            });
+        let Some(implementation) = implementation else {
+            log::warn!("the JDK image has no System class implementing {ACCESS}");
+            return;
+        };
+        if let Err(error) = self.ensure_initialized(&implementation) {
+            log::warn!("{implementation} could not be initialized: {error}");
+            return;
+        }
+        let object = Value::Object(Some(self.alloc_uninitialized(&implementation)));
+        let installed = self
+            .execute_special_method(
+                &implementation,
+                "<init>",
+                "()V",
+                std::slice::from_ref(&object),
+            )
+            .and_then(|_| {
+                self.execute_method(
+                    SHARED_SECRETS,
+                    "setJavaLangAccess",
+                    &format!("(L{ACCESS};)V"),
+                    &[object],
+                )
+            });
+        if let Err(error) = installed {
+            log::warn!("SharedSecrets.setJavaLangAccess failed: {error}");
+        }
     }
 
     /// Replace each argument that is a collection implemented in bytecode (not
@@ -733,7 +792,10 @@ impl Interpreter {
         // (`Intrinsics.checkNotNullParameter(lambda, name)`) must not run it.
         if let Some(first_arg) = args.first() {
             if let Some(this_id) = first_arg.as_obj() {
-                if !matches!(method_name, "getClass" | "toString" | "hashCode" | "equals")
+                // The heap check comes first: it is cheap, and most calls have
+                // no lambda receiver, so the method lookup is rarely needed.
+                if matches!(self.heap.get(this_id), Some(JavaObject::Lambda { .. }))
+                    && !matches!(method_name, "getClass" | "toString" | "hashCode" | "equals")
                     && !self.is_static_method(class_name, method_name, descriptor)
                 {
                     if let Some(JavaObject::Lambda {

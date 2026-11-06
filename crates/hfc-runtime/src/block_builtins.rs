@@ -18,7 +18,7 @@ use crate::item_builtins::ITEM_FIELD;
 use crate::minecraft::{EnumProperty, IntegerProperty, TagKey};
 use crate::value::{JavaObject, Value};
 use hfc_core::{Error, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 const BLOCK: &str = "net/minecraft/world/level/block/Block";
 /// Minecraft's own classes, in binary form.
@@ -349,6 +349,25 @@ impl Interpreter {
         Ok(parts.join(","))
     }
 
+    /// [`Self::shape_boxes`], answered from `memo` for a shape object already
+    /// read. The heap is not collected while the shapes are read, so an
+    /// object id names one shape for the whole pass.
+    fn shape_boxes_memo(
+        &mut self,
+        shape: &Value,
+        memo: &mut HashMap<usize, Vec<[f64; 6]>>,
+    ) -> Result<Vec<[f64; 6]>> {
+        let Some(id) = shape.as_obj() else {
+            return self.shape_boxes(shape);
+        };
+        if let Some(boxes) = memo.get(&id) {
+            return Ok(boxes.clone());
+        }
+        let boxes = self.shape_boxes(shape)?;
+        memo.insert(id, boxes.clone());
+        Ok(boxes)
+    }
+
     /// A `VoxelShape` as `toAabbs()` boxes.
     fn shape_boxes(&mut self, shape: &Value) -> Result<Vec<[f64; 6]>> {
         let list = self.call_object(
@@ -521,6 +540,31 @@ impl Interpreter {
             states.push((self.state_key(&state)?, state));
         }
         Ok(states)
+    }
+
+    /// Whether every state of a block answers the same shapes. `BlockBehaviour`
+    /// (the class every block derives from) answers `Shapes.block()` from
+    /// `getShape` and, from `getCollisionShape`, that shape or `Shapes.empty()`
+    /// depending on the block-wide `hasCollision`; neither reads the state. A
+    /// class below it in the chain that declares either method may.
+    fn shapes_are_state_independent(&self, chain: &[String]) -> bool {
+        const BASE: &str = "net.minecraft.world.level.block.state.BlockBehaviour";
+        const STATE: &str = "(Lnet/minecraft/world/level/block/state/BlockState;";
+        for class in chain {
+            if class == BASE {
+                return true;
+            }
+            let Some(loaded) = self.loader.get(&class.replace('.', "/")) else {
+                return false;
+            };
+            if loaded.methods.keys().any(|(method, descriptor)| {
+                matches!(method.as_str(), "getShape" | "getCollisionShape")
+                    && descriptor.starts_with(STATE)
+            }) {
+                return false;
+            }
+        }
+        false
     }
 
     /// The components the `Item.Properties` of the `item` object set (the snapshot `Item.<init>` keeps on the item).
@@ -749,8 +793,15 @@ impl Interpreter {
     /// in `only` (all of them when it is empty) by calling the states'
     /// `getShape`/`getCollisionShape` with `EmptyBlockGetter`, `BlockPos.ZERO`
     /// and an empty `CollisionContext`. Each call runs under `per_shape`
-    /// instructions; a shape that does not fit stays `None` and is named in
-    /// the block's `unreadable`.
+    /// instructions and each block under that same total, so one block with
+    /// many states cannot hold the whole start; a shape that does not fit
+    /// stays `None` and is named in the block's `unreadable`.
+    ///
+    /// A block whose classes do not replace `getShape`/`getCollisionShape`
+    /// answers the same shapes for every state (both base implementations in
+    /// `BlockBehaviour` ignore the state: `Shapes.block()`, and that or
+    /// `Shapes.empty()` from the block-wide `hasCollision`), so one state's
+    /// pair is read and given to the rest.
     pub(crate) fn read_block_shapes(&mut self, only: &[&str], per_shape: u64) {
         let Some((getter, pos)) = self.fact_arguments() else {
             return;
@@ -771,6 +822,11 @@ impl Interpreter {
         // and a player looking at a loading screen that stopped moving — that
         // it is still working.
         let started = std::time::Instant::now();
+        // A `VoxelShape` is immutable and blocks share them: the states of a
+        // block that differ only in a property the shape ignores (waterlogged,
+        // lit, powered) answer the same object, and a block's outline is often
+        // its collision shape. Its boxes are read once per object.
+        let mut boxes_of: HashMap<usize, Vec<[f64; 6]>> = HashMap::new();
         let mut done = 0usize;
         let mut next_report = 1usize;
         if total > 0 {
@@ -783,7 +839,12 @@ impl Interpreter {
             let Some(record) = records.iter().find(|r| r.id == block.id) else {
                 continue;
             };
-            self.step_budget = Some(per_shape);
+            let block_started = std::time::Instant::now();
+            // The block's total, not one budget per state: a block whose
+            // shapes are expensive cannot spend `per_shape` for every state.
+            // Enumerating the states is part of it.
+            let mut remaining = per_shape;
+            self.step_budget = Some(remaining);
             let states = match self.block_states(&Value::Object(Some(record.object))) {
                 Ok(states) => states,
                 Err(error) => {
@@ -791,20 +852,40 @@ impl Interpreter {
                     continue;
                 }
             };
+            remaining = remaining.saturating_sub(per_shape - self.step_budget.unwrap_or(0));
+            let uniform = self.shapes_are_state_independent(&block.class);
+            let mut reused = 0usize;
+            let mut over_budget = 0usize;
+            let mut first: Option<(Vec<[f64; 6]>, Vec<[f64; 6]>)> = None;
             for (key, state) in states {
                 let Some(fact) = block.states.get_mut(&key) else {
                     continue;
                 };
-                for (label, method) in [("outline", "getShape"), ("collision", "getCollisionShape")]
-                {
-                    self.step_budget = Some(per_shape);
+                if let Some((outline, collision)) = &first {
+                    fact.outline = Some(outline.clone());
+                    fact.collision = Some(collision.clone());
+                    reused += 1;
+                    continue;
+                }
+                if remaining == 0 {
+                    over_budget += 1;
+                    continue;
+                }
+                let mut read = (None, None);
+                for (slot, label, method) in [
+                    (0, "outline", "getShape"),
+                    (1, "collision", "getCollisionShape"),
+                ] {
+                    let budget = remaining.min(per_shape);
+                    self.step_budget = Some(budget);
                     let args = [state.clone(), getter.clone(), pos.clone()];
                     let boxes = self
                         .call_object(STATE_BASE, method, SHAPE_DESCRIPTOR, &args)
-                        .and_then(|shape| self.shape_boxes(&shape));
+                        .and_then(|shape| self.shape_boxes_memo(&shape, &mut boxes_of));
+                    remaining = remaining.saturating_sub(budget - self.step_budget.unwrap_or(0));
                     match boxes {
-                        Ok(boxes) if label == "outline" => fact.outline = Some(boxes),
-                        Ok(boxes) => fact.collision = Some(boxes),
+                        Ok(boxes) if slot == 0 => read.0 = Some(boxes),
+                        Ok(boxes) => read.1 = Some(boxes),
                         Err(error) => {
                             log::warn!("block {}: state {key}: {label}: {error}", block.id);
                             block
@@ -813,7 +894,34 @@ impl Interpreter {
                         }
                     }
                 }
+                fact.outline = read.0.clone();
+                fact.collision = read.1.clone();
+                if uniform {
+                    if let (Some(outline), Some(collision)) = read {
+                        first = Some((outline, collision));
+                    }
+                }
             }
+            if over_budget > 0 {
+                let line = format!(
+                    "{over_budget} state(s) left unread: the block's shapes overran the \
+                     {per_shape}-instruction budget"
+                );
+                log::warn!("block {}: {line}", block.id);
+                block.unreadable.push(line);
+            }
+            log::debug!(
+                "block {} shapes: {} states, {reused} reused{}, {} instructions, {:?}",
+                block.id,
+                block.states.len(),
+                if uniform {
+                    " (the block answers one shape for every state)"
+                } else {
+                    ""
+                },
+                per_shape - remaining,
+                block_started.elapsed()
+            );
             done += 1;
             if done * 4 >= next_report * total {
                 log::info!(

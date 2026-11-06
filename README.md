@@ -44,7 +44,7 @@ client where noted. A mod not listed here should be treated as unsupported.
 | **Emerald Tools** | Its five tools, registered in code, become Horizon items with vanilla-formula tool stats, textures, names and recipes; `/give`, creative search and the tabs the mod chose (Fabric `CreativeModeTabEvents`) find them | ✅ (in vanilla's Tools and Combat tabs) |
 | **Emerald Armor** | Its four armor pieces, registered in code with `Item.Properties.humanoidArmor`, become Horizon items with vanilla-formula durability, armor and toughness, a single stack, and an equippable slot; its worn-armor model and textures (under `assets/minecraft`) are carried | ✅ (worn and rendered) |
 | **Modern Decorations** | Its 344 blocks, registered in code, become Horizon blocks from facts read by running the mod's real block code: states, hardness, light, sounds, outline and collision shapes; they render with the jar's models, drop through its loot tables, and come with their items. Placement runs the mod's own `getStateForPlacement` and `setPlacedBy` (facing, multi-block furniture); right-click runs the block's own `useWithoutItem`/`useItemOn` (a shower head toggles its water); scheduled block ticks run (they are saved in the chunk's vanilla `block_ticks`, so a running shower resumes after a reload) with the particles they send; and the 130 storage blocks are 27-slot containers with the mod's own stack limit, per-face hopper rules, items and drops | ✅ placing, facing, storage, use |
-| **Farmer's Delight** | Its 91 items and 132 of its 135 blocks, registered in code, load from facts read by running the mod's own block code; foods are edible (`Item.Properties.food` exports `minecraft:food`/`minecraft:consumable`), and the creative tab the mod builds in code runs its own item generator and appears in the creative inventory | ✅ placing, eating, own tab |
+| **Farmer's Delight** | Its 91 items and 132 of its 135 blocks, registered in code, load from facts read by running the mod's own block code, outline and collision shapes included, per facing and per `bites` where the block has them (the canvas signs are vanilla `WallSignBlock` shapes, which are cached in a map keyed by `Direction`); foods are edible (`Item.Properties.food` exports `minecraft:food`/`minecraft:consumable`), and the creative tab the mod builds in code runs its own item generator and appears in the creative inventory | ✅ placing, eating, own tab |
 | **JamLib, Iceberg, Placeholder API, Fabric API** | Load and initialise as libraries for the mods above | ✅ |
 
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the
@@ -59,9 +59,13 @@ Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.m
   (`canPlaceItem`) don't run, and blocks whose block entity is not a vanilla container stay
   decoration: Farmer's Delight's cooking pot and cutting board place but open no menu, and
   three of its crop blocks (cabbages, onions, rice panicles) are left out. Reading a mod's
-  block facts and shapes makes its first start slower (about 24 s with Modern Decorations;
-  later starts reuse the cache and take about 9 s, the mod's own entrypoint, against about 3 s
-  without it).
+  block facts and shapes makes its first start slower (23.6 s with Modern Decorations; later
+  starts reuse the cache and take 9.8 s, the mod's own entrypoint, against about 3 s without
+  it). Shape reading is memoized per `VoxelShape` object and bounded per block, and a block
+  whose classes do not replace `getShape`/`getCollisionShape` is read once for all its states:
+  Farmer's Delight's 2,580 states went from 0.64 s to 0.25 s of shape reading. Modern
+  Decorations' 13 s is mostly its three `electric_guitar_*` blocks (~39M instructions each,
+  the mod's own `Shapes.join` calls).
 - Mods that carry blocks or entities around (Carry On) and most `Mixin`-heavy gameplay mods do
   not work.
 - Mod advancements are granted and their tabs sit beside vanilla's; the whole tree is sent on
@@ -87,7 +91,11 @@ Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.m
 
 The runtime prefers executing a mod's real bytecode, JDK and Minecraft classes included.
 It adds a Rust builtin only at a host boundary (I/O, registry data, rendering, the desktop)
-or for a class it deliberately replaces. The design is in
+or for a class it deliberately replaces. What a JVM's bootstrap does for the JDK, it does
+explicitly: it installs the JDK's own `JavaLangAccess` when `SharedSecrets` initializes,
+because `EnumMap`/`EnumSet` read an enum's constants through it, and Minecraft caches rotated
+block shapes in `EnumMap`s keyed by `Direction`. Without it those maps are empty — the shapes
+come back null and face-keyed lookups miss. The design is in
 [docs/architecture/fabric-runtime.md](docs/architecture/fabric-runtime.md), and the reasoning
 behind the content-first installer in
 [docs/decisions/0001-hybrid-content-first.md](docs/decisions/0001-hybrid-content-first.md).
@@ -128,13 +136,16 @@ libudev development files on Linux.
 > run one test file at a time, for example
 > `cargo test -j2 -p hfc-runtime --test config_files -- --test-threads=1`.
 
-Two runtime tools check more than a single mod:
+Three runtime tools check more than a single mod:
 
 ```sh
 # Compile small Java programs and compare the interpreter with the real JVM.
 cargo test -p hfc-runtime --test jvm_diff
 # Rank what the runtime lacks across a folder of mods, by mods affected.
 cargo run --release -p hfc-runtime --example census -- --mods test-mods/corpus --alone
+# Time a cold read of a mod set's block facts and shapes (RUST_LOG=debug: one line per block).
+cargo run --release -p hfc-runtime --example block_profile -- \
+    test-mods/fabric-api-0.165.0+26.3.jar test-mods/corpus/FarmersDelight-26.3-3.6.30+refabricated.jar
 ```
 
 `tests/jvm/known_divergences.toml` is the maintained list of interpreter gaps; the census

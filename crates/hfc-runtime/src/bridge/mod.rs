@@ -1016,10 +1016,10 @@ impl FabricBridge {
             );
             if entry.method_name == "onInitialize" && used > 1_000_000 {
                 log::info!(
-                    "Fabric: entrypoint {}.{} cost {used} instructions, close to the {} cap, in {:.1?}",
+                    "Fabric: entrypoint {}.{} cost {used} of {ENTRYPOINT_BUDGET} instructions \
+                     in {:.1?}",
                     entry.class_name,
                     entry.method_name,
-                    ENTRYPOINT_BUDGET,
                     started.elapsed()
                 );
             }

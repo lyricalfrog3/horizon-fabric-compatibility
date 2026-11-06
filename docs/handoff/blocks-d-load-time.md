@@ -10,6 +10,17 @@ The custom-behaviour work has its own handoff: [blocks-c3-custom-use.md](blocks-
 Read its "Where the work stands" for what stages A–C2 built; the commits are the same
 (root `main` `4fd9d8c`, client fork `hfc` `464372de1`).
 
+**Where step 2 stands now** (the rest of this file is the original plan): the shape pass is
+memoized per `VoxelShape` object, bounded per block (not per state) and reads one state for a
+block whose classes do not replace `getShape`/`getCollisionShape`; Farmer's Delight's 2,580
+states went from 0.64 s to 0.25 s and every state now has a shape. The null shapes it used to
+read were one bug: the JDK's `JavaLangAccess` (which `EnumMap`/`EnumSet` read enum constants
+through) is now installed when `SharedSecrets` initializes, so Minecraft's `Direction`-keyed
+shape maps answer again. mdm is 13.0 s (from 13.8 s); what remains is its own `Shapes.join`
+calls inside `electric_guitar_*` (~39M instructions each), which needs a native fast path or a
+lazier shape read, not another cache. Items 1 (the cache) and 3 (duplicate work) are still
+open.
+
 ## The problem
 
 With Modern Decorations (`test-mods/mdm-3.1-fabric-26.3.jar`, 344 blocks) installed, startup is
@@ -19,7 +30,7 @@ about **20 s slower**. Measured (release build of the runtime; debug is about 9x
 |---|---|---|
 | `MdmMod.onInitialize` | 46.1M instructions, ~5.3 s | entrypoint; mostly building `StateDefinition`s. `mdm:furniture_part` has 2,916 states and each of the three `electric_guitar_*` blocks 3,468 |
 | Whole `init()` incl. facts for 15,360 states | ~5.8 s | `FabricBridge::init` → `collect_block_facts` (`crates/hfc-runtime/src/block_builtins.rs`) |
-| Reading every block's shapes | ~168M instructions, ~13–14 s live | `FabricBridge::read_block_shapes` (`bridge/blocks.rs`), called once behind a `Once` in `workspace/horizon/crates/horizon-client/src/game/fabric_bridge/content.rs` `registered_blocks`. Each `electric_guitar_*` ~40M, white bathtub 11.4M, black modern fridge 7.5M, most blocks under 1M. `Shapes.or` over many fine boxes dominates |
+| Reading every block's shapes | ~168M instructions, ~13 s live (13.8 s before the memo, 13.0 s after) | `FabricBridge::read_block_shapes` (`bridge/blocks.rs`), called once behind a `Once` in `workspace/horizon/crates/horizon-client/src/game/fabric_bridge/content.rs` `registered_blocks`. Each `electric_guitar_*` ~40M, white bathtub 11.4M, black modern fridge 7.5M, most blocks under 1M. `Shapes.or` over many fine boxes dominates |
 | Writing the 344 declarations | ~150 ms | `content/blocks.rs` `declare` |
 
 Also suspected, not measured: `content_root` is called twice per start, so the export may run

@@ -649,4 +649,51 @@ fn farmers_delight_food_its_tab_and_blocks_are_exported() {
         Some(&vec!["lower".to_string(), "upper".to_string()]),
         "{rice:?}"
     );
+
+    // Shapes. A block whose shape comes from a map keyed by a `Direction`
+    // (this sign is vanilla `WallSignBlock`'s, whose `SHAPES` is an
+    // `EnumMap<Direction, VoxelShape>` built by `Shapes.rotateHorizontal`)
+    // used to answer null for every state: the map was built over no enum
+    // constants. javap of `WallSignBlock`: `Block.boxZ(16.0, 4.5, 12.5,
+    // 14.0, 16.0)` against each wall in turn, 0.125 thick.
+    bridge.read_block_shapes(&[]);
+    let blocks = bridge.registered_blocks();
+    let wall_sign = blocks
+        .iter()
+        .find(|block| block.id == "farmersdelight:canvas_wall_sign")
+        .expect("the canvas wall sign is a block");
+    assert!(
+        wall_sign.unreadable.is_empty(),
+        "{:?}",
+        wall_sign.unreadable
+    );
+    for (facing, expect) in [
+        ("north", [0.0, 0.28125, 0.875, 1.0, 0.78125, 1.0]),
+        ("east", [0.0, 0.28125, 0.0, 0.125, 0.78125, 1.0]),
+        ("south", [0.0, 0.28125, 0.0, 1.0, 0.78125, 0.125]),
+        ("west", [0.875, 0.28125, 0.0, 1.0, 0.78125, 1.0]),
+    ] {
+        let key = format!("facing={facing},waterlogged=false");
+        let state = wall_sign
+            .states
+            .get(&key)
+            .unwrap_or_else(|| panic!("{key} is a state of the canvas wall sign"));
+        assert_eq!(state.outline.as_deref(), Some(&[expect][..]), "{key}");
+        // A wall sign is decorative: vanilla gives it no collision shape, and
+        // an empty shape is a real answer (not one that failed to read).
+        assert_eq!(state.collision.as_deref(), Some(&[][..]), "{key}");
+    }
+    // Every state of every block has a shape: the null-shape classes (signs,
+    // pies, feasts, baskets, beds) were the bulk of this mod's blocks.
+    let missing: Vec<String> = blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .states
+                .iter()
+                .filter(|(_, state)| state.outline.is_none() || state.collision.is_none())
+                .map(move |(key, _)| format!("{} [{key}]", block.id))
+        })
+        .collect();
+    assert!(missing.is_empty(), "states without a shape: {missing:?}");
 }

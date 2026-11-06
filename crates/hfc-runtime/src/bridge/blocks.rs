@@ -393,6 +393,13 @@ impl super::FabricBridge {
         else {
             return BlockUse::NotOverridden;
         };
+        let (main_item, off_item) = (host.held_item(), host.off_hand_item());
+        // `ServerPlayerGameMode.useItemOn`: sneaking with something in either
+        // hand keeps the block's own use from running, so the item's use (a
+        // block placed against it) can.
+        if use_suppressed(event.sneaking, main_item.as_deref(), off_item.as_deref()) {
+            return BlockUse::NotOverridden;
+        }
         let mut use_item = fact.overrides.iter().any(|o| o.ends_with(".useItemOn"));
         let mut use_without_item = fact
             .overrides
@@ -419,12 +426,7 @@ impl super::FabricBridge {
             player_pos: [0.0; 3],
             sneaking: event.sneaking,
             off_hand: event.off_hand,
-            item: if event.off_hand {
-                host.off_hand_item()
-            } else {
-                host.held_item()
-            }
-            .unwrap_or_default(),
+            item: if event.off_hand { off_item } else { main_item }.unwrap_or_default(),
             replace_clicked: false,
         };
         // An empty hand has nothing for `useItemOn` to do.
@@ -593,5 +595,38 @@ impl super::FabricBridge {
                 particle.speed,
             );
         }
+    }
+}
+
+/// `ServerPlayerGameMode.useItemOn`'s suppression: with an item in either
+/// hand, sneaking skips the block's own use so the item's use (placing a
+/// block, eating) runs instead.
+fn use_suppressed(sneaking: bool, main: Option<&str>, off: Option<&str>) -> bool {
+    fn holds(item: Option<&str>) -> bool {
+        item.is_some_and(|id| !id.is_empty() && id != "minecraft:air")
+    }
+    sneaking && (holds(main) || holds(off))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_suppressed;
+
+    #[test]
+    fn sneaking_with_an_item_in_either_hand_suppresses_the_blocks_use() {
+        assert!(use_suppressed(true, Some("minecraft:stone"), None));
+        assert!(use_suppressed(true, None, Some("minecraft:stone")));
+        assert!(use_suppressed(
+            true,
+            Some("minecraft:stone"),
+            Some("minecraft:torch")
+        ));
+        // An empty hand is `None`, an empty id or air.
+        assert!(!use_suppressed(true, None, None));
+        assert!(!use_suppressed(true, Some(""), None));
+        assert!(!use_suppressed(true, Some("minecraft:air"), None));
+        assert!(!use_suppressed(true, None, Some("minecraft:air")));
+        // Not sneaking never suppresses.
+        assert!(!use_suppressed(false, Some("minecraft:stone"), None));
     }
 }

@@ -53,6 +53,23 @@ fn failure(what: impl Into<String>) -> Error {
     Error::new("interpreter", what.into())
 }
 
+/// Whether the block's empty-hand method runs: vanilla
+/// `ServerPlayerGameMode.useItemOn` calls `useWithoutItem` only on the main
+/// hand, and only when `useItemOn` was not run or answered
+/// `TRY_WITH_EMPTY_HAND`; a `PASS` does not fall through.
+fn runs_empty_hand(item_outcome: Option<Outcome>, off_hand: bool) -> bool {
+    !off_hand && matches!(item_outcome, None | Some(Outcome::TryEmptyHand))
+}
+
+/// The class of an `InteractionResult` the runtime cannot name, for the error.
+fn result_class(heap: &crate::heap::Heap, value: &Value) -> String {
+    value
+        .as_obj()
+        .and_then(|id| heap.get(id))
+        .map(|object| object.class_name().to_string())
+        .unwrap_or_else(|| "null".into())
+}
+
 /// Which `InteractionResult` record `value` is. Without Minecraft's classes
 /// the runtime has no result to name, so the value is not guessed at.
 fn outcome_of(heap: &crate::heap::Heap, value: &Value) -> Outcome {
@@ -73,10 +90,9 @@ fn outcome_of(heap: &crate::heap::Heap, value: &Value) -> Outcome {
 
 impl Interpreter {
     /// Run the block's `useItemOn` (when it overrides it and the hand holds an
-    /// item) and then, if that did not consume the click, its `useWithoutItem`
-    /// (when it overrides it). `Ok(None)` is the block passing the click on;
-    /// `Ok(Some(level))` the click it consumed, the level it ran on holding
-    /// what it changed.
+    /// item) and then, when vanilla would, its `useWithoutItem`.
+    /// `Ok(None)` is the block passing the click on; `Ok(Some(level))` the
+    /// click it consumed, the level it ran on holding what it changed.
     pub(crate) fn block_used(
         &mut self,
         request: &PlacementRequest,
@@ -109,7 +125,11 @@ impl Interpreter {
         let player = Value::Object(Some(prepared.player));
         let hit = Value::Object(Some(prepared.hit_result));
 
-        let mut handled = false;
+        let mut consumed = false;
+        let mut item_outcome = None;
+        // An empty hand skips `useItemOn`: the inherited `BlockBehaviour`
+        // default answers `TRY_WITH_EMPTY_HAND` for an empty stack, so a mod
+        // override that does nothing for one is treated the same.
         if use_item && !request.item.is_empty() && request.item != "minecraft:air" {
             let result = self.execute_method(
                 BLOCK,
@@ -126,11 +146,20 @@ impl Interpreter {
                     hit.clone(),
                 ],
             )?;
-            handled = outcome_of(&self.heap, &result).consumes();
+            let outcome = outcome_of(&self.heap, &result);
+            if outcome == Outcome::Unknown {
+                return Err(failure(format!(
+                    "useItemOn returned an InteractionResult this runtime cannot name: {}",
+                    result_class(&self.heap, &result)
+                )));
+            }
+            if outcome.consumes() {
+                consumed = true;
+            } else {
+                item_outcome = Some(outcome);
+            }
         }
-        // `TRY_WITH_EMPTY_HAND`: only the main hand's turn uses the block
-        // itself, as the host's own `use_item_on_branch` does.
-        if !handled && use_without_item && !request.off_hand {
+        if !consumed && use_without_item && runs_empty_hand(item_outcome, request.off_hand) {
             let result = self.execute_method(
                 BLOCK,
                 "useWithoutItem",
@@ -144,9 +173,16 @@ impl Interpreter {
                     hit,
                 ],
             )?;
-            handled = outcome_of(&self.heap, &result).consumes();
+            let outcome = outcome_of(&self.heap, &result);
+            if outcome == Outcome::Unknown {
+                return Err(failure(format!(
+                    "useWithoutItem returned an InteractionResult this runtime cannot name: {}",
+                    result_class(&self.heap, &result)
+                )));
+            }
+            consumed = outcome.consumes();
         }
-        if !handled {
+        if !consumed {
             return Ok(None);
         }
         Ok(Some(prepared.level))
@@ -201,5 +237,33 @@ impl Interpreter {
             ],
         )?;
         Ok(level)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Outcome, runs_empty_hand};
+
+    #[test]
+    fn only_a_missing_or_try_empty_hand_item_result_runs_the_empty_hand() {
+        // `useItemOn` was not run (an empty hand): the empty hand's turn runs.
+        assert!(runs_empty_hand(None, false));
+        // `TRY_WITH_EMPTY_HAND`: the empty hand's turn runs.
+        assert!(runs_empty_hand(Some(Outcome::TryEmptyHand), false));
+        // A `PASS` goes to the item's own use, not back to the block.
+        assert!(!runs_empty_hand(Some(Outcome::Pass), false));
+        // A consumed result ends the interaction.
+        assert!(!runs_empty_hand(Some(Outcome::Success), false));
+        assert!(!runs_empty_hand(Some(Outcome::Fail), false));
+        // Only the main hand's turn runs the empty-hand method.
+        for outcome in [
+            None,
+            Some(Outcome::TryEmptyHand),
+            Some(Outcome::Pass),
+            Some(Outcome::Success),
+            Some(Outcome::Fail),
+        ] {
+            assert!(!runs_empty_hand(outcome, true), "{outcome:?}");
+        }
     }
 }

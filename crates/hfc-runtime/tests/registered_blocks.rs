@@ -396,6 +396,7 @@ struct World {
     at: [i32; 3],
     id: String,
     properties: Vec<(String, String)>,
+    held: Option<String>,
 }
 
 impl hfc_runtime::bridge::HostBridge for World {
@@ -430,6 +431,9 @@ impl hfc_runtime::bridge::HostBridge for World {
         } else {
             Vec::new()
         }
+    }
+    fn held_item(&self) -> Option<String> {
+        self.held.clone()
     }
 }
 
@@ -468,6 +472,7 @@ fn a_mod_blocks_own_use_toggles_the_state_it_sets() {
         at: [4, 1, 4],
         id: "mdm:shower_head".into(),
         properties: default,
+        held: None,
     };
     let event = RightClickBlockEvent {
         pos: [4, 1, 4],
@@ -507,6 +512,7 @@ fn a_mod_blocks_own_use_toggles_the_state_it_sets() {
             ("facing".into(), "north".into()),
             ("running".into(), "true".into()),
         ],
+        held: None,
     };
     let started = std::time::Instant::now();
     let ticked = bridge
@@ -538,6 +544,7 @@ fn a_mod_blocks_own_use_toggles_the_state_it_sets() {
             ("facing".into(), "north".into()),
             ("running".into(), "false".into()),
         ],
+        held: None,
     };
     let stopped = bridge
         .tick_block(&off, [4, 1, 4], "mdm:shower_head")
@@ -549,8 +556,43 @@ fn a_mod_blocks_own_use_toggles_the_state_it_sets() {
         at: [4, 1, 4],
         id: "mdm:set_1_cabinet".into(),
         properties: vec![("facing".into(), "north".into())],
+        held: None,
     };
     assert_eq!(bridge.block_used(&cabinet, &event), BlockUse::NotOverridden);
+}
+
+/// `ServerPlayerGameMode.useItemOn`: sneaking with an item in hand must let
+/// the item place/use instead of running the block's own use.
+#[test]
+fn a_sneak_click_with_an_item_skips_the_blocks_use() {
+    use hfc_runtime::bridge::{BlockUse, RightClickBlockEvent};
+    let Some(mut bridge) = mdm() else { return };
+    let host = World {
+        at: [4, 1, 4],
+        id: "mdm:shower_head".into(),
+        properties: vec![
+            ("facing".into(), "north".into()),
+            ("running".into(), "false".into()),
+        ],
+        held: Some("minecraft:stone".into()),
+    };
+    let event = RightClickBlockEvent {
+        pos: [4, 1, 4],
+        face: [0, 1, 0],
+        hit: [4.5, 1.5, 4.5],
+        sneaking: true,
+        off_hand: false,
+    };
+    assert_eq!(bridge.block_used(&host, &event), BlockUse::NotOverridden);
+    // Not sneaking, the same item does not suppress it.
+    let event = RightClickBlockEvent {
+        sneaking: false,
+        ..event
+    };
+    assert!(matches!(
+        bridge.block_used(&host, &event),
+        BlockUse::Handled(_)
+    ));
 }
 
 #[test]

@@ -95,6 +95,13 @@ impl ClassLoader {
         self.jars.iter().map(|jar| jar.path.as_path()).collect()
     }
 
+    /// The classes parsed so far, by binary name.
+    pub(crate) fn classes(&self) -> impl Iterator<Item = (&str, &crate::class::Class)> {
+        self.classes
+            .iter()
+            .map(|(name, class)| (name.as_str(), class))
+    }
+
     /// Whether any loaded class's static field refers to a heap id `>= mark`.
     pub fn static_refs_into(&self, mark: usize) -> bool {
         self.classes.values().any(|class| {

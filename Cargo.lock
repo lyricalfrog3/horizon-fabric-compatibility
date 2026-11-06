@@ -366,6 +366,7 @@ dependencies = [
  "cafebabe",
  "flate2",
  "hfc-core",
+ "hfc-fabric",
  "log",
  "regex",
  "serde",

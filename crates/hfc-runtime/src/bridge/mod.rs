@@ -159,6 +159,49 @@ pub struct RightClickBlockEvent {
     pub off_hand: bool,
 }
 
+/// One entrypoint as the census saw it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntrypointRun {
+    /// Binary class name (`com/example/Mod`).
+    pub class_name: String,
+    pub method_name: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub instructions: u64,
+    pub elapsed_ms: u64,
+    /// The entrypoint used the whole budget; it may be cut short.
+    pub budget_exhausted: bool,
+    /// Symbols the interpreter could not resolve while it ran.
+    pub missing: Vec<String>,
+    /// Event listeners the entrypoint added, as `(owner.FIELD, listeners)`.
+    pub events: Vec<(String, usize)>,
+}
+
+/// What the runtime saw while `init` ran, for the compatibility census
+/// (`examples/census.rs`). `None` in the game, so it pays nothing.
+#[derive(Debug, Clone, Default)]
+pub struct CensusLog {
+    pub entrypoints: Vec<EntrypointRun>,
+}
+
+/// Every event object the bridge dispatches, as `owner class.FIELD` with the
+/// binary class name the runtime keeps. The census reports listeners on events
+/// that are not in this list.
+pub const DISPATCHED_EVENTS: &[&str] = &[
+    "net/fabricmc/fabric/api/event/player/UseBlockCallback.EVENT",
+    "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents.BEFORE",
+    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents.SERVER_STARTING",
+    "net/fabricmc/fabric/api/client/item/v1/ItemTooltipCallback.EVENT",
+    "net/fabricmc/fabric/api/client/screen/v1/ScreenEvents.AFTER_INIT",
+    "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.END_CLIENT_TICK",
+    "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents.GATHER",
+    "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents.COLOREXT",
+    "com/anthonyhilyard/iceberg/events/client/RenderTooltipEvents.POSTEXT",
+    "com/anthonyhilyard/iceberg/events/client/RenderTickEvents.START",
+    "com/anthonyhilyard/prism/events/client/RenderTickEvent.START",
+    "io/github/jamalam360/jamlib/api/events/InteractionEvent.USE_BLOCK",
+];
+
 /// A discovered mod entrypoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModEntrypoint {
@@ -247,6 +290,8 @@ pub struct FabricBridge {
     /// Block ids whose tick had to keep its heap scope (class init, a static
     /// or a cache kept a scoped object), logged once each.
     scope_kept_logged: std::collections::HashSet<String>,
+    /// The compatibility census's recorder; `None` in the game.
+    pub census: Option<CensusLog>,
 }
 
 pub(crate) type HoveredTooltipKey = (String, Vec<(String, u32)>);
@@ -313,6 +358,7 @@ impl FabricBridge {
             block_facts_cache: block_cache::BlockFactsCache::new(None),
             hand_change_logged: std::collections::HashSet::new(),
             scope_kept_logged: std::collections::HashSet::new(),
+            census: None,
         }
     }
 
@@ -339,6 +385,109 @@ impl FabricBridge {
         &self.mods
     }
 
+    /// Start recording what `init` sees, for the census. Off by default.
+    pub fn enable_census(&mut self) {
+        self.census = Some(CensusLog::default());
+        self.interp.trace_missing = true;
+        self.interp.trace_calls = true;
+    }
+
+    /// The census recorder, when one is on.
+    pub fn census(&self) -> Option<&CensusLog> {
+        self.census.as_ref()
+    }
+
+    /// Whether the loader can load `class` (dotted or binary), for the census's
+    /// "applied or ignored" mixin column.
+    pub fn census_interprets(&mut self, class: &str) -> bool {
+        self.interp
+            .loader
+            .get_or_load(&class.replace('.', "/"))
+            .is_ok()
+    }
+
+    /// The entrypoints the census recorded.
+    pub fn census_entrypoints(&self) -> &[EntrypointRun] {
+        self.census
+            .as_ref()
+            .map_or(&[], |census| census.entrypoints.as_slice())
+    }
+
+    /// Symbols the interpreter could not resolve, as `note_missing` wrote them.
+    pub fn census_missing(&self) -> &[String] {
+        &self.interp.missing
+    }
+
+    /// The mixin manifest this bridge built from the loaded jars.
+    pub fn census_mixins(&self) -> &crate::mixin::MixinManifest {
+        &self.mixins
+    }
+
+    /// Event objects with listeners that the runtime kept in statics, as
+    /// `owner class.FIELD` (binary names) and the listener count.
+    pub fn census_events(&self) -> Vec<(String, usize)> {
+        let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut record = |owner: &str, field: &str, value: &Value| {
+            let Some(id) = value.as_obj() else {
+                return;
+            };
+            let Some(JavaObject::Instance { fields, .. }) = self.interp.heap.get(id) else {
+                return;
+            };
+            let listeners = fields
+                .get("listeners")
+                .and_then(Value::as_obj)
+                .and_then(|id| match self.interp.heap.get(id) {
+                    Some(JavaObject::Array { elements, .. }) => Some(elements.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let single = fields.get("listener").is_some_and(|value| !value.is_null()) as usize;
+            if listeners + single > 0 {
+                found.insert(format!("{owner}.{field}"), listeners + single);
+            }
+        };
+        let classes: Vec<(String, Vec<(String, Value)>)> = self
+            .interp
+            .loader
+            .classes()
+            .map(|(name, class)| {
+                (
+                    name.to_string(),
+                    class
+                        .static_fields
+                        .iter()
+                        .map(|(field, value)| (field.clone(), value.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        for (owner, fields) in classes {
+            for (field, value) in fields {
+                record(&owner, &field, &value);
+            }
+        }
+        let singletons: Vec<((String, String), Value)> = self
+            .interp
+            .static_singletons
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        for ((owner, field), value) in singletons {
+            record(&owner, &field, &value);
+        }
+        found.into_iter().collect()
+    }
+
+    /// `(blocks, items, creative-tab entries)` the runtime's registries hold.
+    pub fn census_counts(&self) -> (usize, usize, usize) {
+        (
+            self.interp.heap.registered_blocks.len(),
+            self.interp.heap.registered_items.len(),
+            self.interp.heap.creative_tab_additions.len(),
+        )
+    }
+
     pub fn with_loader(loader: ClassLoader) -> Self {
         Self {
             interp: Interpreter::with_loader(loader),
@@ -361,6 +510,7 @@ impl FabricBridge {
             block_facts_cache: block_cache::BlockFactsCache::new(None),
             hand_change_logged: std::collections::HashSet::new(),
             scope_kept_logged: std::collections::HashSet::new(),
+            census: None,
         }
     }
 
@@ -826,6 +976,9 @@ impl FabricBridge {
 
         for entry in &sorted_entrypoints {
             self.interp.step_budget = Some(ENTRYPOINT_BUDGET);
+            let missing_start = self.interp.missing.len();
+            let events_before: std::collections::BTreeMap<String, usize> =
+                self.census_events().into_iter().collect();
             let started = std::time::Instant::now();
             let res = self.interp.execute_method(
                 &entry.class_name,
@@ -834,6 +987,24 @@ impl FabricBridge {
                 &[],
             );
             let used = ENTRYPOINT_BUDGET - self.interp.step_budget.unwrap_or(0);
+            let events: Vec<(String, usize)> = self
+                .census_events()
+                .into_iter()
+                .filter(|(event, count)| events_before.get(event).copied().unwrap_or(0) < *count)
+                .collect();
+            if let Some(census) = &mut self.census {
+                census.entrypoints.push(EntrypointRun {
+                    class_name: entry.class_name.clone(),
+                    method_name: entry.method_name.clone(),
+                    ok: res.is_ok(),
+                    error: res.as_ref().err().map(ToString::to_string),
+                    instructions: used,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    budget_exhausted: used >= ENTRYPOINT_BUDGET,
+                    missing: self.interp.missing[missing_start..].to_vec(),
+                    events,
+                });
+            }
             log::debug!(
                 "entrypoint {}.{} used {} instructions in {:?}",
                 entry.class_name,

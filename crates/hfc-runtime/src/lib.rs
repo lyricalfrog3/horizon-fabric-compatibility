@@ -3,9 +3,11 @@
 pub mod block_builtins;
 pub mod bridge;
 pub mod builtins;
+pub mod census;
 pub mod class;
 pub mod container_builtins;
 pub mod creative_tab_builtins;
+pub mod discovery;
 pub mod fs_builtins;
 pub mod heap;
 pub mod interp;

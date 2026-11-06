@@ -541,6 +541,41 @@ impl NativeObject for IntegerProperty {
     }
 }
 
+/// Classes the runtime answers with a native object instead of running their
+/// bytecode. A call on one of these, if reached, runs against a Rust stand-in
+/// that may not implement the method; the census reports those references for
+/// a human to check. Maintained by hand next to the `NativeObject` impls.
+pub fn native_classes() -> &'static [&'static str] {
+    &[
+        "net/minecraft/world/item/ItemStack",
+        "net/minecraft/world/item/Item",
+        "net/minecraft/world/item/Item$Properties",
+        "net/minecraft/world/level/Level",
+        "net/minecraft/server/level/ServerLevel",
+        "net/minecraft/world/level/block/Block",
+        "net/minecraft/world/level/block/CropBlock",
+        "net/minecraft/world/level/block/NetherWartBlock",
+        "net/minecraft/world/level/block/CocoaBlock",
+        "net/minecraft/world/level/block/SugarCaneBlock",
+        "net/minecraft/world/level/block/CactusBlock",
+        "net/minecraft/world/level/block/state/BlockState",
+        "net/minecraft/world/level/block/state/properties/IntegerProperty",
+        "net/minecraft/core/BlockPos",
+        "net/minecraft/core/Direction",
+        "net/minecraft/world/phys/BlockHitResult",
+        "net/minecraft/core/particles/SimpleParticleType",
+        "net/minecraft/tags/TagKey",
+        "net/minecraft/world/entity/player/Player",
+        "net/minecraft/server/level/ServerPlayer",
+        "net/minecraft/client/gui/GuiGraphicsExtractor",
+        "com/mojang/blaze3d/platform/NativeImage",
+        "io/github/jamalam360/jamlib/api/events/core/EventResult",
+        "org/spongepowered/asm/mixin/injection/callback/CallbackInfo",
+        "java/io/ByteArrayInputStream",
+        "java/io/OutputStream",
+    ]
+}
+
 /// A particle a mod's code asked the level to send (`ServerLevel.sendParticles`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParticleCall {

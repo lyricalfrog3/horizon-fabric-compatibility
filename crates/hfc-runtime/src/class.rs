@@ -563,6 +563,89 @@ pub fn scan_constant_pool_classes(bytes: &[u8]) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// Every method reference (`Methodref`/`InterfaceMethodref`) in a raw class
+/// file's constant pool, as `(owner class, method name, descriptor)`.
+pub fn scan_method_refs(bytes: &[u8]) -> Vec<(String, String, String)> {
+    let Some(count) = be_u16(bytes, 8) else {
+        return Vec::new();
+    };
+    let mut classes: std::collections::HashMap<u16, String> = Default::default();
+    let mut names: std::collections::HashMap<u16, (String, String)> = Default::default();
+    let mut refs: Vec<(u16, u16)> = Vec::new();
+    let mut slot = 1u16;
+    let mut offset = 10;
+    while slot < count {
+        let Some(&tag) = bytes.get(offset) else {
+            break;
+        };
+        offset += 1;
+        match tag {
+            1 => {
+                let Some(len) = be_u16(bytes, offset) else {
+                    break;
+                };
+                offset += 2 + len as usize;
+            }
+            7 => {
+                let Some(index) = be_u16(bytes, offset) else {
+                    break;
+                };
+                if let Some(name) = resolve_utf8_slot(bytes, count, index as usize) {
+                    classes.insert(slot, name);
+                }
+                offset += 2;
+            }
+            8 | 16 | 19 | 20 => offset += 2,
+            15 => offset += 3,
+            12 => {
+                let (Some(name), Some(descriptor)) =
+                    (be_u16(bytes, offset), be_u16(bytes, offset + 2))
+                else {
+                    break;
+                };
+                if let (Some(name), Some(descriptor)) = (
+                    resolve_utf8_slot(bytes, count, name as usize),
+                    resolve_utf8_slot(bytes, count, descriptor as usize),
+                ) {
+                    names.insert(slot, (name, descriptor));
+                }
+                offset += 4;
+            }
+            9 | 10 | 11 => {
+                let (Some(owner), Some(name)) = (be_u16(bytes, offset), be_u16(bytes, offset + 2))
+                else {
+                    break;
+                };
+                // Field references (9) are not method calls.
+                if tag != 9 {
+                    refs.push((owner, name));
+                }
+                offset += 4;
+            }
+            3 | 4 | 17 | 18 => offset += 4,
+            5 | 6 => {
+                offset += 8;
+                slot += 1;
+            }
+            _ => break,
+        }
+        slot += 1;
+    }
+    let mut out = Vec::new();
+    for (owner, name) in refs {
+        let (Some(owner), Some((name, descriptor))) = (classes.get(&owner), names.get(&name))
+        else {
+            continue;
+        };
+        if let Some(owner) = normalize_class_ref(owner) {
+            out.push((owner, name.clone(), descriptor.clone()));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Turn a constant-pool class reference into a class name. Arrays become their
 /// element type (`[Ljava/lang/String;` → `java/lang/String`); primitive arrays
 /// have no class file and are dropped.

@@ -158,6 +158,36 @@ under test.
   boundary), never in the case or the comparison. Remove its label from the list in the same
   commit.
 
+## Census
+
+`crates/hfc-runtime/examples/census.rs` measures the experimental Fabric runtime over a folder of
+real mods: missing Java/Minecraft symbols, Fabric events mods listen to that the host never
+dispatches, mixin targets and whether they apply, entrypoint failures, and calls to classes the
+runtime replaces with native stand-ins. It writes `census.json` and `census.md` and, with
+`--compare old.json`, a before/after section, so a fix can be chosen by how many mods it unblocks
+and its effect can be quoted.
+
+```sh
+cargo run --release -p hfc-runtime --example census --     --mods test-mods/corpus --out /tmp/census [--resources <prepared resources>]     [--compare /tmp/old/census.json] [--alone | --together]
+```
+
+- The corpus is supplied by the user; the tool never downloads mods or scans personal folders.
+  `test-mods/*.jar` is ignored by Git, so `test-mods/corpus/` can hold local jars; never commit
+  them. A checked-in `test-mods/corpus.toml` may list file names and SHA-256s so the same corpus
+  can be rebuilt.
+- `--alone` runs each mod in its own bridge with its dependencies (one bridge per mod is what
+  attributes a missing symbol to the mod that hit it). A missing dependency skips the mod with
+  the reason. `--together` (the default) runs one bridge like a player's mods folder; events,
+  mixins and registered counts are shared then, while entrypoints and their missing symbols are
+  still attributed by class.
+- Every run uses a fresh temporary game directory; mods' config files never reach player data.
+- **It measures, it does not claim.** Zero missing symbols means init hit nothing the runtime
+  lacks; it does not mean the mod works. Calls on native stand-ins are listed for a human to
+  check against the builtins.
+- The recorder (`FabricBridge::enable_census`) is off in the game, so it pays nothing there. The
+  smoke test (`tests/census.rs`) runs the census over `test-mods/` and returns early without
+  Minecraft or the pinned jars.
+
 ## What is not tested (and why it matters)
 
 - **A real Horizon launch.** The hook compiles and its subprocess contract is tested, and the

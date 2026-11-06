@@ -5801,25 +5801,37 @@ pub fn dispatch_builtin(
         }
     }
 
-    // BlockHitResult
-    if class_name == "net/minecraft/world/phys/BlockHitResult" {
+    // BlockHitResult, and the `HitResult` superclass its getters are declared
+    // on (`invokevirtual net/minecraft/world/phys/HitResult.getLocation`).
+    if class_name == "net/minecraft/world/phys/BlockHitResult"
+        || class_name == "net/minecraft/world/phys/HitResult"
+    {
         if method_name == "<init>" {
             let mut found_pos = BlockPos { x: 0, y: 0, z: 0 };
             let mut found_dir = Direction::UP;
+            let mut found_location = None;
             for arg in &args[1..] {
                 if let Some(id) = arg.as_obj() {
                     if let Some(pos) = heap.get_native::<BlockPos>(id) {
                         found_pos = pos.clone();
                     } else if let Some(dir) = heap.get_native::<Direction>(id) {
                         found_dir = dir.clone();
+                    } else if let Some(JavaObject::Instance { class_name, .. }) = heap.get(id) {
+                        if class_name == "net/minecraft/world/phys/Vec3" {
+                            found_location = Some(id);
+                        }
                     }
                 }
             }
+            // Both 26.3 constructors put the inside flag after the position.
+            let inside = args.get(4).is_some_and(Value::as_bool);
             if let Some(this_id) = args.get(0).and_then(|v| v.as_obj()) {
                 if let Some(obj) = heap.get_mut(this_id) {
                     *obj = JavaObject::Native(Box::new(BlockHitResult {
                         pos: found_pos,
                         direction: found_dir,
+                        location: found_location,
+                        inside,
                     }));
                 }
             }
@@ -5838,15 +5850,53 @@ pub fn dispatch_builtin(
                     return BuiltinResult::Handled(Value::Object(Some(did)));
                 }
             }
-        } else if method_name == "withPosition" && args.len() >= 2 {
-            if let (Some(id), Some(pos_id)) = (args[0].as_obj(), args[1].as_obj()) {
-                if let (Some(hit), Some(pos)) = (
-                    heap.get_native::<BlockHitResult>(id),
-                    heap.get_native::<BlockPos>(pos_id),
-                ) {
-                    let new_id = heap.alloc_hit_result(pos.clone(), hit.direction.clone());
-                    return BuiltinResult::Handled(Value::Object(Some(new_id)));
+        } else if method_name == "getLocation" && !args.is_empty() {
+            // The real `Vec3` the click landed at, built by the bridge. With
+            // none the call falls through: no location is invented.
+            let location = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockHitResult>(id))
+                .and_then(|hit| hit.location);
+            if let Some(location) = location {
+                return BuiltinResult::Handled(Value::Object(Some(location)));
+            }
+        } else if method_name == "isInside" && !args.is_empty() {
+            let inside = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<BlockHitResult>(id))
+                .is_some_and(|hit| hit.inside);
+            return BuiltinResult::Handled(Value::from_bool(inside));
+        } else if method_name == "getType" && !args.is_empty() {
+            // Every hit result the runtime builds is a block hit.
+            let name = heap.alloc_string("BLOCK");
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/world/phys/HitResult$Type".into(),
+                fields: [("name".to_string(), Value::Object(Some(name)))].into(),
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        } else if (method_name == "withPosition" || method_name == "withDirection")
+            && args.len() >= 2
+        {
+            let update = if let (Some(id), Some(argument)) = (args[0].as_obj(), args[1].as_obj()) {
+                if let Some(hit) = heap.get_native::<BlockHitResult>(id).cloned() {
+                    if method_name == "withPosition" {
+                        heap.get_native::<BlockPos>(argument)
+                            .cloned()
+                            .map(|pos| (pos, hit.direction.clone(), hit.location, hit.inside))
+                    } else {
+                        heap.get_native::<Direction>(argument)
+                            .cloned()
+                            .map(|dir| (hit.pos.clone(), dir, hit.location, hit.inside))
+                    }
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            if let Some((pos, dir, location, inside)) = update {
+                let new_id = heap.alloc_hit_result_with(pos, dir, location, inside);
+                return BuiltinResult::Handled(Value::Object(Some(new_id)));
             }
         }
     }

@@ -260,6 +260,24 @@ impl Interpreter {
         Ok(map)
     }
 
+    /// A real `Vec3`, built by Minecraft's own constructor, at `at`.
+    pub(crate) fn alloc_vec3(&mut self, at: [f64; 3]) -> Result<usize> {
+        self.ensure_initialized(VEC3)?;
+        let id = self.alloc_uninitialized(VEC3);
+        self.execute_special_method(
+            VEC3,
+            "<init>",
+            "(DDD)V",
+            &[
+                Value::Object(Some(id)),
+                Value::Double(at[0]),
+                Value::Double(at[1]),
+                Value::Double(at[2]),
+            ],
+        )?;
+        Ok(id)
+    }
+
     /// The level mod code reads: the host's blocks, a mod's own as its state
     /// objects.
     pub(crate) fn snapshot_level(&mut self, world: &WorldSnapshot) -> Result<usize> {
@@ -349,25 +367,17 @@ impl Interpreter {
             y: request.hit_pos[1],
             z: request.hit_pos[2],
         };
-        let hit_result = self.heap.alloc_hit_result(hit_pos.clone(), face.clone());
+        let vec = self.alloc_vec3(request.hit)?;
+        let hit_result = self.heap.alloc_hit_result_with(
+            hit_pos.clone(),
+            face.clone(),
+            Some(vec),
+            request.inside,
+        );
         let pos_id = self
             .heap
             .alloc_block_pos(request.pos[0], request.pos[1], request.pos[2]);
         let hit_pos_id = self.heap.alloc_block_pos(hit_pos.x, hit_pos.y, hit_pos.z);
-
-        self.ensure_initialized(VEC3)?;
-        let vec = self.alloc_uninitialized(VEC3);
-        self.execute_special_method(
-            VEC3,
-            "<init>",
-            "(DDD)V",
-            &[
-                Value::Object(Some(vec)),
-                Value::Double(request.hit[0]),
-                Value::Double(request.hit[1]),
-                Value::Double(request.hit[2]),
-            ],
-        )?;
 
         let context = PlaceContext {
             level: Value::Object(Some(level_id)),

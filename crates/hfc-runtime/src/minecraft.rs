@@ -303,6 +303,11 @@ impl NativeObject for Direction {
 pub struct BlockHitResult {
     pub pos: BlockPos,
     pub direction: Direction,
+    /// Heap id of the real `Vec3` the hit landed at (`HitResult.location`),
+    /// when the bridge built one from the click.
+    pub location: Option<usize>,
+    /// `HitResult.isInside()`.
+    pub inside: bool,
 }
 
 impl NativeObject for BlockHitResult {
@@ -777,9 +782,21 @@ impl Heap {
     }
 
     pub fn alloc_hit_result(&mut self, pos: BlockPos, dir: Direction) -> usize {
+        self.alloc_hit_result_with(pos, dir, None, false)
+    }
+
+    pub fn alloc_hit_result_with(
+        &mut self,
+        pos: BlockPos,
+        dir: Direction,
+        location: Option<usize>,
+        inside: bool,
+    ) -> usize {
         self.alloc_native(BlockHitResult {
             pos,
             direction: dir,
+            location,
+            inside,
         })
     }
 

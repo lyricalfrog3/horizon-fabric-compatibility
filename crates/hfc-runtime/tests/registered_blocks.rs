@@ -561,6 +561,27 @@ fn a_mod_blocks_own_use_toggles_the_state_it_sets() {
     assert_eq!(bridge.block_used(&cabinet, &event), BlockUse::NotOverridden);
 }
 
+/// The context a block's use sees carries the real click location, through
+/// the `Vec3` `HitResult.getLocation` answers.
+#[test]
+fn the_use_context_carries_the_real_click_location() {
+    let Some(mut bridge) = mdm() else { return };
+    let host = World {
+        at: [4, 1, 4],
+        id: "mdm:shower_head".into(),
+        properties: vec![
+            ("facing".into(), "north".into()),
+            ("running".into(), "false".into()),
+        ],
+        held: None,
+    };
+    let request = click("mdm:shower_head", 0.0, 0.0);
+    let at = bridge
+        .debug_hit_location(&request, &host)
+        .expect("the hit result answers its location");
+    assert_eq!(at, request.hit);
+}
+
 /// `ServerPlayerGameMode.useItemOn`: sneaking with an item in hand must let
 /// the item place/use instead of running the block's own use.
 #[test]

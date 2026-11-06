@@ -551,10 +551,16 @@ impl FabricBridge {
         let player_id = self.interp.heap.alloc_player(player);
 
         let hit_dir = Direction::from_array(event.face);
-        let hit_id = self
-            .interp
-            .heap
-            .alloc_hit_result(block_pos.clone(), hit_dir.clone());
+        // A real `Vec3` for the click, so `HitResult.getLocation` answers it.
+        // Without one, the hit result keeps no location rather than a faked
+        // origin.
+        let hit_location = self.interp.alloc_vec3(event.hit).ok();
+        let hit_id = self.interp.heap.alloc_hit_result_with(
+            block_pos.clone(),
+            hit_dir.clone(),
+            hit_location,
+            false,
+        );
         let pos_id = self
             .interp
             .heap

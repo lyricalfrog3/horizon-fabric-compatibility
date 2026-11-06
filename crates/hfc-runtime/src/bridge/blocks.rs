@@ -10,6 +10,7 @@
 //! entities) is mod bytecode the host never runs.
 
 use crate::minecraft::Level;
+use crate::value::{JavaObject, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -490,6 +491,34 @@ impl super::FabricBridge {
             },
             Err(error) => BlockUse::Failed(error.to_string()),
         }
+    }
+
+    /// The click location a registered block's `BlockHitResult` answers, read
+    /// through the real `HitResult.getLocation()`; `None` when the runtime
+    /// could not build it. Tests use it; nothing in the host calls it.
+    #[doc(hidden)]
+    pub fn debug_hit_location(
+        &mut self,
+        request: &super::PlacementRequest,
+        host: &dyn super::HostBridge,
+    ) -> Option<[f64; 3]> {
+        let world = world_around(host, request.pos);
+        let prepared = self.interp.prepare_placement(request, &world).ok()?;
+        let value = self
+            .interp
+            .execute_method(
+                "net/minecraft/world/phys/HitResult",
+                "getLocation",
+                "()Lnet/minecraft/world/phys/Vec3;",
+                &[Value::Object(Some(prepared.hit_result))],
+            )
+            .ok()?;
+        let id = value.as_obj()?;
+        let field = |name: &str| match self.interp.heap.get(id)? {
+            JavaObject::Instance { fields, .. } => fields.get(name).map(Value::as_double),
+            _ => None,
+        };
+        Some([field("x")?, field("y")?, field("z")?])
     }
 
     /// Run the registered block's own `tick` at `pos` (`Level.scheduleTick`

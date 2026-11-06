@@ -556,9 +556,17 @@ impl FabricBridge {
             .heap
             .alloc_block_pos(block_pos.x, block_pos.y, block_pos.z);
         let dir_id = self.interp.heap.alloc_direction(hit_dir);
-        let main_hand = self
-            .interp
-            .resolve_static_field("net/minecraft/world/InteractionHand", "MAIN_HAND");
+        // The hand this turn of `startUseItem` is acting with: the host calls
+        // this once per hand, and a listener that checks the hand must see
+        // the one it is really in.
+        let hand = self.interp.resolve_static_field(
+            "net/minecraft/world/InteractionHand",
+            if event.off_hand {
+                "OFF_HAND"
+            } else {
+                "MAIN_HAND"
+            },
+        );
 
         // 3. Dispatch to UseBlockCallback.EVENT listeners (Fabric API)
         let use_block_event = self.interp.resolve_static_field(
@@ -585,7 +593,7 @@ impl FabricBridge {
                                 listener,
                                 Value::Object(Some(player_id)),
                                 Value::Object(Some(level_id)),
-                                main_hand.clone(),
+                                hand.clone(),
                                 Value::Object(Some(hit_id)),
                             ],
                         );
@@ -628,7 +636,7 @@ impl FabricBridge {
                     &[
                         listener,
                         Value::Object(Some(player_id)),
-                        main_hand.clone(),
+                        hand.clone(),
                         Value::Object(Some(pos_id)),
                         Value::Object(Some(dir_id)),
                     ],

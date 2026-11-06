@@ -642,17 +642,26 @@ no block entity.
 JamLib listeners pass) runs a registered block's own `useItemOn` (when the hand holds an item)
 and `useWithoutItem` through `use_builtins.rs`. It uses the same `Level` snapshot, placer and
 `UseOnContext` placement builds (`place_builtins.rs`), at the state the host's block stands in.
-Only blocks whose `overrides` name those methods run mod code. `InteractionResult.SUCCESS` and
-`FAIL` consume the click; `PASS`/`TRY_WITH_EMPTY_HAND` let the empty hand's turn run and then
-keep the host's handling. A block whose block entity is a `Container` keeps the host's container
-path for the empty hand (its `useWithoutItem` usually only calls `openMenu`, which the host does
-itself); an overridden `useItemOn` still runs, so a container that reacts to an item works.
+Only blocks whose `overrides` name those methods run mod code. Sneaking with an item in either
+hand skips the block's own use, as `ServerPlayerGameMode.useItemOn` does, so sneak-placing works.
+`InteractionResult.SUCCESS` and `FAIL` consume the click; an empty `useItemOn` result or
+`TRY_WITH_EMPTY_HAND` lets `useWithoutItem` run on the main hand; `PASS` goes to the item's own
+use. An `InteractionResult` the runtime cannot name is reported and fails the use, never treated
+as PASS. A block whose block entity is a `Container` keeps the host's container path for the
+empty hand (its `useWithoutItem` usually only calls `openMenu`, which the host does itself); an
+overridden `useItemOn` still runs, so a container that reacts to an item works.
 
-The states the mod's code set (`Level.setBlock`/`setBlockAndUpdate`) are applied through the host
-by property (`HostBridge::set_block_property`); a write that replaces the block with another one
-is reported, not applied. `RightClickBlockEvent` carries the hit point, whether the player is
-sneaking, and which hand acts (the item is the one in that hand). Budget 20M instructions per
-call; a call over 50 ms is logged.
+What the code changed is applied through the host as `BlockEffects`: the states it set
+(`Level.setBlock`/`setBlockAndUpdate`, by property), the items it dropped (`popResource`,
+`dropStacks`), the blocks it removed (`removeBlock`, `destroyBlock`, with the drop flag), the
+block ticks it scheduled and the particles it sent. A state write that replaces the block with
+another one, a position both set and removed, or a removal on a host without `remove_block` is
+reported and leaves the host's own click path in charge (`BlockUse::Failed`), never half-applied.
+A use that changes the held stack (`shrink`/`consume`/`setItemInHand`, detected on the one stack
+object the hand and the use share) is refused the same way until a host hook can apply it.
+`RightClickBlockEvent` carries the hit point, whether the player is sneaking, and which hand acts
+(the item is the one in that hand). Budget 20M instructions per call; a call over 50 ms is
+logged.
 
 Not run: `getTicker`/`BlockEntityTicker` (a ticking block entity), neighbour updates
 (`updateShape`, `neighborChanged`), block-entity data and per-stack container rules. mdm's two
@@ -668,9 +677,9 @@ sink re-schedules itself every 2 ticks while lit). The runtime records the call 
 snapshot; `HostBridge::schedule_block_tick` hands it to the host, which keeps it per dimension and,
 when the game tick is due, runs `FabricBridge::tick_block`. That runs the block's real
 `Block.tick(state, ServerLevel, pos, RandomSource)` over the host's blocks around it, under
-`TICK_BUDGET` (2M instructions; a tick over 20 ms is logged). What the tick set, scheduled and
-sent is applied through the host: property writes, the next ticks, and
-`ServerLevel.sendParticles` bursts. At most 64 scheduled mod ticks run per game tick; the rest
+`TICK_BUDGET` (2M instructions; a tick over 20 ms is logged). What the tick set, scheduled,
+dropped, removed and sent is applied through the host the same way a use's effects are: property
+writes, the next ticks, `ServerLevel.sendParticles` bursts, item drops and block removals. At most 64 scheduled mod ticks run per game tick; the rest
 move to the next tick. A schedule whose block is no longer there is dropped.
 
 `ParticleTypes` constants are synthesized from their field names (`FALLING_WATER` is

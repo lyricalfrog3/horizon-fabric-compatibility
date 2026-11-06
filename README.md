@@ -49,11 +49,13 @@ client where noted. A mod not listed here should be treated as unsupported.
 Known gaps are tracked in [the compatibility matrix](docs/compatibility-matrix.md) and the
 [runtime design note](docs/architecture/fabric-runtime.md). Notably:
 
-- Blocks: a mod block's own right-click code (`useWithoutItem`/`useItemOn`) runs, scheduled
-  block ticks run (a lit shower head sprays), and a container keeps the mod's stack limit and
-  per-face hopper rules; ticking block entities (`getTicker`), neighbour updates and per-stack
-  slot rules (`canPlaceItem`) don't run, and blocks whose block entity is not a vanilla
-  container stay decoration. Reading a mod's block facts and shapes makes its first
+- Blocks: a mod block's own right-click code (`useWithoutItem`/`useItemOn`) runs with vanilla's
+  sneak and pass rules, applying the states, drops, removals, ticks and particles it makes;
+  scheduled block ticks run (a lit shower head sprays); and a container keeps the mod's stack
+  limit and per-face hopper rules. A use that changes the held stack (`shrink`, `consume`,
+  `setItemInHand`) is refused rather than leaving the item behind. Ticking block entities
+  (`getTicker`), neighbour updates and per-stack slot rules (`canPlaceItem`) don't run, and
+  blocks whose block entity is not a vanilla container stay decoration. Reading a mod's block facts and shapes makes its first
   start slower (about 24 s with Modern Decorations; later starts reuse the cache and take about
   9 s, the mod's own entrypoint, against about 3 s without it).
 - Mods that carry blocks or entities around (Carry On) and most `Mixin`-heavy gameplay mods do

@@ -67,6 +67,9 @@ pub struct Heap {
     /// One `ThreadLocal`'s value: the interpreter runs one thread, so a value
     /// per `ThreadLocal` object is exactly what a JVM's thread map holds.
     pub(crate) thread_locals: HashMap<usize, Value>,
+    /// The field names `Unsafe.objectFieldOffset` handed out offsets for; the
+    /// offset of a field is `UNSAFE_FIELD_BASE` plus its index here.
+    pub(crate) unsafe_fields: Vec<String>,
     /// The `Supplier` each `ThreadLocal.withInitial` carries.
     pub(crate) thread_local_initializers: HashMap<usize, Value>,
     /// `Item.Properties` methods the runtime does not model, each logged once.
@@ -170,6 +173,7 @@ impl Heap {
             block_facts_shapes: false,
             block_state_objects: HashMap::new(),
             thread_locals: HashMap::new(),
+            unsafe_fields: Vec::new(),
             thread_local_initializers: HashMap::new(),
             unsupported_item_properties: Vec::new(),
             creative_tab_additions: Vec::new(),

@@ -12,6 +12,9 @@ use std::collections::HashMap;
 /// `jdk.internal.access.SharedSecrets`, which the JVM's bootstrap fills in.
 const SHARED_SECRETS: &str = "jdk/internal/access/SharedSecrets";
 
+/// Marks a class initializer on the catch-site stack (not a class name).
+const CLINIT_BOUNDARY: &str = "<clinit>";
+
 /// JDK bootstrap classes whose statics the runtime supplies instead of running
 /// their initializers: they build the module/CDS class-loader hierarchy of a
 /// JVM, and the runtime is a single loader ([`crate::builtins`] answers
@@ -21,7 +24,18 @@ const SHARED_SECRETS: &str = "jdk/internal/access/SharedSecrets";
 fn runtime_supplied_state(class_name: &str) -> bool {
     matches!(
         class_name,
-        "jdk/internal/loader/ClassLoaders"
+        // Its statics are synthesized (`has_synthetic_statics`); running the
+        // real initializer would build Minecraft's whole registry, which the
+        // runtime answers from `Heap::registry_entries` instead.
+        "net/minecraft/core/registries/BuiltInRegistries"
+            | "net/minecraft/world/item/Items"
+            | "net/minecraft/world/level/block/Blocks"
+            | "net/minecraft/core/component/DataComponents"
+            | "net/minecraft/core/particles/ParticleTypes"
+            | "net/minecraft/stats/Stats"
+            | "net/minecraft/tags/ItemTags"
+            | "net/minecraft/tags/BlockTags"
+            | "jdk/internal/loader/ClassLoaders"
             | "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
             | "jdk/internal/loader/ClassLoaders$AppClassLoader"
             | "jdk/internal/loader/ArchivedClassLoaders"
@@ -114,6 +128,20 @@ pub struct Interpreter {
     /// call site catches it; when none does it reaches the entrypoint, which
     /// reports it.
     pub(crate) pending_exception: Option<Value>,
+    /// The `catch` types of the handlers that cover each pending call site on
+    /// the interpreted stack: whether a fault the interpreter detects would be
+    /// caught by some caller.
+    catch_sites: Vec<String>,
+    /// How many class initializers are running: a class initializing another
+    /// one re-enters the interpreter.
+    clinit_depth: usize,
+    /// The classes whose initializer is running, innermost last. A `getstatic`
+    /// of one of them sees the field's real value (`null`/zero before the
+    /// initializer assigns it), never a synthesized placeholder: the JVM has
+    /// the field, it is just not assigned yet.
+    initializing: Vec<String>,
+    /// The class each vanilla block constant is constructed as, by block id.
+    vanilla_block_classes: HashMap<String, Option<String>>,
     /// Classes whose `<clinit>` threw, by class, with the original cause: a JVM
     /// answers `ExceptionInInitializerError` once and `NoClassDefFoundError`
     /// every time after.
@@ -173,6 +201,10 @@ impl Interpreter {
             call_depth: 0,
             trace_calls: false,
             pending_exception: None,
+            catch_sites: Vec::new(),
+            clinit_depth: 0,
+            initializing: Vec::new(),
+            vanilla_block_classes: HashMap::new(),
             unresolved_calls: 0,
             last_unresolved: None,
             failed_initializers: HashMap::new(),
@@ -204,6 +236,10 @@ impl Interpreter {
             call_depth: 0,
             trace_calls: false,
             pending_exception: None,
+            catch_sites: Vec::new(),
+            clinit_depth: 0,
+            initializing: Vec::new(),
+            vanilla_block_classes: HashMap::new(),
             unresolved_calls: 0,
             last_unresolved: None,
             failed_initializers: HashMap::new(),
@@ -309,8 +345,10 @@ impl Interpreter {
         // `NoClassDefFoundError`, as a JVM does.
         if self.failed_initializers.contains_key(class_name) {
             if !self.building_exception {
-                let message =
-                    format!("Could not initialize class {}", class_name.replace('/', "."));
+                let message = format!(
+                    "Could not initialize class {}",
+                    class_name.replace('/', ".")
+                );
                 let exception = self.new_exception("java/lang/NoClassDefFoundError", &message);
                 self.pending_exception = Some(exception);
             }
@@ -346,26 +384,24 @@ impl Interpreter {
                 {
                     // A throwing initializer leaves the class half-initialized (a JVM
                     // would raise ExceptionInInitializerError on the next use); say so.
-                    if let Err(error) =
-                        self.execute_special_method(class_name, "<clinit>", "()V", &[])
-                    {
+                    // Inside the initializer, an exception that escapes it
+                    // reaches the callers as `ExceptionInInitializerError`.
+                    let mark = self.catch_sites.len();
+                    self.catch_sites.push(CLINIT_BOUNDARY.to_string());
+                    let nested = self.clinit_depth > 0;
+                    self.clinit_depth += 1;
+                    self.initializing.push(class_name.to_string());
+                    let ran = self.execute_special_method(class_name, "<clinit>", "()V", &[]);
+                    self.initializing.pop();
+                    self.clinit_depth -= 1;
+                    self.catch_sites.truncate(mark);
+                    let _ = nested;
+                    if let Err(error) = ran {
                         log::warn!("static initializer of {class_name} failed: {error}");
                     }
                     // A throwing initializer fails the class. The first use
                     // raises `ExceptionInInitializerError` around the cause; the
                     // runtime then answers `NoClassDefFoundError`.
-                    if class_name.contains("ServerConfigurationConnectionEvents") {
-                        let keys: Vec<String> = self
-                            .loader
-                            .get(class_name)
-                            .map(|c| {
-                                c.static_fields
-                                    .iter()
-                                    .map(|(k, v)| format!("{k}={v:?}"))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                    }
                     if let Some(cause) = self.pending_exception.take() {
                         // A symbol the runtime lacks, not the mod's own failure:
                         // a JVM would never have taken this path, so the class
@@ -387,32 +423,6 @@ impl Interpreter {
                             "java/lang/ExceptionInInitializerError",
                             "(Ljava/lang/Throwable;)V",
                             std::slice::from_ref(&cause),
-                        );
-                        let mut chain = Vec::new();
-                        let mut current = Some(cause.clone());
-                        for _ in 0..5 {
-                            let Some(value) = current else { break };
-                            chain.push(self.describe_exception(&value));
-                            current = value
-                                .as_obj()
-                                .and_then(|id| match self.heap.get(id) {
-                                    Some(JavaObject::Instance { fields, .. }) => {
-                                        fields.get("cause").cloned()
-                                    }
-                                    _ => None,
-                                })
-                                .filter(|cause| !cause.is_null());
-                        }
-                        eprintln!(
-                            "INITTHROW {class_name} <- {} STACK {}",
-                            self.describe_exception(&cause),
-                            self.frame_classes[..self.frame_depth]
-                                .iter()
-                                .rev()
-                                .take(12)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(" < ")
                         );
                         self.failed_initializers
                             .insert(class_name.to_string(), cause);
@@ -444,10 +454,9 @@ impl Interpreter {
     fn install_vm_state(&mut self) {
         let properties = crate::builtins::system_properties(&mut self.heap);
         if let Some(class) = self.loader.get_mut("jdk/internal/misc/VM") {
-            class.static_fields.insert(
-                "savedProps".to_string(),
-                Value::Object(Some(properties)),
-            );
+            class
+                .static_fields
+                .insert("savedProps".to_string(), Value::Object(Some(properties)));
             // JAVA_LANG_SYSTEM_INITED | MODULE_SYSTEM_INITED | SYSTEM_BOOTED.
             class
                 .static_fields
@@ -638,6 +647,22 @@ impl Interpreter {
                     || self.class_is_assignable_to(&implemented, &wanted)
             }
             JavaObject::Native(n) => {
+                // A vanilla block constant is the class `Blocks` constructs it
+                // as (`FIRE` is a `FireBlock`), with the interfaces mixins add
+                // to that class (`FireBlockHooks`).
+                if let Some(block) = n.as_any().downcast_ref::<crate::minecraft::Block>() {
+                    let id = block.id.clone();
+                    if let Some(class) = self.vanilla_block_class(&id) {
+                        if class != "net/minecraft/world/level/block/Block"
+                            && self.class_is_assignable_to(&class, target_type)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                let Some(JavaObject::Native(n)) = self.heap.get(id) else {
+                    return false;
+                };
                 let c = n.class_name();
                 c == target_type
                     || (c == "net/minecraft/server/level/ServerPlayer"
@@ -762,6 +787,11 @@ impl Interpreter {
             if !visited.insert(curr.clone()) {
                 continue;
             }
+            // Interfaces mixins add to a class count even before it loads.
+            if let Some(added) = self.mixin_interfaces.get(&curr) {
+                queue.extend(added.iter().cloned());
+            }
+            let _ = self.loader.get_or_load(&curr);
             let Some(c) = self.loader.get(&curr) else {
                 continue;
             };
@@ -770,9 +800,6 @@ impl Interpreter {
             }
             for iface in &c.interfaces {
                 queue.push_back(iface.clone());
-            }
-            if let Some(added) = self.mixin_interfaces.get(&curr) {
-                queue.extend(added.iter().cloned());
             }
         }
         false
@@ -835,6 +862,7 @@ impl Interpreter {
                 .push(format!("{class_name}.{method_name}{descriptor}"));
         }
         let entry = self.call_depth == 1;
+        let unresolved_before = self.unresolved_calls;
         let res =
             self.execute_method_inner(class_name, method_name, descriptor, args, virtual_dispatch);
         if traced {
@@ -842,18 +870,33 @@ impl Interpreter {
         }
         self.call_depth -= 1;
         // A call the host made (not one frame calling another) has no caller to
-        // unwind into: an exception it leaves behind is the call failing, and it
-        // is reported instead of being treated as a result.
+        // unwind into: an exception it leaves behind is the call failing, and an
+        // entrypoint is told so instead of being handed a default as a result.
+        // The one exception is a failure the runtime caused itself (a symbol it
+        // lacks): the entrypoint is not at fault, and reporting it as one would
+        // blame a mod for the runtime's own gap.
         if entry {
             if let Some(exception) = self.pending_exception.take() {
-                let described = self.describe_exception(&exception);
-                return match res {
-                    Ok(_) => Err(Error::new(
-                        "interpreter",
-                        format!("{class_name}.{method_name} threw {described}"),
-                    )),
-                    Err(error) => Err(error),
-                };
+                if self.unresolved_calls > unresolved_before {
+                    let what = self
+                        .last_unresolved
+                        .clone()
+                        .unwrap_or_else(|| "an unresolved call".into());
+                    log::warn!(
+                        "{class_name}.{method_name} failed on {what}, which the runtime lacks: \
+                         {}",
+                        self.describe_exception(&exception)
+                    );
+                } else {
+                    let described = self.describe_exception(&exception);
+                    return match res {
+                        Ok(_) => Err(Error::new(
+                            "interpreter",
+                            format!("{class_name}.{method_name} threw {described}"),
+                        )),
+                        Err(error) => Err(error),
+                    };
+                }
             }
         }
         res
@@ -1827,6 +1870,96 @@ impl Interpreter {
         // `ThreadLocal`: the interpreter runs one thread, so each
         // `ThreadLocal` object holds exactly the one value a JVM's per-thread
         // map would. `withInitial`'s supplier runs when nothing is set.
+        // `Level.getFluidState(pos)` / `BlockState.getFluidState()`: the blocks
+        // the runtime models are not fluids, so the state is the empty one,
+        // whose type is `Fluids.EMPTY` (so `== Fluids.EMPTY` holds).
+        let state_fluid_state = method_name == "getFluidState"
+            && args.len() == 1
+            && matches!(
+                class_name,
+                "net/minecraft/world/level/block/state/BlockState"
+                    | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+                    | "net/minecraft/world/level/block/state/StateHolder"
+            );
+        let level_fluid_state = method_name == "getFluidState"
+            && matches!(
+                class_name,
+                "net/minecraft/world/level/Level"
+                    | "net/minecraft/world/level/BlockGetter"
+                    | "net/minecraft/server/level/ServerLevel"
+                    | "net/minecraft/world/level/LevelReader"
+            )
+            && args.len() == 2
+            && args[0].as_obj().is_some_and(|id| {
+                self.heap
+                    .get_native::<crate::minecraft::Level>(id)
+                    .is_some()
+            });
+        if state_fluid_state || level_fluid_state {
+            let empty =
+                self.resolve_static_field("net/minecraft/world/level/material/Fluids", "EMPTY");
+            let mut fields = HashMap::new();
+            fields.insert("type".to_string(), empty);
+            let id = self.heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/world/level/material/FluidState".into(),
+                fields,
+            });
+            return Ok(Value::Object(Some(id)));
+        }
+
+        // `ThreadLocal`: the interpreter runs one thread, so each `ThreadLocal`
+        // holds exactly the one value a JVM's per-thread map would.
+        // `withInitial`'s supplier runs when nothing is set.
+        if class_name == "java/lang/ThreadLocal" {
+            if method_name == "withInitial" && args.len() == 1 {
+                let id = self.heap.alloc(JavaObject::Instance {
+                    class_name: "java/lang/ThreadLocal".into(),
+                    fields: HashMap::new(),
+                });
+                self.heap
+                    .thread_local_initializers
+                    .insert(id, args[0].clone());
+                return Ok(Value::Object(Some(id)));
+            }
+            if let Some(this_id) = args.first().and_then(Value::as_obj) {
+                match method_name {
+                    "set" if args.len() == 2 => {
+                        self.heap.thread_locals.insert(this_id, args[1].clone());
+                        return Ok(Value::NULL);
+                    }
+                    "remove" => {
+                        self.heap.thread_locals.remove(&this_id);
+                        return Ok(Value::NULL);
+                    }
+                    "get" => {
+                        if let Some(value) = self.heap.thread_locals.get(&this_id) {
+                            return Ok(value.clone());
+                        }
+                        let initializer =
+                            self.heap.thread_local_initializers.get(&this_id).cloned();
+                        let value = match initializer {
+                            Some(initializer) => self.execute_method(
+                                "java/util/function/Supplier",
+                                "get",
+                                "()Ljava/lang/Object;",
+                                std::slice::from_ref(&initializer),
+                            )?,
+                            // `ThreadLocal.initialValue()` of a subclass, or null.
+                            None => self.execute_method(
+                                "java/lang/ThreadLocal",
+                                "initialValue",
+                                "()Ljava/lang/Object;",
+                                std::slice::from_ref(&args[0]),
+                            )?,
+                        };
+                        self.heap.thread_locals.insert(this_id, value.clone());
+                        return Ok(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // `Unsafe.ensureClassInitialized(Class)` runs that class's `<clinit>`;
         // `SharedSecrets` relies on it to install a lazily set access object.
         if matches!(class_name, "jdk/internal/misc/Unsafe" | "sun/misc/Unsafe")
@@ -2135,6 +2268,86 @@ impl Interpreter {
         }
     }
 
+    /// Whether the field a `getfield`/`putfield` names is really declared by a
+    /// class the loader has: only then is a null receiver the JVM's fault. The
+    /// runtime models some objects with natively stored fields (`Thread`'s
+    /// `threadStatus`, `daemon`), and a null there is a model gap, not a throw.
+    fn field_is_checkable(&mut self, class: &str, field: &str) -> bool {
+        matches!(self.loader.get_or_load(class), Ok(Some(class)) if class.fields.contains_key(field))
+    }
+
+    /// Whether a `checkcast` of `value` to `target` can be decided. Only an
+    /// object of real bytecode (an instance of a class the loader has, or a
+    /// string) cast to a class the loader can find is checked. The runtime's
+    /// stand-ins (native Minecraft objects, modelled collections, lambdas,
+    /// synthesized constants) carry no real class identity, and an unknown
+    /// target class cannot be compared with: those casts pass, as before.
+    fn cast_is_checkable(&mut self, value: &Value, target: &str) -> bool {
+        let Some(id) = value.as_obj() else {
+            return false;
+        };
+        if target.starts_with('[') {
+            return false;
+        }
+        let class = match self.heap.get(id) {
+            Some(JavaObject::String(_)) => "java/lang/String".to_string(),
+            Some(JavaObject::Instance { class_name, .. }) => class_name.clone(),
+            _ => return false,
+        };
+        if !matches!(self.loader.get_or_load(&class), Ok(Some(_))) {
+            return false;
+        }
+        matches!(self.loader.get_or_load(target), Ok(Some(_)))
+    }
+
+    /// The class `Blocks.<clinit>` constructs vanilla block `id` as: the
+    /// constructor reference (`FireBlock::new`) it registers before storing the
+    /// constant. Read from the bytecode once per id.
+    fn vanilla_block_class(&mut self, id: &str) -> Option<String> {
+        if let Some(known) = self.vanilla_block_classes.get(id) {
+            return known.clone();
+        }
+        let field = id.strip_prefix("minecraft:").map(str::to_ascii_uppercase);
+        let found = field.and_then(|field| {
+            const BLOCKS: &str = "net/minecraft/world/level/block/Blocks";
+            let _ = self.loader.get_or_load(BLOCKS);
+            let class = self.loader.get(BLOCKS)?;
+            let code = class
+                .methods
+                .get(&("<clinit>".to_string(), "()V".to_string()))?
+                .code
+                .clone()?;
+            let bootstraps = class.bootstrap_methods.clone();
+            let mut constructor: Option<String> = None;
+            for (_, opcode) in &code.opcodes {
+                match opcode {
+                    Opcode::Invokedynamic { bootstrap_idx, .. } => {
+                        if let Some(b) = bootstraps.get(*bootstrap_idx as usize) {
+                            if b.target_method == "<init>" {
+                                constructor = Some(b.target_class.clone());
+                            }
+                        }
+                    }
+                    Opcode::Putstatic {
+                        class_name,
+                        field_name,
+                        ..
+                    } if class_name == BLOCKS => {
+                        if *field_name == field {
+                            return constructor;
+                        }
+                        constructor = None;
+                    }
+                    _ => {}
+                }
+            }
+            None
+        });
+        self.vanilla_block_classes
+            .insert(id.to_string(), found.clone());
+        found
+    }
+
     /// The class of the frame below the innermost one, as a `Class`; null at
     /// the bottom of the stack.
     fn caller_class(&mut self) -> Value {
@@ -2179,6 +2392,7 @@ impl Interpreter {
             None => self.frame_methods.push(method_name.to_string()),
         }
         self.frame_depth += 1;
+        let catch_mark = self.catch_sites.len();
         let result = self.interpret_frame(
             this_class,
             method_name,
@@ -2187,6 +2401,7 @@ impl Interpreter {
             code,
             args,
         );
+        self.catch_sites.truncate(catch_mark);
         self.frame_depth -= 1;
         result
     }
@@ -2341,8 +2556,64 @@ impl Interpreter {
         message: &str,
         stack: &mut Vec<Value>,
     ) -> Option<usize> {
+        if !self.fault_is_caught(code, thrown_at, class) {
+            // Nothing on the stack catches it. On a JVM the fault would end the
+            // call; here the null, the stand-in or the missing value behind it
+            // almost always comes from something the runtime does not model,
+            // so the instruction keeps its lenient answer instead of ending
+            // the entrypoint (see `docs/architecture/fabric-runtime.md`).
+            return None;
+        }
         let exception = self.new_exception(class, message);
         self.throw_at(code, thrown_at, exception, stack)
+    }
+
+    /// Whether a handler of this frame (at `at`) or of a caller's pending call
+    /// site catches an exception of `class`. A `finally` (catch-all) handler
+    /// rethrows, so it does not count as catching.
+    fn fault_is_caught(&mut self, code: &CodeInfo, at: usize, class: &str) -> bool {
+        let local: Vec<String> = code
+            .handlers
+            .iter()
+            .filter(|entry| at >= entry.start && at < entry.end)
+            .filter_map(|entry| entry.catch_type.clone())
+            .collect();
+        if local
+            .iter()
+            .any(|catch| self.class_is_assignable_to(class, catch))
+        {
+            return true;
+        }
+        // Innermost caller first. Leaving a class initializer turns anything
+        // but an `Error` into `ExceptionInInitializerError`.
+        let callers = self.catch_sites.clone();
+        let mut class = class.to_string();
+        for catch in callers.iter().rev() {
+            if catch == CLINIT_BOUNDARY {
+                if !self.class_is_assignable_to(&class, "java/lang/Error") {
+                    class = "java/lang/ExceptionInInitializerError".to_string();
+                }
+                continue;
+            }
+            if self.class_is_assignable_to(&class, catch) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Record the catch types of the handlers of `code` that cover the call at
+    /// `at`, for the duration of that call. Returns the mark to restore.
+    fn enter_call(&mut self, code: &CodeInfo, at: usize) -> usize {
+        let mark = self.catch_sites.len();
+        for entry in &code.handlers {
+            if at >= entry.start && at < entry.end {
+                if let Some(catch) = &entry.catch_type {
+                    self.catch_sites.push(catch.clone());
+                }
+            }
+        }
+        mark
     }
 
     /// After a call returned: catch the exception it threw here when this frame
@@ -2410,7 +2681,10 @@ impl Interpreter {
     ) -> Result<Value> {
         let mut pc = *pc_slot;
         let opcodes = &code.opcodes;
+        let catch_mark = self.catch_sites.len();
         while pc < opcodes.len() {
+            // The catch types covering the previous call site no longer apply.
+            self.catch_sites.truncate(catch_mark);
             if let Some(budget) = &mut self.step_budget {
                 if *budget == 0 {
                     let stack = if self.trace_calls && !self.call_stack.is_empty() {
@@ -2436,6 +2710,22 @@ impl Interpreter {
             *pc_slot = pc;
             let (byte_offset, ref op) = opcodes[pc];
             pc += 1;
+            // An instruction that runs other code (a call, or a class
+            // initializer) makes this frame's covering handlers visible to it.
+            if !code.handlers.is_empty()
+                && matches!(
+                    op,
+                    Opcode::Invokestatic { .. }
+                        | Opcode::Invokespecial { .. }
+                        | Opcode::Invokevirtual { .. }
+                        | Opcode::Invokeinterface { .. }
+                        | Opcode::New(_)
+                        | Opcode::Getstatic { .. }
+                        | Opcode::Putstatic { .. }
+                )
+            {
+                self.enter_call(code, byte_offset);
+            }
 
             match op {
                 Opcode::Nop => {}
@@ -2601,7 +2891,10 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        stack.push(Value::Int(0));
                     } else {
                         stack.push(Value::Int(a.wrapping_div(b)));
                     }
@@ -2620,7 +2913,10 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        stack.push(Value::Int(0));
                     } else {
                         stack.push(Value::Int(a.wrapping_rem(b)));
                     }
@@ -2746,7 +3042,10 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        stack.push(Value::Long(0));
                     } else {
                         stack.push(Value::Long(a.wrapping_div(b)));
                     }
@@ -2765,7 +3064,10 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        stack.push(Value::Long(0));
                     } else {
                         stack.push(Value::Long(a.wrapping_rem(b)));
                     }
@@ -3152,15 +3454,23 @@ impl Interpreter {
                     if let Some(c) = self.loader.get_mut(&owner) {
                         c.static_fields.insert(field_name.clone(), val);
                     }
+                    // The class field is now the truth: drop any placeholder
+                    // handed out before the initializer ran, or two readers of
+                    // the "same" static hold different objects.
+                    self.static_singletons
+                        .remove(&(owner.clone(), field_name.clone()));
+                    self.static_singletons
+                        .remove(&(class_name.clone(), field_name.clone()));
                 }
                 Opcode::Getfield {
+                    class_name: field_class,
                     field_name,
                     descriptor,
-                    ..
                 } => {
                     let obj_ref = stack.pop().unwrap_or(Value::NULL);
-                    if obj_ref.is_null() {
-                        let message = format!("Cannot read field \"{field_name}\" because value is null");
+                    if obj_ref.is_null() && self.field_is_checkable(field_class, field_name) {
+                        let message =
+                            format!("Cannot read field \"{field_name}\" because value is null");
                         if let Some(target) = self.raise(
                             code,
                             byte_offset,
@@ -3171,7 +3481,11 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        stack.push(Value::NULL);
+                        continue;
                     }
                     let val = if let Some(id) = obj_ref.as_obj() {
                         if let Some(JavaObject::Instance { fields, .. }) = self.heap.get(id) {
@@ -3189,11 +3503,16 @@ impl Interpreter {
                     };
                     stack.push(val);
                 }
-                Opcode::Putfield { field_name, .. } => {
+                Opcode::Putfield {
+                    class_name: field_class,
+                    field_name,
+                    ..
+                } => {
                     let val = stack.pop().unwrap_or(Value::NULL);
                     let obj_ref = stack.pop().unwrap_or(Value::NULL);
-                    if obj_ref.is_null() {
-                        let message = format!("Cannot assign field \"{field_name}\" because value is null");
+                    if obj_ref.is_null() && self.field_is_checkable(field_class, field_name) {
+                        let message =
+                            format!("Cannot assign field \"{field_name}\" because value is null");
                         if let Some(target) = self.raise(
                             code,
                             byte_offset,
@@ -3204,7 +3523,10 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        continue;
                     }
                     if let Some(id) = obj_ref.as_obj() {
                         if let Some(JavaObject::Instance { fields, .. }) = self.heap.get_mut(id) {
@@ -3238,9 +3560,11 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
                     }
-                    let count = size as usize;
+                    let count = size.max(0) as usize;
                     let default_val = match elem.as_str() {
                         "boolean" | "byte" | "short" | "char" | "int" => Value::Int(0),
                         "long" => Value::Long(0),
@@ -3260,7 +3584,9 @@ impl Interpreter {
                         Some(JavaObject::Array { elements, .. }) => Some(elements.len() as i32),
                         _ => None,
                     });
-                    let Some(len) = len else {
+                    let len = if let Some(len) = len {
+                        len
+                    } else {
                         let message = "Cannot read the array length because value is null";
                         if let Some(target) = self.raise(
                             code,
@@ -3272,7 +3598,10 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        0
                     };
                     stack.push(Value::Int(len));
                 }
@@ -3309,13 +3638,15 @@ impl Interpreter {
                                 "Cannot load from array because it is null".to_string(),
                             ),
                         };
-                        if let Some(target) =
-                            self.raise(code, byte_offset, class, &message, stack)
+                        if let Some(target) = self.raise(code, byte_offset, class, &message, stack)
                         {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        stack.push(Value::NULL);
                     }
                 }
                 Opcode::Aastore
@@ -3353,13 +3684,14 @@ impl Interpreter {
                         }
                     }
                     if let Some((class, message)) = failure {
-                        if let Some(target) =
-                            self.raise(code, byte_offset, class, &message, stack)
+                        if let Some(target) = self.raise(code, byte_offset, class, &message, stack)
                         {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
                     }
                 }
 
@@ -3367,7 +3699,9 @@ impl Interpreter {
                     // A reference that is not an instance of the target throws;
                     // `null` passes through every cast.
                     let value = stack.last().cloned().unwrap_or(Value::NULL);
-                    if !value.is_null() && !self.is_instance_of(&value, target_type) {
+                    if self.cast_is_checkable(&value, target_type)
+                        && !self.is_instance_of(&value, target_type)
+                    {
                         let from = self
                             .heap
                             .get(value.as_obj().unwrap_or(usize::MAX))
@@ -3388,7 +3722,9 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
                     }
                 }
                 Opcode::Instanceof(target_type) => {
@@ -3402,7 +3738,6 @@ impl Interpreter {
                     method_name,
                     descriptor,
                 } => {
-
                     self.ensure_initialized(class_name)?;
                     let param_count = parse_descriptor_param_count(descriptor);
                     let mut call_args = Vec::with_capacity(param_count);
@@ -3501,7 +3836,19 @@ impl Interpreter {
                             pc = target;
                             continue;
                         }
-                        return Ok(Value::NULL);
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        // A method of `Class` on null ends the call even when
+                        // nothing catches it: reflection walks
+                        // (`c = c.getSuperclass()` until a field is found) end
+                        // on it, and answering null instead loops forever.
+                        if class_name == "java/lang/Class" {
+                            return Err(Error::new(
+                                "interpreter",
+                                format!("java.lang.NullPointerException: {message}"),
+                            ));
+                        }
                     }
                     call_args.insert(0, this_ref);
 
@@ -3851,6 +4198,24 @@ impl Interpreter {
             return value;
         }
 
+        // A class whose initializer is running: its statics are whatever it has
+        // assigned so far, and the rest are still the JVM's default. Synthesizing
+        // one here would hand out a placeholder the initializer's own
+        // `putstatic` then replaces.
+        if self.initializing.iter().any(|name| name == class_name) {
+            if let Some(class) = self.loader.get(class_name) {
+                if let Some(val) = class.static_fields.get(field_name) {
+                    return val.clone();
+                }
+                if let Some(field) = class.fields.get(field_name) {
+                    if field.is_static {
+                        return default_for_descriptor(&field.descriptor);
+                    }
+                }
+            }
+            return Value::NULL;
+        }
+
         if let Some(class) = self.loader.get(class_name) {
             if let Some(val) = class.static_fields.get(field_name) {
                 if !val.is_null() {
@@ -3882,6 +4247,26 @@ impl Interpreter {
             }
         }
 
+        // A platform class's statics are what its initializer built. Reading
+        // one before that initializer ran would hand back a synthesized
+        // placeholder that a later `putstatic` replaces, and two readers of
+        // "the same" static would then hold different objects
+        // (`BlockStateProperties.AGE_7` in a block's state definition and in
+        // `setValue`). Initialize first, then synthesize only what is still
+        // null.
+        let platform = ["net/minecraft/", "com/mojang/", "java/", "jdk/", "sun/"]
+            .iter()
+            .any(|prefix| class_name.starts_with(prefix));
+        if platform && !has_synthetic_statics(class_name) && !runtime_supplied_state(class_name) {
+            let _ = self.ensure_initialized(class_name);
+        }
+        if let Some(class) = self.loader.get(class_name) {
+            if let Some(val) = class.static_fields.get(field_name) {
+                if !val.is_null() {
+                    return val.clone();
+                }
+            }
+        }
         let val = self.create_static_field_val(class_name, field_name);
         self.static_singletons.insert(key, val.clone());
         if let Some(class) = self.loader.get_mut(class_name) {

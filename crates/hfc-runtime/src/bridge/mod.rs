@@ -566,10 +566,10 @@ impl FabricBridge {
     pub fn add_jimage(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if let Some(home) = path.parent().and_then(Path::parent) {
-            self.interp.heap.properties.insert(
-                "java.home".to_string(),
-                home.to_string_lossy().to_string(),
-            );
+            self.interp
+                .heap
+                .properties
+                .insert("java.home".to_string(), home.to_string_lossy().to_string());
         }
         self.interp.loader.add_jimage(path)
     }

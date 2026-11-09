@@ -1,11 +1,17 @@
-use hfc_runtime::bridge::FabricBridge;
 use hfc_runtime::minecraft::{BlockPos, BlockState, Direction, EventResult, Level, Player};
 use hfc_runtime::value::Value;
 use std::path::PathBuf;
 
+mod common;
+
 #[test]
 fn test_rch_initialize() {
-    let mut bridge = FabricBridge::new();
+    // The mods' bytecode runs against the real Minecraft and JDK classes;
+    // without an installation the test has nothing real to run on.
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        eprintln!("skipping: no Minecraft installation");
+        return;
+    };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -72,7 +78,12 @@ fn test_rch_initialize() {
 
 #[test]
 fn test_rch_harvest_crop_dynamically() {
-    let mut bridge = FabricBridge::new();
+    // The mods' bytecode runs against the real Minecraft and JDK classes;
+    // without an installation the test has nothing real to run on.
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        eprintln!("skipping: no Minecraft installation");
+        return;
+    };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

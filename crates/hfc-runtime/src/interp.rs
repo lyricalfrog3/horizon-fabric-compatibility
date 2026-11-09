@@ -132,6 +132,9 @@ pub struct Interpreter {
     /// the interpreted stack: whether a fault the interpreter detects would be
     /// caught by some caller.
     catch_sites: Vec<String>,
+    /// Set while a property factory runs, so its own call does not intern again.
+    interning_property: bool,
+
     /// How many class initializers are running: a class initializing another
     /// one re-enters the interpreter.
     clinit_depth: usize,
@@ -202,6 +205,7 @@ impl Interpreter {
             trace_calls: false,
             pending_exception: None,
             catch_sites: Vec::new(),
+            interning_property: false,
             clinit_depth: 0,
             initializing: Vec::new(),
             vanilla_block_classes: HashMap::new(),
@@ -237,6 +241,7 @@ impl Interpreter {
             trace_calls: false,
             pending_exception: None,
             catch_sites: Vec::new(),
+            interning_property: false,
             clinit_depth: 0,
             initializing: Vec::new(),
             vanilla_block_classes: HashMap::new(),
@@ -1870,6 +1875,30 @@ impl Interpreter {
         // `ThreadLocal`: the interpreter runs one thread, so each
         // `ThreadLocal` object holds exactly the one value a JVM's per-thread
         // map would. `withInitial`'s supplier runs when nothing is set.
+        // `CropBlock.getAgeProperty()` (and `Block`'s) answers
+        // `BlockStateProperties.AGE_<max>`, the constant the block's state
+        // definition was built with. Vanilla compares properties by identity, so
+        // a freshly built property of the same name would not be the one the
+        // state's `propertyKeys` holds.
+        if matches!(
+            class_name,
+            "net/minecraft/world/level/block/CropBlock" | "net/minecraft/world/level/block/Block"
+        ) && method_name == "getAgeProperty"
+        {
+            let max = args
+                .first()
+                .and_then(Value::as_obj)
+                .and_then(|id| self.heap.get_native::<crate::minecraft::Block>(id))
+                .map_or(7, |block| block.max_age.clamp(1, 25));
+            let property = self.resolve_static_field(
+                "net/minecraft/world/level/block/state/properties/BlockStateProperties",
+                &format!("AGE_{max}"),
+            );
+            if !property.is_null() {
+                return Ok(property);
+            }
+        }
+
         // `Level.getFluidState(pos)` / `BlockState.getFluidState()`: the blocks
         // the runtime models are not fluids, so the state is the empty one,
         // whose type is `Fluids.EMPTY` (so `== Fluids.EMPTY` holds).
@@ -1957,6 +1986,46 @@ impl Interpreter {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // A block-state `Property` is a value vanilla compares by identity
+        // (`StateHolder.valueIndex` uses `if_acmpne`): a block's state
+        // definition and a `setValue` naming "the same" property must receive
+        // one object. Vanilla builds them through `IntegerProperty.create(name,
+        // …)`, so the factory is interned by class and name and every later call
+        // answers the object the first one made.
+        if method_name == "create" && is_property_class(class_name) && !self.interning_property {
+            if let Some(name) = args
+                .first()
+                .and_then(Value::as_obj)
+                .and_then(|id| self.heap.get_string(id))
+                .map(str::to_string)
+            {
+                // A property's identity is its class, name and value set: two
+                // `EnumProperty.create("axis", …)` calls with different values
+                // are different properties, and reusing one for the other gives
+                // it the wrong allowed values.
+                let extra = args
+                    .iter()
+                    .skip(2)
+                    .map(|v| format!("{v:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let key = format!("property:{class_name}:{name}:{extra}");
+                if let Some(existing) = self.heap.get_singleton(&key) {
+                    return Ok(Value::Object(Some(existing)));
+                }
+                // The factory itself calls back into this method; the flag
+                // keeps the intercept from recursing.
+                self.interning_property = true;
+                let made = self.execute_special_method(class_name, method_name, descriptor, args);
+                self.interning_property = false;
+                let made = made?;
+                if let Some(id) = made.as_obj() {
+                    self.heap.set_singleton(&key, id);
+                }
+                return Ok(made);
             }
         }
 
@@ -4754,6 +4823,18 @@ fn modelled_collection_assignable(modelled: &str, target: &str) -> bool {
         _ => return false,
     };
     family.contains(&target)
+}
+
+/// The block-state `Property` subclasses whose `create` factory the runtime
+/// interns: vanilla compares properties by identity.
+fn is_property_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "net/minecraft/world/level/block/state/properties/IntegerProperty"
+            | "net/minecraft/world/level/block/state/properties/BooleanProperty"
+            | "net/minecraft/world/level/block/state/properties/EnumProperty"
+            | "net/minecraft/world/level/block/state/properties/DirectionProperty"
+    )
 }
 
 /// The Minecraft registry types the runtime models with one object.

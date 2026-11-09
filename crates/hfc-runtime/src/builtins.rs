@@ -7400,10 +7400,15 @@ pub fn dispatch_builtin(
         } else if method_name == "getMaxAge" {
             return BuiltinResult::Handled(Value::Int(7));
         } else if method_name == "getAgeProperty" {
-            let pid = heap.alloc_native(IntegerProperty {
+            let max = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_native::<Block>(id))
+                .map_or(7, |block| block.max_age);
+            let pid = heap.alloc_property(IntegerProperty {
                 name: "age".into(),
                 min: 0,
-                max: 7,
+                max,
             });
             return BuiltinResult::Handled(Value::Object(Some(pid)));
         } else if method_name == "asItem" && !args.is_empty() {

@@ -311,6 +311,24 @@ impl Heap {
         self.alloc(JavaObject::Native(Box::new(obj)))
     }
 
+    /// The one block-state `Property` object for `name` and its value range.
+    /// Properties are values vanilla compares by identity: a state built with
+    /// `BlockStateProperties.AGE_7` and a `setValue` call naming a property of
+    /// the same name must see the same object, or `StateHolder.valueIndex`
+    /// answers -1 and the state rejects the write.
+    pub fn alloc_property(&mut self, property: crate::minecraft::IntegerProperty) -> usize {
+        let key = format!(
+            "property:{}:{}:{}",
+            property.name, property.min, property.max
+        );
+        if let Some(id) = self.identifiers.get(&key) {
+            return *id;
+        }
+        let id = self.alloc_native(property);
+        self.identifiers.insert(key, id);
+        id
+    }
+
     /// The one `Identifier` object for `namespace:path`. Identifiers are values:
     /// two with the same text must compare equal in a Set or Map, which the
     /// runtime's collections decide by object identity.

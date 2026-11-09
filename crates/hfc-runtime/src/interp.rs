@@ -1880,25 +1880,6 @@ impl Interpreter {
         // definition was built with. Vanilla compares properties by identity, so
         // a freshly built property of the same name would not be the one the
         // state's `propertyKeys` holds.
-        if matches!(
-            class_name,
-            "net/minecraft/world/level/block/CropBlock" | "net/minecraft/world/level/block/Block"
-        ) && method_name == "getAgeProperty"
-        {
-            let max = args
-                .first()
-                .and_then(Value::as_obj)
-                .and_then(|id| self.heap.get_native::<crate::minecraft::Block>(id))
-                .map_or(7, |block| block.max_age.clamp(1, 25));
-            let property = self.resolve_static_field(
-                "net/minecraft/world/level/block/state/properties/BlockStateProperties",
-                &format!("AGE_{max}"),
-            );
-            if !property.is_null() {
-                return Ok(property);
-            }
-        }
-
         // `Level.getFluidState(pos)` / `BlockState.getFluidState()`: the blocks
         // the runtime models are not fluids, so the state is the empty one,
         // whose type is `Fluids.EMPTY` (so `== Fluids.EMPTY` holds).

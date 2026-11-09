@@ -1431,7 +1431,17 @@ fn builtin_registry_method(
     ) {
         return None;
     }
-    let kind = builtin_registry_kind(heap, args.first()?)?;
+    // A block or item is a holder-getter for its own registry (`ToolMaterial`
+    // asks a block for a tag's members). The registry's kind is the one the
+    // value belongs to.
+    let kind = match builtin_registry_kind(heap, args.first()?) {
+        Some(kind) => kind,
+        None => match args.first().and_then(|v| v.as_obj()) {
+            Some(id) if heap.get_native::<crate::minecraft::Block>(id).is_some() => "BLOCK".into(),
+            Some(id) if heap.get_native::<Item>(id).is_some() => "ITEM".into(),
+            _ => return None,
+        },
+    };
     let handled = |v: Value| Some(BuiltinResult::Handled(v));
     match (method_name, args.len()) {
         // The registry's own key is its token, as `Registries.X` is.
@@ -1591,8 +1601,19 @@ fn builtin_registry_method(
                 return handled(Value::Object(Some(id)));
             }
             if members.is_empty() {
+                // No host snapshot: the runtime has no data on this tag, so it
+                // answers an empty set rather than letting vanilla's own
+                // `getOrThrow` report a tag the host never listed as missing.
                 if method_name == "getOrThrow" {
-                    return handled(Value::NULL);
+                    let mut fields = HashMap::new();
+                    fields.insert("key".to_string(), args[1].clone());
+                    let list = heap.alloc_list(Vec::new());
+                    fields.insert("list".to_string(), Value::Object(Some(list)));
+                    let id = heap.alloc(JavaObject::Instance {
+                        class_name: "net/minecraft/core/HolderSet$Named".into(),
+                        fields,
+                    });
+                    return handled(Value::Object(Some(id)));
                 }
                 let mut fields = HashMap::new();
                 fields.insert("present".to_string(), Value::from_bool(false));
@@ -7399,18 +7420,6 @@ pub fn dispatch_builtin(
             }
         } else if method_name == "getMaxAge" {
             return BuiltinResult::Handled(Value::Int(7));
-        } else if method_name == "getAgeProperty" {
-            let max = args
-                .first()
-                .and_then(|v| v.as_obj())
-                .and_then(|id| heap.get_native::<Block>(id))
-                .map_or(7, |block| block.max_age);
-            let pid = heap.alloc_property(IntegerProperty {
-                name: "age".into(),
-                min: 0,
-                max,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(pid)));
         } else if method_name == "asItem" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(block) = heap.get_native::<Block>(id) {

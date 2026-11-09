@@ -1409,6 +1409,29 @@ fn registered_id(heap: &Heap, kind: &str, value: &Value) -> Option<String> {
 /// `Heap::registry_entries`; the vanilla contents of registries other than
 /// items and blocks are not known to the runtime, so lookups of those answer
 /// only what mods registered.
+/// `BuiltInRegistries.acquireBootstrapRegistrationLookup(registry)`: the
+/// holder-getter a vanilla `ToolMaterial` reads a tag through. It is the
+/// registry itself, which already answers `get`/`getOrThrow` for tags.
+fn bootstrap_lookup(heap: &mut Heap, method_name: &str, args: &[Value]) -> Option<BuiltinResult> {
+    if method_name != "acquireBootstrapRegistrationLookup" {
+        return None;
+    }
+    let registry = args.first()?.clone();
+    // A registry the runtime models is its own lookup; anything else (a null or
+    // a stand-in it cannot read) gets one that knows no tags rather than null,
+    // which would make vanilla's `getOrThrow` dereference it.
+    if registry.as_obj().is_none() {
+        let mut fields = HashMap::new();
+        fields.insert("kind".to_string(), Value::NULL);
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/core/DefaultedRegistry".into(),
+            fields,
+        });
+        return Some(BuiltinResult::Handled(Value::Object(Some(id))));
+    }
+    Some(BuiltinResult::Handled(registry))
+}
+
 fn builtin_registry_method(
     heap: &mut Heap,
     class_name: &str,
@@ -6746,6 +6769,15 @@ pub fn dispatch_builtin(
         }
         return BuiltinResult::Handled(Value::NULL);
     }
+    // `applyTextInputArea` hands the focused text field's rectangle to the
+    // window system's IME through SDL, on LWJGL's `MemoryStack`. There is no
+    // window or IME here, so the native call is the host boundary; the
+    // manager's own state (`areaX`...) is still kept by the real bytecode.
+    if class_name == "com/mojang/blaze3d/platform/TextInputManager"
+        && method_name == "applyTextInputArea"
+    {
+        return BuiltinResult::Handled(Value::NULL);
+    }
     if class_name == "com/mojang/blaze3d/platform/ClipboardManager" {
         if method_name == "setClipboard" {
             let text = args
@@ -7759,6 +7791,11 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::from_bool(false));
     }
 
+    if class_name == "net/minecraft/core/registries/BuiltInRegistries" {
+        if let Some(result) = bootstrap_lookup(heap, method_name, args) {
+            return result;
+        }
+    }
     if let Some(result) = registry_method(heap, class_name, method_name, args) {
         return result;
     }
@@ -8454,25 +8491,6 @@ pub fn dispatch_builtin(
             let mut f = HashMap::new();
             f.insert("value".into(), Value::Int(c));
             f.insert("color".into(), Value::Int(c));
-            let id = heap.alloc(JavaObject::Instance {
-                class_name: class_name.into(),
-                fields: f,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(id)));
-        } else if method_name == "fromLegacyFormat" && !args.is_empty() {
-            let color = args[0]
-                .as_obj()
-                .and_then(|id| {
-                    if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
-                        fields.get("color").map(|v| v.as_int())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0xFFFFFF);
-            let mut f = HashMap::new();
-            f.insert("value".into(), Value::Int(color));
-            f.insert("color".into(), Value::Int(color));
             let id = heap.alloc(JavaObject::Instance {
                 class_name: class_name.into(),
                 fields: f,

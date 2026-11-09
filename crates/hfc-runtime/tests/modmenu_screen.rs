@@ -596,6 +596,32 @@ fn a_mods_own_http_helper_runs_against_the_offline_boundary() {
             &[],
         )
         .expect("the JDK request builder runs");
+    // A real `HttpRequestBuilderImpl.build` rejects a builder with no URI, so
+    // the request needs one before the offline boundary can answer it.
+    let location = Value::Object(Some(
+        bridge
+            .interp
+            .heap
+            .alloc_string("https://example.com/mods.json"),
+    ));
+    let uri = bridge
+        .interp
+        .execute_method(
+            "java/net/URI",
+            "create",
+            "(Ljava/lang/String;)Ljava/net/URI;",
+            &[location],
+        )
+        .expect("the URI is built");
+    bridge
+        .interp
+        .execute_method(
+            "java/net/http/HttpRequest$Builder",
+            "uri",
+            "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
+            &[builder.clone(), uri],
+        )
+        .expect("the builder takes the URI");
     let response = bridge
         .interp
         .execute_method(

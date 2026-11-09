@@ -2219,6 +2219,11 @@ impl Interpreter {
                         Some(JavaObject::Instance {
                             class_name: actual, ..
                         }) => Some(actual.as_str()),
+                        // A runtime string is a `String` whatever interface the
+                        // call site names: `CharSequence.subSequence` must run
+                        // `String`'s implementation, not answer the abstract
+                        // interface method with null.
+                        Some(JavaObject::String(_)) => Some("java/lang/String"),
                         // The runtime's own list, set and map stand for a JDK
                         // collection: whatever the builtins do not answer runs
                         // as that collection's skeleton class (`toString`,

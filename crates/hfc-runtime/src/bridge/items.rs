@@ -98,8 +98,12 @@ pub(crate) struct ArmorMaterial {
     /// `defense.getOrDefault(type, 0)`.
     pub defense: i32,
     pub enchantment_value: i32,
-    /// The `SoundEvents` constant of `equipSound` (`ARMOR_EQUIP_DIAMOND`).
+    /// The `SoundEvents` constant of `equipSound` (`ARMOR_EQUIP_DIAMOND`),
+    /// when the field holds the runtime's placeholder for it.
     pub equip_sound_constant: Option<String>,
+    /// `equipSound`'s id, when it is a registered `Holder` (the sound event
+    /// `SoundEvents`' initializer registered).
+    pub equip_sound: Option<String>,
     pub toughness: f32,
     pub knockback_resistance: f32,
     /// The `repairIngredient` item tag, `namespace:path`.
@@ -266,6 +270,9 @@ impl ItemProperties {
         equippable.insert("slot".into(), json!(armor.slot));
         if let Some(asset) = &material.asset_id {
             equippable.insert("asset_id".into(), json!(asset));
+        }
+        if let Some(sound) = &material.equip_sound {
+            equippable.insert("equip_sound".into(), json!(sound));
         }
         self.set("minecraft:equippable", Value::Object(equippable));
         self.equip_sound_constant = material.equip_sound_constant.clone();

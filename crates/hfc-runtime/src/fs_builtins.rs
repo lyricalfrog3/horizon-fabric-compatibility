@@ -355,6 +355,19 @@ pub fn file_system_method(
             let path = vfs::join("", &path);
             handled(alloc_path(heap, &path))
         }
+        // `java.nio.file` is the runtime's own (paths over the game folder and
+        // the mod jars), so the default file system is the same stand-in a
+        // runtime `Path.getFileSystem()` answers. Running the JDK's would load
+        // `libnio` and its Unix natives.
+        "java/nio/file/FileSystems" if method_name == "getDefault" => {
+            handled(inert(heap, "java/nio/file/FileSystem"))
+        }
+        // The runtime's file system is not built from JDK providers, so there
+        // is none to list (no `jar:` provider either: jar entries are read by
+        // the runtime's own paths). A caller looking for one finds it absent.
+        "java/nio/file/spi/FileSystemProvider" if method_name == "installedProviders" => {
+            handled(Value::Object(Some(heap.alloc_list(Vec::new()))))
+        }
         "java/nio/file/FileSystem" if method_name == "newWatchService" => {
             handled(inert(heap, "java/nio/file/WatchService"))
         }

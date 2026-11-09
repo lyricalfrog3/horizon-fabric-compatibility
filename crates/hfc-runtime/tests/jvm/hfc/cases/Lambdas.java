@@ -69,6 +69,21 @@ public final class Lambdas {
         return mapped + "|" + byLength;
     }
 
+    static String extremes() {
+        List<String> words = List.of("pear", "fig", "banana", "kiwi");
+        String longest = words.stream().max(Comparator.comparingInt(String::length)).orElse("none");
+        String shortest = words.stream().min(Comparator.comparingInt(String::length)).orElse("none");
+        String tieFirst = List.of("ab", "cd").stream().max(Comparator.comparingInt(String::length)).get();
+        String empty = List.<String>of().stream().max(Comparator.naturalOrder()).orElse("none");
+        return longest + "," + shortest + "," + tieFirst + "," + empty;
+    }
+
+    static String treeSet() {
+        java.util.TreeSet<Integer> set = new java.util.TreeSet<>(Comparator.reverseOrder());
+        set.addAll(List.of(3, 1, 2));
+        return set + ":" + set.first();
+    }
+
     public static String run() {
         StringBuilder out = new StringBuilder();
         out.append("functions=").append(functions()).append('\n');
@@ -77,6 +92,8 @@ public final class Lambdas {
         out.append("bridge=").append(bridge()).append('\n');
         out.append("comparing=").append(comparing()).append('\n');
         out.append("streams=").append(streams()).append('\n');
+        out.append("extremes=").append(extremes()).append('\n');
+        out.append("tree_set=").append(treeSet()).append('\n');
         return out.toString();
     }
 }

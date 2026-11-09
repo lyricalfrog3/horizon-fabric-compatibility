@@ -285,6 +285,18 @@ impl Interpreter {
         args: &[Value],
     ) -> Option<Value> {
         let receiver = args.first()?;
+        // A `ServiceLoader` the runtime made, reached as the `Iterable` it is
+        // (Log4j's `ServiceLoaderSpliterator`; `Iterable.forEach` and
+        // `spliterator` call `iterator()` this way too).
+        if class_name == "java/lang/Iterable"
+            && method_name == "iterator"
+            && receiver.as_obj().is_some_and(|id| {
+                matches!(self.heap.get(id), Some(JavaObject::Instance { class_name, .. })
+                    if class_name == "java/util/ServiceLoader")
+            })
+        {
+            return self.service_loader_call(method_name, args);
+        }
         match class_name {
             // `Class.forName(name)` initializes the class, which is how a
             // library registers itself (Night Config's format detector loads

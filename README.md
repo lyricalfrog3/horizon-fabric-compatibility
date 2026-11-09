@@ -103,7 +103,17 @@ resolve there, the folders above it exist, nothing outside it is listed or writt
 `System`'s properties (`user.dir`, separators, encodings), `System.identityHashCode`, a
 monotonic `nanoTime`, `Runtime.availableProcessors`, `String.intern` and the float bit
 conversions come from the host with the values a JVM reports. Mods' config files are read and
-written through it. The design is in
+written through it.
+
+The runtime's own lists, maps and sets behave as the JDK classes they stand for: whatever the
+collection builtins do not answer runs as `AbstractList`/`AbstractSet`/`AbstractMap` bytecode
+(`toString`, `listIterator`, `equals`, `List.sort`), `TreeMap`/`TreeSet` and the JDK's
+`Collectors` and comparators run as their own bytecode, and `Stream.collect` uses the
+collector's supplier/accumulator/finisher. `BuiltInRegistries` take registrations (`key()`,
+`register`, `createIntrusiveHolder`, `getKey`), and `Block.asItem()`/`new ItemStack(item)` work
+for registered block items, so creative-tab generators record their items. On the test mods the
+census's unresolved symbols went from 55 to 18 with the JDK slice and to 3 with this one, and the
+interpreter's known divergences from a real JVM from 32 to 16. The design is in
 [docs/architecture/fabric-runtime.md](docs/architecture/fabric-runtime.md), and the reasoning
 behind the content-first installer in
 [docs/decisions/0001-hybrid-content-first.md](docs/decisions/0001-hybrid-content-first.md).

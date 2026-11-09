@@ -548,6 +548,26 @@ fn custom_value_method(
             .map(str::to_string)
     };
     let value = match method_name {
+        // The `CvType` constant's name; see `CustomValue$CvType` statics.
+        "getType" => {
+            let kind = match &json {
+                serde_json::Value::Object(_) => "OBJECT",
+                serde_json::Value::Array(_) => "ARRAY",
+                serde_json::Value::String(_) => "STRING",
+                serde_json::Value::Number(_) => "NUMBER",
+                serde_json::Value::Bool(_) => "BOOLEAN",
+                serde_json::Value::Null => "NULL",
+            };
+            Value::Object(Some(heap.alloc_string(kind)))
+        }
+        "getAsNumber" => match &json {
+            serde_json::Value::Number(n) if n.is_i64() => match n.as_i64().map(i32::try_from) {
+                Some(Ok(small)) => Value::Int(small),
+                _ => Value::Long(n.as_i64().unwrap_or(0)),
+            },
+            serde_json::Value::Number(n) => Value::Double(n.as_f64().unwrap_or(0.0)),
+            _ => return None,
+        },
         "getAsString" => {
             let text = match &json {
                 serde_json::Value::String(text) => text.clone(),
@@ -900,6 +920,9 @@ fn registry_method(
     args: &[Value],
 ) -> Option<BuiltinResult> {
     let handled = |v: Value| Some(BuiltinResult::Handled(v));
+    if let Some(result) = builtin_registry_method(heap, class_name, method_name, args) {
+        return Some(result);
+    }
     match (class_name, method_name) {
         (
             "net/minecraft/server/MinecraftServer"
@@ -994,6 +1017,156 @@ fn registry_method(
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+/// The registry token of one of the runtime's built-in registries
+/// (`BuiltInRegistries.SOUND_EVENT` is an object carrying `kind`), not of a
+/// real `MappedRegistry` instance, whose own bytecode answers.
+fn builtin_registry_kind(heap: &Heap, value: &Value) -> Option<String> {
+    let JavaObject::Instance { class_name, fields } = heap.get(value.as_obj()?)? else {
+        return None;
+    };
+    if class_name != "net/minecraft/core/DefaultedRegistry" {
+        return None;
+    }
+    let kind = fields.get("kind")?.as_obj()?;
+    heap.get_string(kind).map(str::to_string)
+}
+
+/// A `Holder.Reference` for `value`, with `key` once it is registered. Its
+/// fields are `Holder.Reference`'s own, so its bytecode (`unwrapKey`,
+/// `isBound`, `is(ResourceKey)`) reads them.
+fn registry_holder(heap: &mut Heap, key: Option<Value>, value: Value) -> usize {
+    let mut fields = HashMap::new();
+    fields.insert("value".to_string(), value);
+    if let Some(key) = key {
+        fields.insert("key".to_string(), key);
+    }
+    heap.alloc(JavaObject::Instance {
+        class_name: "net/minecraft/core/Holder$Reference".into(),
+        fields,
+    })
+}
+
+/// The id a mod object was registered under in registry `kind`, or a vanilla
+/// item/block stand-in's own id.
+fn registered_id(heap: &Heap, kind: &str, value: &Value) -> Option<String> {
+    let object = value.as_obj()?;
+    if let Some(entry) = heap
+        .registry_entries
+        .iter()
+        .find(|entry| entry.kind == kind && entry.value.as_obj() == Some(object))
+    {
+        return Some(entry.id.clone());
+    }
+    match kind {
+        "ITEM" => heap
+            .registered_items
+            .iter()
+            .find(|record| record.object == object)
+            .map(|record| record.id.clone())
+            .or_else(|| heap.get_native::<Item>(object).map(|item| item.id.clone())),
+        "BLOCK" => heap
+            .registered_blocks
+            .iter()
+            .find(|record| record.object == object)
+            .map(|record| record.id.clone())
+            .or_else(|| {
+                heap.get_native::<Block>(object)
+                    .map(|block| block.id.clone())
+            }),
+        _ => None,
+    }
+}
+
+/// What a mod writes into and reads back from a built-in registry:
+/// `key()`, `register(key, value, info)` (which `Registry.register` calls),
+/// `createIntrusiveHolder` and `getKey`. Registrations are kept in
+/// `Heap::registry_entries`; the vanilla contents of registries other than
+/// items and blocks are not known to the runtime, so lookups of those answer
+/// only what mods registered.
+fn builtin_registry_method(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    if !matches!(
+        class_name,
+        "net/minecraft/core/Registry"
+            | "net/minecraft/core/WritableRegistry"
+            | "net/minecraft/core/DefaultedRegistry"
+            | "net/minecraft/core/MappedRegistry"
+            | "net/minecraft/core/DefaultedMappedRegistry"
+            | "net/minecraft/core/IdMap"
+    ) {
+        return None;
+    }
+    let kind = builtin_registry_kind(heap, args.first()?)?;
+    let handled = |v: Value| Some(BuiltinResult::Handled(v));
+    match (method_name, args.len()) {
+        // The registry's own key is its token, as `Registries.X` is.
+        ("key", 1) => handled(Value::Object(Some(heap.alloc_string(kind)))),
+        ("createIntrusiveHolder", 2) => {
+            let object = args[1].as_obj()?;
+            if let Some(&holder) = heap.intrusive_holders.get(&object) {
+                return handled(Value::Object(Some(holder)));
+            }
+            let holder = registry_holder(heap, None, args[1].clone());
+            heap.intrusive_holders.insert(object, holder);
+            handled(Value::Object(Some(holder)))
+        }
+        ("register", 4) => {
+            let id = crate::item_builtins::registration_id(heap, &args[1])?;
+            if let Some(existing) = heap
+                .registry_entries
+                .iter()
+                .find(|entry| entry.kind == kind && entry.id == id)
+            {
+                // A JVM throws IllegalStateException("Adding duplicate key").
+                log::warn!("{kind} {id} is registered twice; the first registration is kept");
+                return handled(Value::Object(Some(existing.holder)));
+            }
+            let value = args[2].clone();
+            let holder = match value.as_obj().and_then(|o| heap.intrusive_holders.get(&o)) {
+                Some(&holder) => {
+                    if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(holder) {
+                        fields.insert("key".to_string(), args[1].clone());
+                    }
+                    holder
+                }
+                None => registry_holder(heap, Some(args[1].clone()), value.clone()),
+            };
+            heap.registry_entries.push(crate::heap::RegistryEntry {
+                kind,
+                id,
+                value,
+                holder,
+            });
+            handled(Value::Object(Some(holder)))
+        }
+        ("getKey", 2) => match registered_id(heap, &kind, &args[1]) {
+            Some(id) => {
+                let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", &id));
+                let (namespace, path) = (namespace.to_string(), path.to_string());
+                handled(Value::Object(Some(
+                    heap.alloc_identifier(&namespace, &path),
+                )))
+            }
+            // Unregistered: `MappedRegistry.getKey` answers null too. For a
+            // registry whose vanilla contents the runtime lacks, null is
+            // "not known", so say so.
+            None => {
+                if !matches!(kind.as_str(), "ITEM" | "BLOCK") {
+                    log::debug!(
+                        "{kind}.getKey of an object no mod registered; vanilla {kind} entries are not modelled"
+                    );
+                }
+                handled(Value::NULL)
+            }
+        },
         _ => None,
     }
 }
@@ -1396,16 +1569,29 @@ pub fn dispatch_builtin(
     }
 
     // A native list or set reached through `Collection` is still that list or set.
+    // So is one reached through the JDK skeleton class its unanswered methods run
+    // as (`AbstractList.toString` calls `this.iterator()` as `AbstractCollection`).
     if matches!(
         class_name,
         "java/util/Collection" | "java/util/SequencedCollection"
-    ) {
+    ) || virtual_dispatch
+        && matches!(
+            class_name,
+            "java/util/AbstractCollection"
+                | "java/util/AbstractList"
+                | "java/util/AbstractSequentialList"
+                | "java/util/AbstractSet"
+                | "java/util/AbstractMap"
+                | "java/util/SequencedMap"
+        )
+    {
         let concrete = args
             .first()
             .and_then(|v| v.as_obj())
             .and_then(|id| match heap.get(id) {
                 Some(JavaObject::List(_)) => Some("java/util/List"),
                 Some(JavaObject::Set(_)) => Some("java/util/Set"),
+                Some(JavaObject::Map(_)) => Some("java/util/Map"),
                 _ => None,
             });
         if let Some(concrete) = concrete {
@@ -1539,6 +1725,9 @@ pub fn dispatch_builtin(
     if let Some(result) =
         crate::num_builtins::numeric_method(heap, class_name, method_name, descriptor, args)
     {
+        return result;
+    }
+    if let Some(result) = crate::text_io::console_method(heap, method_name, descriptor, args) {
         return result;
     }
     if let Some(result) = crate::text_io::text_method(heap, class_name, method_name, args) {
@@ -1694,6 +1883,19 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 1. java/lang/Object
     // -------------------------------------------------------------
+    // A runtime list, set or map renders, hashes and compares as the JDK
+    // collection it stands for: those run as its skeleton class
+    // (`AbstractCollection.toString`, `AbstractList.equals`, ...).
+    if class_name == "java/lang/Object"
+        && matches!(method_name, "toString" | "hashCode" | "equals")
+        && args
+            .first()
+            .and_then(Value::as_obj)
+            .and_then(|id| heap.get(id))
+            .is_some_and(|object| crate::interp::collection_skeleton(object).is_some())
+    {
+        return BuiltinResult::NotHandled;
+    }
     if class_name == "java/lang/Object" {
         if method_name == "<init>" {
             return BuiltinResult::Handled(Value::NULL);
@@ -2086,7 +2288,18 @@ pub fn dispatch_builtin(
                 fields: HashMap::new(),
             });
             return BuiltinResult::Handled(Value::Object(Some(uid)));
-        } else if method_name == "registerNatives" || method_name == "ensureClassInitialized" {
+        } else if matches!(
+            method_name,
+            "registerNatives"
+                | "ensureClassInitialized"
+                | "ensureClassInitialized0"
+                // The interpreter runs one thread: memory fences order nothing.
+                | "fullFence"
+                | "loadFence"
+                | "storeFence"
+        ) {
+            // `ensureClassInitialized` runs the class's `<clinit>` in the
+            // interpreter before this point; see `Interpreter::execute_method_inner`.
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "arrayBaseOffset" || method_name == "arrayBaseOffset0" {
             return BuiltinResult::Handled(Value::Int(16));
@@ -2250,6 +2463,35 @@ pub fn dispatch_builtin(
                 }
             }
             return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getenv" {
+            // The process environment, as a JVM in this process reads it. The
+            // JDK's own `ProcessEnvironment` keys its map by byte-array
+            // wrappers whose equality the runtime's maps do not run, so the
+            // lookup is answered here.
+            if descriptor == "(Ljava/lang/String;)Ljava/lang/String;" {
+                let name = args
+                    .first()
+                    .and_then(Value::as_obj)
+                    .and_then(|id| heap.get_string(id))
+                    .map(str::to_string);
+                let value = name
+                    .and_then(|name| std::env::var(name).ok())
+                    .map_or(Value::NULL, |value| {
+                        Value::Object(Some(heap.alloc_string(value)))
+                    });
+                return BuiltinResult::Handled(value);
+            }
+            if descriptor == "()Ljava/util/Map;" {
+                let entries = std::env::vars()
+                    .map(|(name, value)| {
+                        (
+                            Value::Object(Some(heap.alloc_string(name))),
+                            Value::Object(Some(heap.alloc_string(value))),
+                        )
+                    })
+                    .collect();
+                return BuiltinResult::Handled(Value::Object(Some(heap.alloc_map(entries))));
+            }
         } else if method_name == "getProperty" && !args.is_empty() {
             let key = args[0]
                 .as_obj()
@@ -2373,6 +2615,13 @@ pub fn dispatch_builtin(
             // Thread ids start above this offset; the process has one thread.
             "getNextThreadIdOffset" | "nextThreadIdOffset" => {
                 return BuiltinResult::Handled(Value::Long(1));
+            }
+            // `Thread.sleep` really waits: callers poll a clock against it
+            // (Iceberg waits for a config file for up to 500 ms in 2 ms steps).
+            "sleepNanos0" if args.len() == 1 => {
+                let nanos = args[0].as_long().max(0) as u64;
+                std::thread::sleep(std::time::Duration::from_nanos(nanos));
+                return BuiltinResult::Handled(Value::NULL);
             }
             "interrupted" => return BuiltinResult::Handled(Value::from_bool(false)),
             "isInterrupted" => return BuiltinResult::Handled(Value::from_bool(false)),
@@ -2915,6 +3164,9 @@ pub fn dispatch_builtin(
                     char::from_u32(args[1].as_int() as u32)
                         .map(|c| c.to_string())
                         .unwrap_or_default()
+                } else if descriptor.starts_with("(Z)") {
+                    // `append(boolean)` receives 0/1 as an int.
+                    (args[1].as_int() != 0).to_string()
                 } else if descriptor.starts_with("([C)") {
                     // `append(char[])`: Iceberg's tooltip text sink builds a
                     // line one copied codepoint at a time.
@@ -3056,10 +3308,27 @@ pub fn dispatch_builtin(
     }
 
     if class_name == "java/lang/String" {
-        if method_name == "intern" && !args.is_empty() {
-            // The runtime already interns strings by their text (`Heap::alloc_string`),
-            // so the receiver is the interned instance.
+        if method_name == "toString"
+            && descriptor == "()Ljava/lang/String;"
+            && args
+                .first()
+                .and_then(Value::as_obj)
+                .is_some_and(|id| heap.get_string(id).is_some())
+        {
+            // `String.toString()` is the string itself (also when reached
+            // through `CharSequence`, as `StringJoiner` does).
             return BuiltinResult::Handled(args[0].clone());
+        } else if method_name == "intern" && !args.is_empty() {
+            // `Heap::alloc_string` interns by text; a `new String(...)` is a
+            // separate object, so answer the interned one.
+            let text = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .map(str::to_string);
+            return BuiltinResult::Handled(match text {
+                Some(text) => Value::Object(Some(heap.alloc_string(text))),
+                None => args[0].clone(),
+            });
         } else if method_name == "valueOf" && !args.is_empty() {
             let s = match &args[0] {
                 Value::Int(i) if descriptor.starts_with("(Z)") => (*i != 0).to_string(),
@@ -3519,6 +3788,7 @@ pub fn dispatch_builtin(
                     let iter_id = heap.alloc(JavaObject::Iterator {
                         items: items.clone(),
                         cursor: 0,
+                        source: Some(id),
                     });
                     return BuiltinResult::Handled(Value::Object(Some(iter_id)));
                 }
@@ -3607,7 +3877,11 @@ pub fn dispatch_builtin(
                     _ => None,
                 };
                 if let Some(items) = items {
-                    let iter_id = heap.alloc(JavaObject::Iterator { items, cursor: 0 });
+                    let iter_id = heap.alloc(JavaObject::Iterator {
+                        items,
+                        cursor: 0,
+                        source: Some(id),
+                    });
                     return BuiltinResult::Handled(Value::Object(Some(iter_id)));
                 }
             }
@@ -3766,29 +4040,6 @@ pub fn dispatch_builtin(
         }
     }
 
-    // java.util.stream.Collectors
-    if class_name == "java/util/stream/Collectors" {
-        let name = match method_name {
-            "toSet" | "toUnmodifiableSet" => "toSet",
-            "toList" | "toUnmodifiableList" => "toList",
-            "joining" => "joining",
-            "toCollection" => "toCollection",
-            "toMap" | "toUnmodifiableMap" => "toMap",
-            _ => "collector",
-        };
-        let mut fields = HashMap::new();
-        let nid = heap.alloc_string(name);
-        fields.insert("type".into(), Value::Object(Some(nid)));
-        for (index, arg) in args.iter().enumerate() {
-            fields.insert(format!("arg{index}"), arg.clone());
-        }
-        let cid = heap.alloc(JavaObject::Instance {
-            class_name: "java/util/stream/Collector".into(),
-            fields,
-        });
-        return BuiltinResult::Handled(Value::Object(Some(cid)));
-    }
-
     // ConcurrentHashMap.newKeySet(): a set; the interpreter is single-threaded.
     if class_name == "java/util/concurrent/ConcurrentHashMap" && method_name == "newKeySet" {
         let sid = heap.alloc_set(Vec::new());
@@ -3860,7 +4111,6 @@ pub fn dispatch_builtin(
     if class_name == "java/util/Map"
         || class_name == "java/util/HashMap"
         || class_name == "java/util/LinkedHashMap"
-        || class_name == "java/util/TreeMap"
         || class_name == "java/util/concurrent/ConcurrentHashMap"
         || class_name == "java/util/concurrent/ConcurrentMap"
     {
@@ -4051,7 +4301,6 @@ pub fn dispatch_builtin(
     if class_name == "java/util/Set"
         || class_name == "java/util/HashSet"
         || class_name == "java/util/LinkedHashSet"
-        || class_name == "java/util/TreeSet"
     {
         if method_name == "stream" && args.len() == 1 {
             if let Some(JavaObject::Set(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
@@ -4168,6 +4417,7 @@ pub fn dispatch_builtin(
                     let iter_id = heap.alloc(JavaObject::Iterator {
                         items: items.clone(),
                         cursor: 0,
+                        source: Some(id),
                     });
                     return BuiltinResult::Handled(Value::Object(Some(iter_id)));
                 }
@@ -4179,20 +4429,52 @@ pub fn dispatch_builtin(
     if class_name == "java/util/Iterator" {
         if method_name == "hasNext" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Iterator { items, cursor }) = heap.get(id) {
+                if let Some(JavaObject::Iterator { items, cursor, .. }) = heap.get(id) {
                     return BuiltinResult::Handled(Value::from_bool(*cursor < items.len()));
                 }
             }
             return BuiltinResult::Handled(Value::from_bool(false));
         } else if method_name == "next" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Iterator { items, cursor }) = heap.get_mut(id) {
+                if let Some(JavaObject::Iterator { items, cursor, .. }) = heap.get_mut(id) {
                     if *cursor < items.len() {
                         let item = items[*cursor].clone();
                         *cursor += 1;
                         return BuiltinResult::Handled(item);
                     }
                 }
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "remove" && args.len() == 1 {
+            // Remove the element `next` last returned from the list or set the
+            // iterator walks. The snapshot drops it too, so the cursor still
+            // lines up with the source's indices.
+            let Some(id) = args[0].as_obj() else {
+                return BuiltinResult::Handled(Value::NULL);
+            };
+            let Some(JavaObject::Iterator {
+                items,
+                cursor,
+                source: Some(source),
+            }) = heap.get_mut(id)
+            else {
+                return BuiltinResult::NotHandled;
+            };
+            let Some(index) = cursor.checked_sub(1) else {
+                // A JVM throws IllegalStateException; the runtime has no
+                // cross-frame exceptions, so leave the collection as it is.
+                log::warn!("Iterator.remove before next(); nothing removed");
+                return BuiltinResult::Handled(Value::NULL);
+            };
+            let removed = items.remove(index);
+            *cursor = index;
+            let source = *source;
+            match heap.get_mut(source) {
+                Some(JavaObject::List(list)) if index < list.len() => {
+                    list.remove(index);
+                }
+                Some(JavaObject::Set(set)) => set.retain(|item| *item != removed),
+                _ => {}
             }
             return BuiltinResult::Handled(Value::NULL);
         }

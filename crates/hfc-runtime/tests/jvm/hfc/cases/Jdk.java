@@ -12,6 +12,12 @@ import java.nio.file.Files;
  */
 public final class Jdk {
     /** Booleans as text: a concat recipe in the interpreter prints 1/0. */
+    static final class Caller {
+        static Class<?> whoCalled() {
+            return StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE).getCallerClass();
+        }
+    }
+
     private static String b(boolean value) {
         return value ? "true" : "false";
     }
@@ -89,6 +95,12 @@ public final class Jdk {
         // none; what must work is that `walk` runs the function it is given.
         String walked = StackWalker.getInstance().walk(stream -> "answered");
         out.append("stackwalker=").append(walked).append('\n');
+        // The process environment is the host's; both processes inherit PATH.
+        String path = System.getenv("PATH");
+        out.append("env=").append(b(path != null && !path.isEmpty())).append(',')
+                .append(b(System.getenv("HFC_SURELY_UNSET_VARIABLE") == null)).append(',')
+                .append(b(System.getenv().get("PATH") != null)).append('\n');
+        out.append("caller=").append(Caller.whoCalled().getName()).append('\n');
 
         return out.toString();
     }

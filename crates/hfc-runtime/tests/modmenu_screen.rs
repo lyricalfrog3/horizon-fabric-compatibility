@@ -180,12 +180,18 @@ fn a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it() {
         .expect("screen render failed")
         .expect("no screen to render");
     assert!(
-        draws.len() > 60,
+        draws.len() > 50,
         "expected the mod list and its widgets, got {} draws",
         draws.len()
     );
 
     let texts = text_draws(&draws);
+    // Placeholder API carries the `library` badge in its `custom.modmenu`
+    // metadata, and Mod Menu hides libraries unless its config shows them.
+    assert!(
+        texts.contains(&"Showing 2 mods") && !texts.contains(&"Placeholder API"),
+        "the mod list did not hide the library mod: {texts:?}"
+    );
     assert!(
         texts.contains(&"Minecraft"),
         "the mod list did not render the Minecraft entry: {texts:?}"

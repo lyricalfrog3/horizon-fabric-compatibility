@@ -121,11 +121,25 @@ fn armor_material(heap: &Heap, value: &Value, armor_type: &Value) -> Option<Armo
         defense,
         enchantment_value: fields.get("enchantmentValue")?.as_int(),
         equip_sound_constant: string_field(heap, fields, "equipSound"),
+        equip_sound: fields
+            .get("equipSound")
+            .and_then(|holder| registered_holder_id(heap, holder)),
         toughness: fields.get("toughness")?.as_float(),
         knockback_resistance: fields.get("knockbackResistance")?.as_float(),
         repair_items: tag_id(heap, fields.get("repairIngredient")?)?,
         asset_id,
     })
+}
+
+/// The id of a registered `Holder.Reference` (its `key`'s location).
+fn registered_holder_id(heap: &Heap, holder: &Value) -> Option<String> {
+    let JavaObject::Instance { class_name, fields } = heap.get(holder.as_obj()?)? else {
+        return None;
+    };
+    if class_name != "net/minecraft/core/Holder$Reference" {
+        return None;
+    }
+    registration_id(heap, fields.get("key")?)
 }
 
 /// The name of an enum constant (`Rarity.EPIC` is `EPIC`).
@@ -201,8 +215,66 @@ pub(crate) fn item_method(
             item_constructor(heap, args);
             Some(BuiltinResult::Handled(Value::NULL))
         }
+        // `new ItemStack(itemLike)` / `new ItemStack(itemLike, count)`: the
+        // runtime's stacks are native, so the object `new` made becomes one.
+        "net/minecraft/world/item/ItemStack"
+            if method_name == "<init>"
+                && matches!(
+                    descriptor,
+                    "(Lnet/minecraft/world/level/ItemLike;)V"
+                        | "(Lnet/minecraft/world/level/ItemLike;I)V"
+                ) =>
+        {
+            let this = args.first()?.as_obj()?;
+            let id = item_like_id(heap, args.get(1)?)?;
+            let count = args.get(2).map_or(1, Value::as_int);
+            let stack = crate::minecraft::ItemStack::new(id, count);
+            *heap.get_mut(this)? = JavaObject::Native(Box::new(stack));
+            Some(BuiltinResult::Handled(Value::NULL))
+        }
+        // `Item.byBlock(block)` (what `Block.asItem()` asks): the `BlockItem` a
+        // mod registered for that block — Fabric's registry sync puts every
+        // registered `BlockItem` in `Item.BY_BLOCK` — or, for a vanilla block,
+        // its item of the same id; `Items.AIR` when there is none, as the map's
+        // default.
+        ITEM if method_name == "byBlock" && args.len() == 1 => {
+            let block = args[0].as_obj()?;
+            if let Some(&(_, _, item)) = heap
+                .registered_block_items
+                .iter()
+                .find(|(_, registered, _)| *registered == block)
+            {
+                return Some(BuiltinResult::Handled(Value::Object(Some(item))));
+            }
+            let vanilla = heap
+                .get_native::<crate::minecraft::Block>(block)
+                .map(|block| block.id.clone())
+                .filter(|id| heap.registries.items.contains(id));
+            let id = vanilla.unwrap_or_else(|| "minecraft:air".to_string());
+            let item = heap.alloc_native(Item { id });
+            Some(BuiltinResult::Handled(Value::Object(Some(item))))
+        }
         _ => None,
     }
+}
+
+/// The item id of an `ItemLike`: a vanilla item or block stand-in, a mod's
+/// registered item, or a mod block with a registered `BlockItem`.
+fn item_like_id(heap: &Heap, value: &Value) -> Option<String> {
+    let object = value.as_obj()?;
+    if let Some(item) = heap.get_native::<Item>(object) {
+        return Some(item.id.clone());
+    }
+    if let Some(block) = heap.get_native::<crate::minecraft::Block>(object) {
+        return Some(block.id.clone());
+    }
+    if let Some(record) = heap.registered_items.iter().find(|r| r.object == object) {
+        return Some(record.id.clone());
+    }
+    heap.registered_block_items
+        .iter()
+        .find(|(_, block, item)| *block == object || *item == object)
+        .map(|(id, _, _)| id.clone())
 }
 
 /// `Item.<init>(Properties)`: the item keeps a copy of what the properties

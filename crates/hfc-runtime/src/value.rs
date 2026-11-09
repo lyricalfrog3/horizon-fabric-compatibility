@@ -106,8 +106,13 @@ pub enum JavaObject {
     Set(Vec<Value>),
     /// A Java Stream (e.g. java.util.stream.Stream).
     Stream(Vec<Value>),
-    /// A Java Iterator.
-    Iterator { items: Vec<Value>, cursor: usize },
+    /// A Java Iterator over a snapshot of `items`. `source` is the runtime
+    /// list or set it walks, which `Iterator.remove` writes through to.
+    Iterator {
+        items: Vec<Value>,
+        cursor: usize,
+        source: Option<usize>,
+    },
     /// A Java String.
     String(String),
     /// A `java.lang.Class` instance.
@@ -115,6 +120,8 @@ pub enum JavaObject {
     /// A lambda closure created via `invokedynamic` / `LambdaMetafactory`.
     Lambda {
         interface_class: String,
+        /// The interface method the lambda implements (the `invokedynamic` name).
+        interface_method: String,
         target_class: String,
         target_method: String,
         target_desc: String,
@@ -144,7 +151,7 @@ impl fmt::Debug for JavaObject {
             JavaObject::Map(entries) => f.debug_tuple("Map").field(&entries.len()).finish(),
             JavaObject::Set(items) => f.debug_tuple("Set").field(&items.len()).finish(),
             JavaObject::Stream(items) => f.debug_tuple("Stream").field(&items.len()).finish(),
-            JavaObject::Iterator { cursor, items } => f
+            JavaObject::Iterator { cursor, items, .. } => f
                 .debug_struct("Iterator")
                 .field("cursor", cursor)
                 .field("len", &items.len())

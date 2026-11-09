@@ -38,6 +38,16 @@ macro_rules! native {
         }
     };
 }
+/// `System.out` / `System.err`: what a mod prints goes to the host process's
+/// standard output or error, as it would from a JVM.
+#[derive(Debug)]
+pub struct Console {
+    pub error: bool,
+    /// Text since the last line break, written out a line at a time.
+    pub line: String,
+}
+
+native!(Console, "java/io/PrintStream");
 native!(CharReader, "java/io/Reader");
 native!(StringSink, "java/io/StringWriter");
 
@@ -268,6 +278,32 @@ pub fn text_method(
                 .collect();
             return handled(alloc_str(heap, parts.join(&delimiter)));
         }
+        // The JDK-internal `join(prefix, suffix, delimiter, String[], size)`
+        // that `StringJoiner` (and so `Collectors.joining`) reaches through
+        // `JavaLangAccess`. The runtime's strings are not byte arrays, so the
+        // JDK's own body cannot run on them.
+        ("java/lang/String", "join") if args.len() == 5 => {
+            let prefix = string_of(heap, &args[0])?.to_string();
+            let suffix = string_of(heap, &args[1])?.to_string();
+            let delimiter = string_of(heap, &args[2])?.to_string();
+            let size = args[4].as_int().max(0) as usize;
+            let elements = match args[3].as_obj().and_then(|id| heap.get(id)) {
+                Some(JavaObject::Array { elements, .. }) => elements.clone(),
+                _ => Vec::new(),
+            };
+            let parts: Vec<String> = elements
+                .iter()
+                .take(size)
+                .map(|item| match item {
+                    Value::Object(None) => "null".to_string(),
+                    other => crate::builtins::text_of_value(heap, other),
+                })
+                .collect();
+            return handled(alloc_str(
+                heap,
+                format!("{prefix}{}{suffix}", parts.join(&delimiter)),
+            ));
+        }
         ("java/lang/String", "chars" | "codePoints") if args.len() == 1 => {
             let text = string_of(heap, &args[0])?;
             let items = if method_name == "chars" {
@@ -323,6 +359,19 @@ pub fn text_method(
                 elements: text.chars().map(|c| Value::Int(c as i32)).collect(),
             });
             return handled(Value::Object(Some(id)));
+        }
+        // new String(), new String(String), new String(StringBuilder|StringBuffer):
+        // a new string object with that text (not the interned one).
+        ("java/lang/String", "<init>")
+            if args.len() == 1 || args.len() == 2 && string_of(heap, &args[1]).is_some() =>
+        {
+            let text = args
+                .get(1)
+                .and_then(|v| string_of(heap, v))
+                .unwrap_or_default();
+            let id = args[0].as_obj()?;
+            *heap.get_mut(id)? = JavaObject::String(text);
+            return handled(Value::NULL);
         }
         ("java/lang/String", "<init>") if args.len() >= 2 => {
             // new String(byte[]|char[] [, ...])
@@ -812,4 +861,65 @@ fn java_format(heap: &Heap, fmt: &str, args: &[Value]) -> String {
         out.push_str(&body);
     }
     out
+}
+
+/// The text a `print`/`println`/`append` argument of descriptor `descriptor`
+/// prints.
+fn printed(heap: &Heap, descriptor: &str, value: &Value) -> String {
+    match (descriptor.as_bytes().get(1), value) {
+        (Some(b'Z'), Value::Int(i)) => (*i != 0).to_string(),
+        (Some(b'C'), Value::Int(i)) => char::from_u32(*i as u32)
+            .map(String::from)
+            .unwrap_or_default(),
+        (_, Value::Object(None)) => "null".to_string(),
+        (_, other) => crate::builtins::value_to_string(heap, other),
+    }
+}
+
+/// `PrintStream` methods on the runtime's `System.out`/`System.err`.
+pub fn console_method(
+    heap: &mut Heap,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Option<BuiltinResult> {
+    let id = args.first()?.as_obj()?;
+    heap.get_native::<Console>(id)?;
+    let text = match (method_name, args.len()) {
+        ("println", 1) => Some("\n".to_string()),
+        ("println", 2) => Some(format!("{}\n", printed(heap, descriptor, &args[1]))),
+        ("print" | "append", 2) => Some(printed(heap, descriptor, &args[1])),
+        ("write", 2) if descriptor == "(I)V" => {
+            Some(char::from(args[1].as_int() as u8).to_string())
+        }
+        ("flush" | "close", 1) => Some(String::new()),
+        ("checkError", 1) => return Some(BuiltinResult::Handled(Value::from_bool(false))),
+        _ => None,
+    }?;
+    let console = heap.get_native_mut::<Console>(id)?;
+    console.line.push_str(&text);
+    let flush = matches!(method_name, "flush" | "close");
+    while let Some(end) = console.line.find('\n') {
+        let line: String = console.line.drain(..=end).collect();
+        if console.error {
+            eprint!("{line}");
+        } else {
+            print!("{line}");
+        }
+    }
+    if flush && !console.line.is_empty() {
+        let rest = std::mem::take(&mut console.line);
+        if console.error {
+            eprint!("{rest}");
+        } else {
+            print!("{rest}");
+        }
+    }
+    // `append` returns the stream; the print methods return nothing.
+    let result = if method_name == "append" {
+        Value::Object(Some(id))
+    } else {
+        Value::NULL
+    };
+    Some(BuiltinResult::Handled(result))
 }

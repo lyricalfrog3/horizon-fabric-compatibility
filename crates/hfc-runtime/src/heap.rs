@@ -38,6 +38,14 @@ pub struct Heap {
     /// `java.io.tmpdir` depend on the game directory and are filled in when
     /// they are asked for.
     pub properties: BTreeMap<String, String>,
+    /// What mods registered in the runtime's built-in registries other than
+    /// through the item/block paths (sound events, block entity types, menus,
+    /// fluids, ...), in registration order.
+    pub(crate) registry_entries: Vec<RegistryEntry>,
+    /// The intrusive `Holder.Reference` made for an object
+    /// (`createIntrusiveHolder`), by the object's heap id; registering the
+    /// object binds its key.
+    pub(crate) intrusive_holders: HashMap<usize, usize>,
     /// Items mods registered in `BuiltInRegistries.ITEM`, in registration order.
     pub(crate) registered_items: Vec<crate::item_builtins::RegisteredRecord>,
     /// Blocks mods registered in `BuiltInRegistries.BLOCK`, in registration order.
@@ -72,6 +80,18 @@ pub struct Heap {
     /// A scoped object was stored where the final reference scan cannot see
     /// it (a class's static fields, the interpreter's caches).
     escaped: bool,
+}
+
+/// One `WritableRegistry.register(key, value, info)` into a built-in registry.
+#[derive(Debug, Clone)]
+pub(crate) struct RegistryEntry {
+    /// The registry's token (`SOUND_EVENT`), as `Registries.SOUND_EVENT` is.
+    pub kind: String,
+    /// `namespace:path`.
+    pub id: String,
+    pub value: Value,
+    /// The `Holder.Reference` `register` answered.
+    pub holder: usize,
 }
 
 /// The system properties that do not depend on where the game folder is.
@@ -128,6 +148,8 @@ impl Heap {
             registered_items: Vec::new(),
             registered_blocks: Vec::new(),
             registered_block_items: Vec::new(),
+            registry_entries: Vec::new(),
+            intrusive_holders: HashMap::new(),
             block_facts: Vec::new(),
             block_ids: std::collections::HashSet::new(),
             block_facts_shapes: false,
@@ -372,7 +394,11 @@ impl Heap {
 
     /// Allocate a Java Iterator object.
     pub fn alloc_iterator(&mut self, items: Vec<Value>) -> usize {
-        self.alloc(JavaObject::Iterator { items, cursor: 0 })
+        self.alloc(JavaObject::Iterator {
+            items,
+            cursor: 0,
+            source: None,
+        })
     }
 }
 

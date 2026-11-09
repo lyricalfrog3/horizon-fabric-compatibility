@@ -610,12 +610,22 @@ The rest of the boundary, in the same spirit: `System`'s property table (`user.d
 folder, `java.io.tmpdir` is `tmp/` under it, `file.separator`/`path.separator`/`java.version` and
 the rest as a JVM 25 reports them), `System.getProperties`/`setProperty`/`clearProperty` and
 `Properties.getProperty`, `System.identityHashCode` (the heap id, stable and distinct per object),
-a monotonic `System.nanoTime`, `Runtime.availableProcessors`, `String.intern` (every string the
-runtime allocates is already interned by its text), `Float.floatToRawIntBits`/`floatToIntBits`/
+a monotonic `System.nanoTime`, `Runtime.availableProcessors`, `String.intern` (the interned
+string of that text; `new String(s)` is a separate object), `Float.floatToRawIntBits`/`floatToIntBits`/
 `intBitsToFloat`, the `registerNatives` calls of `Class`, `ClassLoader`, `Thread` and `Object`,
 `Thread.getNextThreadIdOffset`, `BootLoader.setBootLoaderUnnamedModule0`,
-`Unsafe.staticFieldBase0`, `VM.initialize`/`getNanoTimeAdjustment`, and `StackWalker`, which
-reports no frames (the interpreter has none) so `walk`'s function runs over an empty stream.
+`Unsafe.staticFieldBase0`, `VM.initialize`/`getNanoTimeAdjustment`, and `StackWalker`, whose
+`walk` reports no frames (its function runs over an empty stream). `getCallerClass` (and
+`Reflection.getCallerClass`) read the interpreter's own frame stack, the class of each interpreted
+frame. Later additions: `Unsafe.ensureClassInitialized` runs the class's `<clinit>` (how
+`SharedSecrets` installs a lazily set access object) and the memory fences do nothing (one
+thread); `Thread.sleep` really waits; `System.getenv` answers the process environment;
+`System.out`/`System.err` print to the host process's standard output and error (the JVM sets
+them in `initPhase1`, which the runtime does not run);
+`FileSystems.getDefault()` is the runtime's file-system stand-in and
+`FileSystemProvider.installedProviders()` is empty (the runtime's `java.nio.file` is not built
+from JDK providers; running the JDK's would load `libnio`). A static field of a JDK class that
+its `<clinit>` left null stays null; the runtime no longer invents a value for it.
 
 `crates/hfc-runtime/tests/jvm_diff.rs` runs every case in a temporary folder that is both the
 JVM harness's working directory and the interpreter's file-system root, and
@@ -625,11 +635,82 @@ rename/delete (including that two spellings of a path canonicalize the same).
 
 Measured with the census (`--mods test-mods --alone`): **55 missing symbols before, 18 after**.
 iceberg 5→0, jamlib 5→0, legendarytooltips 16→1, mdm 21→11, modmenu 7→5, rightclickharvest 1→1.
-What is left is not JDK natives: `List.listIterator` and the other collection views (a heap
-`List`/`Map` has no iterator view yet), method references such as `ToIntFunction.applyAsInt`
-whose bootstrap target is the interface rather than the implementation, and Minecraft's registry
-API (`WritableRegistry.register`, `Registry.key`, `createIntrusiveHolder`), which is the mod-API
-surface the content side needs next.
+The next slice (below) took the 18 to 3.
+
+### Collections, streams, lambdas and the built-in registries
+
+The census lists a symbol only where a mod's own code reached it, and most of the 18 left after
+the JDK slice had a shared cause underneath. A debug line now names the receiver of every
+unresolved call (`Method not found in hierarchy of X: m() (receiver ...)`), which is how these
+were found.
+
+- **Runtime collections run as their JDK skeleton.** `ArrayList`/`LinkedList`/`HashMap`/
+  `LinkedHashMap`/`HashSet`/`LinkedHashSet` are the runtime's own list, map and set objects.
+  Any method the collection builtins do not answer now runs as the bytecode of
+  `AbstractList`/`AbstractSet`/`AbstractMap` (and the interfaces' defaults), whose
+  implementations are written against `size`/`get`/`iterator`/`entrySet`, which the builtins do
+  answer. That gives `listIterator`, `toString` (`[a, b]`, `{k=v}`, also inside string
+  concatenation and `StringBuilder.append(Object)`), content `equals`/`hashCode`, `List.sort`,
+  `removeIf` and the rest without a builtin each. `Iterator.remove` writes through to the list or
+  set the iterator walks. `TreeMap` and `TreeSet` are no longer modelled at all: their order is the
+  comparator's, so they run as the JDK's classes.
+- **Streams collect with the collector's own functions.** The stand-in `Collectors` (an
+  `Instance` of the `Collector` interface with a `type` string) is gone. `Stream.collect(c)` does
+  what a sequential pipeline does with any `Collector`: `supplier().get()`, `accumulator()` per
+  element, then `finisher()`. `groupingBy`, `joining`, `toMap`, downstream collectors and
+  libraries' `Collector.of` therefore run as bytecode. `Stream.max`/`min(Comparator)` reduce like
+  `BinaryOperator.maxBy`/`minBy`. The JDK-internal `String.join(prefix, suffix, delimiter,
+  String[], size)` that `StringJoiner` reaches through `JavaLangAccess` is answered, since the
+  runtime's strings are not byte arrays, and so is `String.toString()`.
+- **Comparators are the JDK's.** The stand-in `Comparator.comparingInt` read its key function
+  from the wrong argument, so every `comparingInt` comparator called `applyAsInt` on null (the
+  census's `ToIntFunction.applyAsInt`). It is gone. A lambda is now unpacked only for its abstract
+  method: a call to a method with a body (`Comparator.thenComparing`, or another lambda's
+  implementation that takes this lambda as its first argument) runs as itself. Before, such a
+  call ran the receiver lambda's target with the wrong arguments.
+- **`dup2`/`pop2` know `long` and `double`.** A category-2 value is one entry on this operand
+  stack, and the `dup2`, `dup2_x1`, `dup2_x2`, `dup_x2` and `pop2` forms moved two entries where
+  the JVM moves one such value. `TimeUnit.MILLISECONDS.toNanos(10)` answered `Long.MAX_VALUE`, so
+  `Thread.sleep(10)` would have slept forever. `tests/jvm/hfc/cases/Wide.java` pins each form.
+- **String concatenation honours the call site's types.** A `boolean` prints `true`/`false` and a
+  `char` its character, in `makeConcatWithConstants` and in `StringBuilder.append(boolean)`.
+  `new String(s)` is a new object.
+- **The built-in registries take registrations.** `BuiltInRegistries.X` is the runtime's registry
+  object for kind `X`. It now answers `key()` (its token, the same one `Registries.X` is),
+  `register(key, value, info)` (what `Registry.register` calls), `createIntrusiveHolder` and
+  `getKey`. Registrations live in `Heap::registry_entries`, vanilla's own included: `SoundEvents`'
+  initializer registers its sound events, so a `SoundEvents` constant is a registered
+  `Holder.Reference` whose key names the sound (an armor material's equip sound is read from it).
+  A `Holder.Reference` carries `Holder.Reference`'s own fields, so its bytecode (`unwrapKey`, `is`)
+  reads them. The vanilla contents of registries other than items and blocks are not known to the
+  runtime. `getKey` of an object nobody registered answers null, and `iterator()` stays
+  unanswered, because a partial iteration would be a lie.
+- **Items from blocks.** `Item.byBlock` (what `Block.asItem()` asks) answers the `BlockItem` a mod
+  registered for the block, as Fabric's registry sync fills `Item.BY_BLOCK`, or the vanilla item
+  of the same id, or `Items.AIR`. `new ItemStack(itemLike[, count])` builds the runtime's native
+  stack. Together they let a creative tab generator's `output.accept(block.asItem())` record the
+  item (mdm's 339 tab entries were dropped before).
+- **Fabric Loader's `CustomValue.getType()`** answers the `CvType` constant (an interned name, so
+  `== CvType.OBJECT` compares like the enum), and `getAsNumber` is answered. Mod Menu now reads
+  the `library` badge in a mod's `custom.modmenu` and hides library mods by default, as it does on
+  a JVM.
+- **`ServiceLoader`** reached as an `Iterable` (Log4j's spliterator) iterates the providers its
+  `META-INF/services` files name.
+
+Census after this slice: **3 missing symbols** (from 18), all mdm's: iceberg 0, jamlib 0,
+legendarytooltips 0, mdm 3, modmenu 0, rightclickharvest 0. mdm's three are one gap:
+`Fluids.<clinit>` iterates `BuiltInRegistries.FLUID` (`DefaultedRegistry.iterator()`), and the
+runtime answers no registry iteration it cannot make complete. `tests/jvm/known_divergences.toml`
+went from 32 entries to 16; the new `Wide.java` case and the additions to `Jdk.java` (environment,
+`getCallerClass`) and `Lambdas.java` (`Stream.max`/`min`, a reverse-ordered `TreeSet`) match the
+JVM.
+
+Cost, measured with `block_profile` on Fabric API + Farmer's Delight (cold, three runs each):
+init with facts 3.5 s before, 3.8 s after; shapes 250 ms before, 262 ms after. Most of it is
+initialization that now completes (vanilla `SoundEvents` registers its ~1,700 sound events, the
+JDK's charset and class-loader initializers run); the interpreter's frame-class stack, which
+`getCallerClass` reads, reuses its buffers and costs about 0.1 s of it. A lambda call checks the
+method it implements by name first, so the body lookup above runs only for other methods.
 
 ### Shape maps keyed by an enum
 

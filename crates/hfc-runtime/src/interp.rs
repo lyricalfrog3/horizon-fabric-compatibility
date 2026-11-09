@@ -86,6 +86,11 @@ pub struct Interpreter {
     /// budget exhaustion can name the Java frames it happened under. Off in
     /// normal runs: the bookkeeping allocates a string per call.
     pub trace_calls: bool,
+    /// The class of each interpreted frame, innermost last: what
+    /// `Reflection.getCallerClass` and `StackWalker.getCallerClass` read.
+    frame_classes: Vec<String>,
+    /// How many of `frame_classes` are live frames.
+    frame_depth: usize,
     pub call_stack: Vec<String>,
     /// Menu widget injections are applied only while the bridge runs a host
     /// menu's layout method, never to ordinary gameplay code.
@@ -126,6 +131,8 @@ impl Interpreter {
             step_budget: None,
             call_depth: 0,
             trace_calls: false,
+            frame_classes: Vec::new(),
+            frame_depth: 0,
             call_stack: Vec::new(),
             menu_injection: false,
             injection_depth: 0,
@@ -148,6 +155,8 @@ impl Interpreter {
             step_budget: None,
             call_depth: 0,
             trace_calls: false,
+            frame_classes: Vec::new(),
+            frame_depth: 0,
             call_stack: Vec::new(),
             menu_injection: false,
             injection_depth: 0,
@@ -168,6 +177,35 @@ impl Interpreter {
         let result = f(self);
         self.step_budget = previous;
         result
+    }
+
+    /// What a call's receiver is, for the "method not found" debug line.
+    fn describe_receiver(&self, virtual_dispatch: bool, args: &[Value]) -> String {
+        if !virtual_dispatch {
+            return "static".into();
+        }
+        match args.first() {
+            None => "none".into(),
+            Some(value) => match value.as_obj() {
+                None => format!("{value:?}"),
+                Some(id) => match self.heap.get(id) {
+                    None => "dangling".into(),
+                    Some(JavaObject::Instance { class_name, .. }) => {
+                        format!("instance {class_name}")
+                    }
+                    Some(JavaObject::Lambda {
+                        interface_class,
+                        target_class,
+                        target_method,
+                        target_desc,
+                        ..
+                    }) => format!(
+                        "lambda {interface_class} -> {target_class}.{target_method}{target_desc}"
+                    ),
+                    Some(other) => format!("{other:?}"),
+                },
+            },
+        }
     }
 
     fn note_missing(&mut self, what: String) {
@@ -578,6 +616,34 @@ impl Interpreter {
         res
     }
 
+    /// Whether `class_name` or one of its supertypes has a body for
+    /// `method_name`/`descriptor`.
+    fn has_concrete_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> bool {
+        let key = (method_name.to_string(), descriptor.to_string());
+        let mut queue = vec![class_name.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(current) = queue.pop() {
+            if current == "java/lang/Object" || !seen.insert(current.clone()) {
+                continue;
+            }
+            let _ = self.loader.get_or_load(&current);
+            let Some(class) = self.loader.get(&current) else {
+                continue;
+            };
+            if class.methods.get(&key).is_some_and(|m| m.code.is_some()) {
+                return true;
+            }
+            queue.extend(class.super_class.iter().cloned());
+            queue.extend(class.interfaces.iter().cloned());
+        }
+        false
+    }
+
     /// Whether `class_name` declares `method_name`/`descriptor` as a static method.
     fn is_static_method(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
         self.loader.get(class_name).is_some_and(|class| {
@@ -596,13 +662,14 @@ impl Interpreter {
             "java/util/ArrayList" | "java/util/LinkedList" => {
                 self.heap.alloc(JavaObject::List(Vec::new()))
             }
+            // `TreeMap`/`TreeSet` are not modelled: their order is the
+            // comparator's, so they run as the JDK's own bytecode.
             "java/util/HashMap"
             | "java/util/LinkedHashMap"
-            | "java/util/TreeMap"
             | "java/util/concurrent/ConcurrentHashMap" => {
                 self.heap.alloc(JavaObject::Map(Vec::new()))
             }
-            "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/TreeSet" => {
+            "java/util/HashSet" | "java/util/LinkedHashSet" => {
                 self.heap.alloc(JavaObject::Set(Vec::new()))
             }
             _ => self.heap.alloc(JavaObject::Instance {
@@ -808,9 +875,20 @@ impl Interpreter {
             if let Some(this_id) = first_arg.as_obj() {
                 // The heap check comes first: it is cheap, and most calls have
                 // no lambda receiver, so the method lookup is rarely needed.
-                if matches!(self.heap.get(this_id), Some(JavaObject::Lambda { .. }))
+                let implements = match self.heap.get(this_id) {
+                    Some(JavaObject::Lambda {
+                        interface_method, ..
+                    }) => Some(interface_method == method_name),
+                    _ => None,
+                };
+                if let Some(implements) = implements
                     && !matches!(method_name, "getClass" | "toString" | "hashCode" | "equals")
                     && !self.is_static_method(class_name, method_name, descriptor)
+                    // A method other than the one the lambda implements runs as
+                    // itself when it has a body: a default method
+                    // (`Comparator.thenComparing`) or another lambda's
+                    // implementation taking this lambda as its first argument.
+                    && (implements || !self.has_concrete_method(class_name, method_name, descriptor))
                 {
                     if let Some(JavaObject::Lambda {
                         target_class,
@@ -948,9 +1026,19 @@ impl Interpreter {
 
         // The interpreter has no Java stack frames, and a JVM is allowed to
         // report none: `walk`'s function receives an empty stream, `forEach`
-        // runs nothing and `getCallerClass` answers null. Log4j's
+        // runs nothing; `getCallerClass` reads the interpreter's frames. Log4j's
         // `StackLocator` and anything else that only wants "who called me"
         // then completes instead of reading a null the native walk left.
+        // `Reflection.getCallerClass()`: the class of the frame that called
+        // the method asking (`ClassLoader.registerAsParallelCapable` asks for
+        // the loader class whose `<clinit>` called it).
+        if class_name == "jdk/internal/reflect/Reflection"
+            && method_name == "getCallerClass"
+            && args.is_empty()
+        {
+            return Ok(self.caller_class());
+        }
+
         if class_name == "java/lang/StackWalker" && !args.is_empty() {
             match method_name {
                 "walk" if args.len() >= 2 => {
@@ -964,7 +1052,7 @@ impl Interpreter {
                     );
                 }
                 "forEach" if args.len() >= 2 => return Ok(Value::NULL),
-                "getCallerClass" => return Ok(Value::NULL),
+                "getCallerClass" => return Ok(self.caller_class()),
                 _ => {}
             }
         }
@@ -1358,6 +1446,39 @@ impl Interpreter {
                         return Ok(Value::NULL);
                     }
                     "count" => return Ok(Value::Long(items.len() as i64)),
+                    // `max`/`min(comparator)`: the first greatest (least)
+                    // element, as `BinaryOperator.maxBy`/`minBy` reduce.
+                    "max" | "min" if args.len() == 2 => {
+                        let mut best: Option<Value> = None;
+                        for item in items {
+                            let Some(current) = best.clone() else {
+                                best = Some(item);
+                                continue;
+                            };
+                            let order = self
+                                .execute_method(
+                                    "java/util/Comparator",
+                                    "compare",
+                                    "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                                    &[args[1].clone(), current, item.clone()],
+                                )?
+                                .as_int();
+                            if (method_name == "max" && order < 0)
+                                || (method_name == "min" && order > 0)
+                            {
+                                best = Some(item);
+                            }
+                        }
+                        let mut fields = HashMap::new();
+                        if let Some(best) = best {
+                            fields.insert("value".into(), best);
+                        }
+                        let id = self.heap.alloc(JavaObject::Instance {
+                            class_name: "java/util/Optional".into(),
+                            fields,
+                        });
+                        return Ok(Value::Object(Some(id)));
+                    }
                     "toList" => {
                         return Ok(Value::Object(Some(self.heap.alloc_list(items))));
                     }
@@ -1391,170 +1512,74 @@ impl Interpreter {
                         }
                         return Ok(container);
                     }
-                    "collect" => {
-                        let collector = args.get(1).cloned().unwrap_or(Value::NULL);
-                        let (kind, collector_args) =
-                            match collector.as_obj().and_then(|id| self.heap.get(id)) {
-                                Some(JavaObject::Instance { fields, .. }) => {
-                                    let kind = fields
-                                        .get("type")
-                                        .and_then(|v| v.as_obj())
-                                        .and_then(|id| self.heap.get_string(id))
-                                        .unwrap_or("toList")
-                                        .to_string();
-                                    let collector_args: Vec<Value> = (0..4)
-                                        .map_while(|n| fields.get(&format!("arg{n}")).cloned())
-                                        .collect();
-                                    (kind, collector_args)
-                                }
-                                _ => ("toList".to_string(), Vec::new()),
-                            };
-                        let text = |interp: &Self, value: Option<&Value>| -> String {
-                            value
-                                .and_then(|v| v.as_obj())
-                                .and_then(|id| interp.heap.get_string(id))
-                                .unwrap_or("")
-                                .to_string()
+                    // `collect(collector)`: what a sequential `ReferencePipeline`
+                    // does with any `Collector` — the JDK's own `Collectors` or a
+                    // library's `Collector.of` — so grouping, joining and
+                    // downstream collectors run as their bytecode.
+                    "collect" if args.len() == 2 => {
+                        let collector = args[1].clone();
+                        let part = |interp: &mut Self, name: &str, descriptor: &str| {
+                            interp.execute_method(
+                                "java/util/stream/Collector",
+                                name,
+                                descriptor,
+                                std::slice::from_ref(&collector),
+                            )
                         };
-                        return Ok(match kind.as_str() {
-                            "toSet" => Value::Object(Some(self.heap.alloc_set(items))),
-                            "joining" => {
-                                let parts = items
-                                    .iter()
-                                    .filter_map(|v| {
-                                        v.as_obj().and_then(|id| self.heap.get_string(id))
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(&text(self, collector_args.first()));
-                                let joined = format!(
-                                    "{}{parts}{}",
-                                    text(self, collector_args.get(1)),
-                                    text(self, collector_args.get(2))
-                                );
-                                Value::Object(Some(self.heap.alloc_string(joined)))
-                            }
-                            "toCollection" if !collector_args.is_empty() => {
-                                let target = self.execute_method(
-                                    "java/util/function/Supplier",
-                                    "get",
-                                    "()Ljava/lang/Object;",
-                                    &[collector_args[0].clone()],
-                                )?;
-                                for item in items {
-                                    self.execute_method(
-                                        "java/util/Collection",
-                                        "add",
-                                        "(Ljava/lang/Object;)Z",
-                                        &[target.clone(), item],
-                                    )?;
-                                }
-                                target
-                            }
-                            "toMap" if collector_args.len() >= 2 => {
-                                let target = match collector_args.get(3) {
-                                    Some(supplier) => self.execute_method(
-                                        "java/util/function/Supplier",
-                                        "get",
-                                        "()Ljava/lang/Object;",
-                                        &[supplier.clone()],
-                                    )?,
-                                    None => Value::Object(Some(
-                                        self.heap.alloc(JavaObject::Map(Vec::new())),
-                                    )),
-                                };
-                                for item in items {
-                                    let key = self.execute_method(
-                                        "java/util/function/Function",
-                                        "apply",
-                                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                                        &[collector_args[0].clone(), item.clone()],
-                                    )?;
-                                    let value = self.execute_method(
-                                        "java/util/function/Function",
-                                        "apply",
-                                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                                        &[collector_args[1].clone(), item],
-                                    )?;
-                                    self.execute_method(
-                                        "java/util/Map",
-                                        "put",
-                                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                                        &[target.clone(), key, value],
-                                    )?;
-                                }
-                                target
-                            }
-                            _ => Value::Object(Some(self.heap.alloc_list(items))),
-                        });
+                        let supplier = part(self, "supplier", "()Ljava/util/function/Supplier;")?;
+                        let accumulator =
+                            part(self, "accumulator", "()Ljava/util/function/BiConsumer;")?;
+                        let finisher = part(self, "finisher", "()Ljava/util/function/Function;")?;
+                        let container = self.execute_method(
+                            "java/util/function/Supplier",
+                            "get",
+                            "()Ljava/lang/Object;",
+                            &[supplier],
+                        )?;
+                        for item in items {
+                            self.execute_method(
+                                "java/util/function/BiConsumer",
+                                "accept",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                                &[accumulator.clone(), container.clone(), item],
+                            )?;
+                        }
+                        // An `IDENTITY_FINISH` collector's finisher is the
+                        // identity, so applying it always is what the JDK answers.
+                        return self.execute_method(
+                            "java/util/function/Function",
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[finisher, container],
+                        );
                     }
                     _ => {}
                 }
             }
         }
 
-        // Comparator built from an int-key function, and its reverse. The
-        // actual comparison stays here so the key function can be Java.
-        if class_name == "java/util/Comparator" && !args.is_empty() {
-            if method_name == "comparingInt" {
-                let function = args.get(1).cloned().unwrap_or(Value::NULL);
-                let mut fields = HashMap::new();
-                fields.insert("function".into(), function);
-                let id = self.heap.alloc(JavaObject::Instance {
-                    class_name: "java/util/Comparator".into(),
-                    fields,
-                });
-                return Ok(Value::Object(Some(id)));
-            }
-            if method_name == "reversed" {
-                let mut fields = HashMap::new();
-                fields.insert("reversed".into(), args[0].clone());
-                let id = self.heap.alloc(JavaObject::Instance {
-                    class_name: "java/util/Comparator".into(),
-                    fields,
-                });
-                return Ok(Value::Object(Some(id)));
-            }
-            if method_name == "compare" && args.len() >= 3 {
-                let fields = match self.heap.get(args[0].as_obj().unwrap_or(usize::MAX)) {
-                    Some(JavaObject::Instance { fields, .. }) => fields.clone(),
-                    _ => HashMap::new(),
-                };
-                if let Some(inner) = fields.get("reversed").cloned() {
-                    let inner_order = self.execute_method(
-                        "java/util/Comparator",
-                        "compare",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)I",
-                        &[inner, args[1].clone(), args[2].clone()],
-                    )?;
-                    return Ok(Value::Int(-inner_order.as_int()));
-                }
-                if let Some(function) = fields.get("function").cloned() {
-                    let left = self.execute_method(
-                        "java/util/function/ToIntFunction",
-                        "applyAsInt",
-                        "(Ljava/lang/Object;)I",
-                        &[function.clone(), args[1].clone()],
-                    )?;
-                    let right = self.execute_method(
-                        "java/util/function/ToIntFunction",
-                        "applyAsInt",
-                        "(Ljava/lang/Object;)I",
-                        &[function, args[2].clone()],
-                    )?;
-                    let (left, right) = (left.as_int(), right.as_int());
-                    return Ok(Value::Int(if left < right {
-                        -1
-                    } else if left > right {
-                        1
-                    } else {
-                        0
-                    }));
-                }
-                // A lambda comparator is unpacked by the branch at the top.
-            }
+        if class_name == "java/lang/Thread" && (method_name == "start" || method_name == "start0") {
+            return Ok(Value::NULL);
         }
 
-        if class_name == "java/lang/Thread" && (method_name == "start" || method_name == "start0") {
+        // `Unsafe.ensureClassInitialized(Class)` runs that class's `<clinit>`;
+        // `SharedSecrets` relies on it to install a lazily set access object.
+        if matches!(class_name, "jdk/internal/misc/Unsafe" | "sun/misc/Unsafe")
+            && matches!(
+                method_name,
+                "ensureClassInitialized" | "ensureClassInitialized0"
+            )
+        {
+            let target =
+                args.last()
+                    .and_then(Value::as_obj)
+                    .and_then(|id| match self.heap.get(id) {
+                        Some(JavaObject::Class(name)) => Some(name.replace('.', "/")),
+                        _ => None,
+                    });
+            if let Some(target) = target {
+                self.ensure_initialized(&target)?;
+            }
             return Ok(Value::NULL);
         }
 
@@ -1665,6 +1690,34 @@ impl Interpreter {
             return Ok(Value::Object(Some(pose)));
         }
 
+        // `Objects.toString(Object)` and `StringBuilder.append(Object)` render
+        // an object with its own `toString`. A runtime collection or a JDK
+        // collection's bytecode renders the way the JDK does, so a list of
+        // lists or a map of lists prints its elements, not their heap ids.
+        let rendered;
+        let args = match (class_name, method_name, descriptor) {
+            ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;")
+                if self.renders_as_jdk_collection(&args[0]) =>
+            {
+                let text = self.concat_text(&args[0]);
+                return Ok(Value::Object(Some(self.heap.alloc_string(text))));
+            }
+            (
+                "java/lang/StringBuilder" | "java/lang/AbstractStringBuilder",
+                "append",
+                "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+                | "(Ljava/lang/Object;)Ljava/lang/AbstractStringBuilder;",
+            ) if args.len() == 2 && self.renders_as_jdk_collection(&args[1]) => {
+                let text = self.concat_text(&args[1]);
+                rendered = [
+                    args[0].clone(),
+                    Value::Object(Some(self.heap.alloc_string(text))),
+                ];
+                &rendered[..]
+            }
+            _ => args,
+        };
+
         // A heap-modelled list, set or map copies from a collection that is
         // real bytecode (a Guava `ImmutableList`, `Lists.cartesianProduct`):
         // read its elements through `Iterator` first.
@@ -1714,12 +1767,22 @@ impl Interpreter {
         if virtual_dispatch && method_name != "<init>" {
             if let Some(first) = args.first() {
                 if let Some(id) = first.as_obj() {
-                    if let Some(JavaObject::Instance {
-                        class_name: actual, ..
-                    }) = self.heap.get(id)
-                    {
+                    let actual = match self.heap.get(id) {
+                        Some(JavaObject::Instance {
+                            class_name: actual, ..
+                        }) => Some(actual.as_str()),
+                        // The runtime's own list, set and map stand for a JDK
+                        // collection: whatever the builtins do not answer runs
+                        // as that collection's skeleton class (`toString`,
+                        // `listIterator`, `equals`, `removeIf`, ...), whose
+                        // bytecode is written against `size`/`get`/`iterator`/
+                        // `entrySet`, which the builtins do answer.
+                        Some(other) => collection_skeleton(other),
+                        None => None,
+                    };
+                    if let Some(actual) = actual {
                         if actual != class_name {
-                            queue.push_back(actual.clone());
+                            queue.push_back(actual.to_string());
                             declared_fallback = Some(class_name.to_string());
                         }
                     }
@@ -1743,7 +1806,8 @@ impl Interpreter {
                     self.note_missing(format!("{class_name}.{method_name}{descriptor}"));
                 }
                 log::debug!(
-                    "Method not found in hierarchy of {class_name}: {method_name}{descriptor}"
+                    "Method not found in hierarchy of {class_name}: {method_name}{descriptor} (receiver {})",
+                    self.describe_receiver(virtual_dispatch, args)
                 );
                 return Ok(Value::NULL);
             };
@@ -1806,8 +1870,51 @@ impl Interpreter {
         }
     }
 
+    /// The class of the frame below the innermost one, as a `Class`; null at
+    /// the bottom of the stack.
+    fn caller_class(&mut self) -> Value {
+        match self
+            .frame_depth
+            .checked_sub(2)
+            .map(|i| self.frame_classes[i].clone())
+        {
+            Some(class) => Value::Object(Some(self.heap.alloc_class(class))),
+            None => Value::NULL,
+        }
+    }
+
     /// Interpret a code block with the given arguments as initial locals.
     fn interpret_code(
+        &mut self,
+        this_class: &str,
+        method_name: &str,
+        descriptor: &str,
+        bootstrap_methods: &[BootstrapMethodInfo],
+        code: &CodeInfo,
+        args: &[Value],
+    ) -> Result<Value> {
+        // The buffers stay allocated between calls; only the depth moves.
+        match self.frame_classes.get_mut(self.frame_depth) {
+            Some(slot) => {
+                slot.clear();
+                slot.push_str(this_class);
+            }
+            None => self.frame_classes.push(this_class.to_string()),
+        }
+        self.frame_depth += 1;
+        let result = self.interpret_frame(
+            this_class,
+            method_name,
+            descriptor,
+            bootstrap_methods,
+            code,
+            args,
+        );
+        self.frame_depth -= 1;
+        result
+    }
+
+    fn interpret_frame(
         &mut self,
         this_class: &str,
         method_name: &str,
@@ -2031,16 +2138,27 @@ impl Interpreter {
                         stack.insert(len - 2, top);
                     }
                 }
+                // A `long` or `double` is one entry on this operand stack but a
+                // category-2 value to the JVM: the `dup2`/`pop2` family moves
+                // one of them where it would move two category-1 values.
                 Opcode::DupX2 => {
                     let len = stack.len();
-                    if len >= 3 {
+                    let depth = if len >= 2 && is_wide(&stack[len - 2]) {
+                        2
+                    } else {
+                        3
+                    };
+                    if len >= depth {
                         let top = stack[len - 1].clone();
-                        stack.insert(len - 3, top);
+                        stack.insert(len - depth, top);
                     }
                 }
                 Opcode::Dup2 => {
                     let len = stack.len();
-                    if len >= 2 {
+                    if len >= 1 && is_wide(&stack[len - 1]) {
+                        let a = stack[len - 1].clone();
+                        stack.push(a);
+                    } else if len >= 2 {
                         let a = stack[len - 2].clone();
                         let b = stack[len - 1].clone();
                         stack.push(a);
@@ -2049,7 +2167,10 @@ impl Interpreter {
                 }
                 Opcode::Dup2X1 => {
                     let len = stack.len();
-                    if len >= 3 {
+                    if len >= 2 && is_wide(&stack[len - 1]) {
+                        let top = stack[len - 1].clone();
+                        stack.insert(len - 2, top);
+                    } else if len >= 3 {
                         let a = stack[len - 2].clone();
                         let b = stack[len - 1].clone();
                         stack.insert(len - 3, b);
@@ -2058,18 +2179,35 @@ impl Interpreter {
                 }
                 Opcode::Dup2X2 => {
                     let len = stack.len();
-                    if len >= 4 {
-                        let a = stack[len - 2].clone();
-                        let b = stack[len - 1].clone();
-                        stack.insert(len - 4, b);
-                        stack.insert(len - 4, a);
+                    if len >= 1 && is_wide(&stack[len - 1]) {
+                        // v1 is wide: under one wide value or two narrow ones.
+                        let depth = if len >= 2 && is_wide(&stack[len - 2]) {
+                            2
+                        } else {
+                            3
+                        };
+                        if len >= depth {
+                            let top = stack[len - 1].clone();
+                            stack.insert(len - depth, top);
+                        }
+                    } else if len >= 3 {
+                        // v2, v1 narrow: under one wide value or two narrow ones.
+                        let depth = if is_wide(&stack[len - 3]) { 3 } else { 4 };
+                        if len >= depth {
+                            let a = stack[len - 2].clone();
+                            let b = stack[len - 1].clone();
+                            stack.insert(len - depth, b);
+                            stack.insert(len - depth, a);
+                        }
                     }
                 }
                 Opcode::Pop => {
                     stack.pop();
                 }
                 Opcode::Pop2 => {
-                    stack.pop();
+                    if !stack.last().is_some_and(is_wide) {
+                        stack.pop();
+                    }
                     stack.pop();
                 }
                 Opcode::Swap => {
@@ -2926,6 +3064,10 @@ impl Interpreter {
                         let strings = bsm
                             .map(|b| b.string_arguments.as_slice())
                             .unwrap_or_default();
+                        // The call site's descriptor types each argument: a
+                        // `boolean` prints `true`/`false` and a `char` its
+                        // character, though both arrive as an int.
+                        let kinds = parameter_kinds(descriptor);
                         let mut out = String::new();
                         if target_method == "makeConcatWithConstants" {
                             if let Some(recipe) = strings.first() {
@@ -2934,7 +3076,8 @@ impl Interpreter {
                                 for ch in recipe.chars() {
                                     if ch == '\u{1}' {
                                         if let Some(value) = captured.get(dynamic) {
-                                            let text = self.concat_text(value);
+                                            let text = self
+                                                .concat_typed(kinds.get(dynamic).copied(), value);
                                             out.push_str(&text);
                                         }
                                         dynamic += 1;
@@ -2949,8 +3092,8 @@ impl Interpreter {
                                 }
                             }
                         } else {
-                            for value in &captured {
-                                let text = self.concat_text(value);
+                            for (index, value) in captured.iter().enumerate() {
+                                let text = self.concat_typed(kinds.get(index).copied(), value);
                                 out.push_str(&text);
                             }
                         }
@@ -2962,6 +3105,7 @@ impl Interpreter {
                     let return_type = extract_return_type(descriptor);
                     let lambda_id = self.heap.alloc(JavaObject::Lambda {
                         interface_class: return_type,
+                        interface_method: name.clone(),
                         target_class,
                         target_method,
                         target_desc,
@@ -2985,19 +3129,37 @@ impl Interpreter {
         Ok(stack.pop().unwrap_or(Value::NULL))
     }
 
+    /// The text concatenation appends for an argument of descriptor kind `kind`.
+    fn concat_typed(&mut self, kind: Option<u8>, value: &Value) -> String {
+        match (kind, value) {
+            (Some(b'Z'), Value::Int(i)) => (*i != 0).to_string(),
+            (Some(b'C'), Value::Int(i)) => char::from_u32(*i as u32 & 0xffff)
+                .map(String::from)
+                .unwrap_or_default(),
+            _ => self.concat_text(value),
+        }
+    }
+
     /// The text string concatenation appends for `value`: a mod class's own
     /// `toString()` when it has one, otherwise the runtime's rendering.
     fn concat_text(&mut self, value: &Value) -> String {
         let class = match value.as_obj().and_then(|id| self.heap.get(id)) {
             Some(JavaObject::Instance { class_name, .. }) => Some(class_name.clone()),
+            Some(collection) if collection_skeleton(collection).is_some() => {
+                return self.collection_text(value);
+            }
             _ => None,
         };
         if let Some(class) = class {
             let mut current = Some(class);
             while let Some(name) = current {
+                // The JDK's collections render themselves (`TreeMap` is
+                // `AbstractMap.toString`); other JDK and Minecraft objects are
+                // rendered by the runtime, which models many of them.
                 if ["java/", "jdk/", "sun/", "net/minecraft/"]
                     .iter()
                     .any(|prefix| name.starts_with(prefix))
+                    && !name.starts_with("java/util/")
                 {
                     break;
                 }
@@ -3025,6 +3187,34 @@ impl Interpreter {
             }
         }
         crate::builtins::value_to_string(&self.heap, value)
+    }
+
+    /// Whether `value` is a runtime collection or an instance of a JDK
+    /// `java.util` class, which render through their own `toString`.
+    fn renders_as_jdk_collection(&self, value: &Value) -> bool {
+        match value.as_obj().and_then(|id| self.heap.get(id)) {
+            Some(JavaObject::Instance { class_name, .. }) => class_name.starts_with("java/util/"),
+            Some(other) => collection_skeleton(other).is_some(),
+            None => false,
+        }
+    }
+
+    /// `toString()` of a runtime list, set or map: the JDK's own
+    /// `AbstractCollection`/`AbstractMap` rendering (`[a, b]`, `{k=v}`), with
+    /// each element rendered by its own `toString`.
+    fn collection_text(&mut self, value: &Value) -> String {
+        match self.execute_method(
+            "java/lang/Object",
+            "toString",
+            "()Ljava/lang/String;",
+            std::slice::from_ref(value),
+        ) {
+            Ok(result) => match result.as_obj().and_then(|id| self.heap.get_string(id)) {
+                Some(text) => text.to_string(),
+                None => crate::builtins::value_to_string(&self.heap, value),
+            },
+            Err(_) => crate::builtins::value_to_string(&self.heap, value),
+        }
     }
 
     /// The class that declares `field_name` as a static field, following the
@@ -3122,6 +3312,19 @@ impl Interpreter {
             return val.clone();
         }
 
+        // `System.out`/`System.err` are set by the JVM's `initPhase1`, which
+        // the runtime does not run: they are the host's standard streams.
+        if class_name == "java/lang/System" && matches!(field_name, "out" | "err") {
+            let console = crate::text_io::Console {
+                error: field_name == "err",
+                line: String::new(),
+            };
+            let id = self.heap.alloc_native(console);
+            let value = Value::Object(Some(id));
+            self.static_singletons.insert(key, value.clone());
+            return value;
+        }
+
         if let Some(class) = self.loader.get(class_name) {
             if let Some(val) = class.static_fields.get(field_name) {
                 if !val.is_null() {
@@ -3133,7 +3336,17 @@ impl Interpreter {
                 let platform = ["java/", "jdk/", "sun/", "net/minecraft/", "com/mojang/"]
                     .iter()
                     .any(|prefix| class_name.starts_with(prefix));
-                if !platform && class.fields.get(field_name).is_some_and(|f| f.is_static) {
+                // The JDK's statics come from its own `<clinit>` too: a null one
+                // is a lazily set field (`SharedSecrets.javaUtilCollectionAccess`
+                // is null until `ImmutableCollections` initializes), not a
+                // constant to invent. Only the `VarHandle`s the runtime stands
+                // in for are synthesized.
+                let jdk = ["java/", "jdk/", "sun/"]
+                    .iter()
+                    .any(|prefix| class_name.starts_with(prefix))
+                    && !(class_name.starts_with("java/")
+                        && matches!(field_name, "NEXT" | "PREV" | "HEAD" | "TAIL" | "ITEM"));
+                if (!platform || jdk) && class.fields.get(field_name).is_some_and(|f| f.is_static) {
                     return Value::NULL;
                 }
             }
@@ -3271,6 +3484,19 @@ impl Interpreter {
                 _ => Direction::UP,
             };
             let id = self.heap.alloc_direction(dir);
+            return Value::Object(Some(id));
+        }
+
+        // The runtime stands in for Fabric Loader's metadata API: a
+        // `CustomValue`'s type is the constant's name, as an interned string, so
+        // `value.getType() == CvType.OBJECT` compares like the enum does.
+        if class_name == "net/fabricmc/loader/api/metadata/CustomValue$CvType"
+            && matches!(
+                field_name,
+                "OBJECT" | "ARRAY" | "STRING" | "NUMBER" | "BOOLEAN" | "NULL"
+            )
+        {
+            let id = self.heap.alloc_string(field_name);
             return Value::Object(Some(id));
         }
 
@@ -3567,6 +3793,21 @@ fn collection_copy_call(class_name: &str, method_name: &str) -> bool {
             | "java/util/LinkedList"
             | "java/util/HashSet"
             | "java/util/LinkedHashSet"
-            | "java/util/TreeSet"
     ) && matches!(method_name, "copyOf" | "<init>" | "addAll")
+}
+
+/// Whether an operand-stack value is a JVM category-2 value (`long`, `double`).
+fn is_wide(value: &Value) -> bool {
+    matches!(value, Value::Long(_) | Value::Double(_))
+}
+
+/// The JDK skeleton class a runtime-modelled collection behaves as, for the
+/// methods the collection builtins do not answer themselves.
+pub(crate) fn collection_skeleton(object: &JavaObject) -> Option<&'static str> {
+    match object {
+        JavaObject::List(_) => Some("java/util/AbstractList"),
+        JavaObject::Set(_) => Some("java/util/AbstractSet"),
+        JavaObject::Map(_) => Some("java/util/AbstractMap"),
+        _ => None,
+    }
 }

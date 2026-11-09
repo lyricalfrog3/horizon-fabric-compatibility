@@ -1423,6 +1423,11 @@ fn builtin_registry_method(
             | "net/minecraft/core/MappedRegistry"
             | "net/minecraft/core/DefaultedMappedRegistry"
             | "net/minecraft/core/IdMap"
+            // `HolderGetter.get(tag)` / `getOrThrow(tag)` reach the registry
+            // through the interface vanilla's own default methods name.
+            | "net/minecraft/core/HolderGetter"
+            | "net/minecraft/core/HolderLookup"
+            | "net/minecraft/core/HolderLookup$RegistryLookup"
     ) {
         return None;
     }
@@ -1481,6 +1486,54 @@ fn builtin_registry_method(
         // `getOrThrow` turns into its "Missing tag" error. Answering a present
         // but *empty* set instead made vanilla's own `getOrThrow` succeed and
         // hide the gap.
+        ("get", 1) if method_name == "get" => {
+            // The one-argument form is the tag lookup on `HolderGetter`.
+            let tag = args.first().and_then(|v| v.as_obj()).and_then(|id| heap.get_native::<TagKey>(id)).map(|t| t.id.clone())?;
+            let full = if tag.contains(':') { tag } else { format!("minecraft:{tag}") };
+            let members = heap.registries.tag_members(&kind, &full);
+            if members.is_empty() && !heap.registries.loaded {
+                let mut fields = HashMap::new();
+                fields.insert("present".to_string(), Value::from_bool(true));
+                fields.insert("value".to_string(), Value::Object(Some(heap.alloc_set(Vec::new()))));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Optional".into(),
+                    fields,
+                });
+                return handled(Value::Object(Some(id)));
+            }
+            let holders: Vec<Value> = members
+                .iter()
+                .map(|member| {
+                    let (namespace, path) = member.split_once(':').unwrap_or(("minecraft", member.as_str()));
+                    let (namespace, path) = (namespace.to_string(), path.to_string());
+                    let location = heap.alloc_identifier(&namespace, &path);
+                    let key = resource_key(heap, &kind, location);
+                    Value::Object(Some(registry_holder(heap, Some(key), Value::NULL)))
+                })
+                .collect();
+            let named = {
+                let tag_value = args[0].clone();
+                let list = heap.alloc_list(holders);
+                let mut fields = HashMap::new();
+                fields.insert("key".to_string(), tag_value);
+                fields.insert("list".to_string(), Value::Object(Some(list)));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/core/HolderSet$Named".into(),
+                    fields,
+                });
+                Value::Object(Some(id))
+            };
+            let mut fields = HashMap::new();
+            fields.insert("present".to_string(), Value::from_bool(!members.is_empty()));
+            if !members.is_empty() {
+                fields.insert("value".to_string(), named);
+            }
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields,
+            });
+            handled(Value::Object(Some(id)))
+        }
         ("get", 2) | ("getOrThrow", 2)
             if args[1]
                 .as_obj()
@@ -1497,6 +1550,36 @@ fn builtin_registry_method(
                 format!("minecraft:{tag}")
             };
             let members = heap.registries.tag_members(&kind, &full);
+            // No host snapshot: the runtime has no data on this tag at all, so
+            // it answers the empty set it can stand behind rather than claiming
+            // the tag is missing.
+            let unknown = members.is_empty() && !heap.registries.loaded;
+            if unknown {
+                if method_name == "getOrThrow" {
+                    let mut fields = HashMap::new();
+                    let tag_value = args[1].clone();
+                    let list = heap.alloc_list(Vec::new());
+                    fields.insert("key".to_string(), tag_value);
+                    fields.insert("list".to_string(), Value::Object(Some(list)));
+                    let id = heap.alloc(JavaObject::Instance {
+                        class_name: "net/minecraft/core/HolderSet$Named".into(),
+                        fields,
+                    });
+                    return handled(Value::Object(Some(id)));
+                }
+                let mut fields = HashMap::new();
+                fields.insert("present".to_string(), Value::from_bool(true));
+                let list = heap.alloc_set(Vec::new());
+                fields.insert(
+                    "value".to_string(),
+                    Value::Object(Some(list)),
+                );
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Optional".into(),
+                    fields,
+                });
+                return handled(Value::Object(Some(id)));
+            }
             if members.is_empty() {
                 if method_name == "getOrThrow" {
                     return handled(Value::NULL);

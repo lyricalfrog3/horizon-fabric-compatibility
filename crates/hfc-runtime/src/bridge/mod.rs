@@ -318,6 +318,7 @@ impl FabricBridge {
     pub fn load_registries(&mut self, resources: &std::path::Path) {
         let mut loaded = crate::registry::Registries::load(resources);
         loaded.absorb_tags(std::mem::take(&mut self.interp.heap.registries));
+        loaded.mark_loaded();
         self.interp.heap.registries = loaded;
     }
 

@@ -7,6 +7,10 @@ use std::path::Path;
 
 #[derive(Debug, Default, Clone)]
 pub struct Registries {
+    /// Whether a host snapshot was read at all. Without one the runtime knows no
+    /// tag's members, which is not the same as knowing a tag is empty: a tag
+    /// lookup then answers "not known" rather than "missing".
+    pub loaded: bool,
     pub blocks: BTreeSet<String>,
     pub items: BTreeSet<String>,
     /// Raw tag definitions by `namespace:path`: plain ids and `#tag` references.
@@ -65,6 +69,7 @@ impl Registries {
     pub fn load(dir: &Path) -> Self {
         let mut out = Self::default();
         if let Ok(text) = std::fs::read_to_string(dir.join("registries.json")) {
+            out.loaded = true;
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                 let keys = |name: &str| -> BTreeSet<String> {
                     json.get(name)
@@ -98,6 +103,13 @@ impl Registries {
             }
         }
         out
+    }
+
+    /// Record that the host snapshot is the authority even though it lists no
+    /// blocks or items: the tag files it read are the whole truth, so a tag it
+    /// does not have really is missing.
+    pub fn mark_loaded(&mut self) {
+        self.loaded = true;
     }
 
     /// Keep the tags another snapshot holds (those mod jars defined).

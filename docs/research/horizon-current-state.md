@@ -1,13 +1,13 @@
 # Horizon: current state (evidence from source)
 
-Research date: 2026-11-02.
+Research date: 2026-11-02 (the upstream and fork revisions were moved on 2026-11-09).
 
 ## Exact revisions used
 
 | Repository | Commit | Date | Role |
 |---|---|---|---|
-| `horizon-rust/horizon` | `26c83240d6d2e3bfbda5314c9f8d1274fba0ec1a` | 2026-11-02 | Engine, content loader, port pipeline, launcher |
-| `lyricalfrog3/horizon` (`hfc`) | `32f24b595965d28a0c356786d1a36275ef3fcde2` | 2026-11-05 | Fork with the HFC client hooks; the `workspace/horizon` submodule pins it |
+| `horizon-rust/horizon` | `595421d8ee08f023b3f0591a21297cd62f81a8df` | 2026-11-09 | Engine, content loader, port pipeline, launcher |
+| `lyricalfrog3/horizon` (`hfc`) | `debb70ddd` (full hash in the submodule pin) | 2026-11-09 | Fork with the HFC client hooks; the `workspace/horizon` submodule pins it |
 | `horizon-rust/horizon-mods` | `b22a9c42a3848ef410f00e381b505b3d12a742aa` | 2026-11-02 | Official mods, reference native/content mods |
 | `horizon-rust/horizon-mixins` | `ddd9700b21997c95d95ac6ee5ecafe3830cf622a` | 2026-11-01 | Native mixin tooling (shallow clone) |
 

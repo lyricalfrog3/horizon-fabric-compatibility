@@ -1488,13 +1488,24 @@ fn builtin_registry_method(
         // hide the gap.
         ("get", 1) if method_name == "get" => {
             // The one-argument form is the tag lookup on `HolderGetter`.
-            let tag = args.first().and_then(|v| v.as_obj()).and_then(|id| heap.get_native::<TagKey>(id)).map(|t| t.id.clone())?;
-            let full = if tag.contains(':') { tag } else { format!("minecraft:{tag}") };
+            let tag = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_native::<TagKey>(id))
+                .map(|t| t.id.clone())?;
+            let full = if tag.contains(':') {
+                tag
+            } else {
+                format!("minecraft:{tag}")
+            };
             let members = heap.registries.tag_members(&kind, &full);
             if members.is_empty() && !heap.registries.loaded {
                 let mut fields = HashMap::new();
                 fields.insert("present".to_string(), Value::from_bool(true));
-                fields.insert("value".to_string(), Value::Object(Some(heap.alloc_set(Vec::new()))));
+                fields.insert(
+                    "value".to_string(),
+                    Value::Object(Some(heap.alloc_set(Vec::new()))),
+                );
                 let id = heap.alloc(JavaObject::Instance {
                     class_name: "java/util/Optional".into(),
                     fields,
@@ -1504,7 +1515,9 @@ fn builtin_registry_method(
             let holders: Vec<Value> = members
                 .iter()
                 .map(|member| {
-                    let (namespace, path) = member.split_once(':').unwrap_or(("minecraft", member.as_str()));
+                    let (namespace, path) = member
+                        .split_once(':')
+                        .unwrap_or(("minecraft", member.as_str()));
                     let (namespace, path) = (namespace.to_string(), path.to_string());
                     let location = heap.alloc_identifier(&namespace, &path);
                     let key = resource_key(heap, &kind, location);
@@ -1570,10 +1583,7 @@ fn builtin_registry_method(
                 let mut fields = HashMap::new();
                 fields.insert("present".to_string(), Value::from_bool(true));
                 let list = heap.alloc_set(Vec::new());
-                fields.insert(
-                    "value".to_string(),
-                    Value::Object(Some(list)),
-                );
+                fields.insert("value".to_string(), Value::Object(Some(list)));
                 let id = heap.alloc(JavaObject::Instance {
                     class_name: "java/util/Optional".into(),
                     fields,

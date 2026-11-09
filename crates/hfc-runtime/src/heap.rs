@@ -64,6 +64,11 @@ pub struct Heap {
     pub(crate) block_facts_shapes: bool,
     /// The `BlockState` objects of registered blocks, by block id and state key.
     pub(crate) block_state_objects: HashMap<String, HashMap<String, Value>>,
+    /// One `ThreadLocal`'s value: the interpreter runs one thread, so a value
+    /// per `ThreadLocal` object is exactly what a JVM's thread map holds.
+    pub(crate) thread_locals: HashMap<usize, Value>,
+    /// The `Supplier` each `ThreadLocal.withInitial` carries.
+    pub(crate) thread_local_initializers: HashMap<usize, Value>,
     /// `Item.Properties` methods the runtime does not model, each logged once.
     pub unsupported_item_properties: Vec<String>,
     /// Creative-tab placements the tab events' listeners made, in call order.
@@ -97,6 +102,9 @@ pub(crate) struct RegistryEntry {
 /// The system properties that do not depend on where the game folder is.
 fn default_properties() -> BTreeMap<String, String> {
     let mut properties = BTreeMap::new();
+    let os_version = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default();
     for (key, value) in [
         ("java.version", "25"),
         ("java.specification.version", "25"),
@@ -106,6 +114,8 @@ fn default_properties() -> BTreeMap<String, String> {
         ("java.vm.vendor", "Horizon Fabric Runtime"),
         ("java.vm.version", "25"),
         ("os.name", "Linux"),
+        // The kernel release, as the JVM's `os.version` reports it.
+        ("os.version", os_version.as_str()),
         ("os.arch", std::env::consts::ARCH),
         ("file.separator", "/"),
         ("path.separator", ":"),
@@ -116,6 +126,11 @@ fn default_properties() -> BTreeMap<String, String> {
         // The interpreter has no `sun.misc.Unsafe`, so JOML must take its
         // plain-field matrix copies rather than raw memory ones.
         ("joml.nounsafe", "true"),
+        // JOML formats floats through `DecimalFormat`, which needs the JDK's
+        // CLDR locale bundles; the runtime reads classes from the JDK image,
+        // not its resource bundles. JOML's own switch turns that formatting off
+        // and prints the plain number, as `-Djoml.format=false` does on a JVM.
+        ("joml.format", "false"),
     ] {
         properties.insert(key.to_string(), value.to_string());
     }
@@ -154,6 +169,8 @@ impl Heap {
             block_ids: std::collections::HashSet::new(),
             block_facts_shapes: false,
             block_state_objects: HashMap::new(),
+            thread_locals: HashMap::new(),
+            thread_local_initializers: HashMap::new(),
             unsupported_item_properties: Vec::new(),
             creative_tab_additions: Vec::new(),
             registered_creative_tabs: Vec::new(),

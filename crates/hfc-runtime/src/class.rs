@@ -453,12 +453,22 @@ pub struct FieldInfo {
 /// Information about an invokedynamic bootstrap method.
 #[derive(Debug, Clone)]
 pub struct BootstrapMethodInfo {
+    /// The bootstrap method itself (`java/lang/invoke/LambdaMetafactory`).
+    pub bootstrap_class: String,
+    /// Its name (`altMetafactory`).
+    pub bootstrap_method: String,
     pub target_class: String,
     pub target_method: String,
     pub target_desc: String,
     /// String constants in the bootstrap arguments. `StringConcatFactory` puts
     /// its recipe here; other bootstrap methods can ignore them.
     pub string_arguments: Vec<String>,
+    /// Integer constants in the bootstrap arguments, in order:
+    /// `LambdaMetafactory.altMetafactory` puts its flags and marker count here.
+    pub int_arguments: Vec<i32>,
+    /// Class constants in the bootstrap arguments, in order: the interfaces
+    /// `altMetafactory` adds to the lambda.
+    pub class_arguments: Vec<String>,
 }
 
 /// A parsed JVM class.
@@ -805,6 +815,8 @@ impl Class {
                     let mut target_method = String::new();
                     let mut target_desc = String::new();
                     let mut string_arguments = Vec::new();
+                    let mut int_arguments = Vec::new();
+                    let mut class_arguments = Vec::new();
                     // `StringConcatFactory` is the bootstrap method itself; the
                     // method handle inside the arguments is the concat target.
                     if entry.method.class_name == "java/lang/invoke/StringConcatFactory" {
@@ -821,6 +833,12 @@ impl Class {
                                     target_desc = mh.member_ref.descriptor.to_string();
                                 }
                             }
+                            BootstrapArgument::LiteralConstant(LiteralConstant::Integer(i)) => {
+                                int_arguments.push(*i);
+                            }
+                            BootstrapArgument::ClassInfo(name) => {
+                                class_arguments.push(name.to_string());
+                            }
                             BootstrapArgument::LiteralConstant(LiteralConstant::String(s)) => {
                                 string_arguments.push(s.to_string());
                             }
@@ -833,10 +851,14 @@ impl Class {
                         }
                     }
                     bootstrap_methods.push(BootstrapMethodInfo {
+                        bootstrap_class: entry.method.class_name.to_string(),
+                        bootstrap_method: entry.method.member_ref.name.to_string(),
                         target_class,
                         target_method,
                         target_desc,
                         string_arguments,
+                        int_arguments,
+                        class_arguments,
                     });
                 }
             }
@@ -907,7 +929,9 @@ impl Class {
 fn obj_arr_to_string(o: &ObjectArrayType<'_>) -> String {
     match o {
         ObjectArrayType::BinaryName(name) => name.to_string(),
-        ObjectArrayType::ArrayType(desc) => format!("{desc:?}"),
+        // The JVM descriptor (`[Ljava/lang/Object;`), which is what the
+        // interpreter's `instanceof`/`checkcast` match against.
+        ObjectArrayType::ArrayType(desc) => format!("{desc}"),
     }
 }
 

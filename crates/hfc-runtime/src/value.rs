@@ -122,6 +122,9 @@ pub enum JavaObject {
         interface_class: String,
         /// The interface method the lambda implements (the `invokedynamic` name).
         interface_method: String,
+        /// Interfaces the bootstrap adds beyond the functional one:
+        /// `altMetafactory`'s markers (and `Serializable` when it asks for it).
+        intersections: Vec<String>,
         target_class: String,
         target_method: String,
         target_desc: String,

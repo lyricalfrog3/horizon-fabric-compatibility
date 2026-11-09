@@ -10,22 +10,13 @@
 "Arith.double_str" = "Double.toString does not use Java's shortest form: 1.0E21, 1.0E-7, 2.0"
 
 # --- Exceptions ------------------------------------------------------------
-"Exceptions.arithmetic" = "ArithmeticException from / 0 carries no message (/ by zero)"
-"Exceptions.nulls" = "a null receiver answers 0/null instead of throwing NullPointerException, so the catch does not run"
-"Exceptions.bounds" = "new int[-1] does not throw NegativeArraySizeException"
-"Exceptions.casts" = "a bad checkcast does not throw ClassCastException"
-"Exceptions.static_init" = "a throwing static initializer does not raise ExceptionInInitializerError/NoClassDefFoundError"
-"Exceptions.unwinding" = "an exception thrown several frames down is swallowed instead of unwinding to the caller"
 
 # --- Strings --------------------------------------------------------------
-"Strings.code_points" = "non-ASCII constant-pool text is decoded wrongly (String.length of 3 chars answers 6)"
-"Strings.compares" = "String.repeat is missing and String.strip does not remove whitespace"
 
 # --- Objects --------------------------------------------------------------
 "Objects.dispatch" = "a super.field access reads the subclass's shadowing field instead of the superclass's"
 "Objects.super_field" = "super.field and a field access through the superclass both read the runtime object's (subclass) field"
 "Objects.record" = "record equals/hashCode/toString run ObjectMethods (invokedynamic), which the runtime does not implement"
-"Objects.record_check" = "a record's compact constructor does not run, so its validation is skipped"
 
 # --- Collections ----------------------------------------------------------
 "Collections.immutable" = "List.of's immutable list implementation is not carried and add does not throw UnsupportedOperationException"

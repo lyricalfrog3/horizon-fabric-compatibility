@@ -560,8 +560,17 @@ impl FabricBridge {
         self.interp.loader.add_jar(path)
     }
 
-    /// Register the JDK's `lib/modules` image as a class source.
+    /// Register the JDK's `lib/modules` image as a class source. Its directory
+    /// is the runtime's `java.home`: the JDK whose classes this interpreter
+    /// executes, which is what the property means to code that reads it.
     pub fn add_jimage(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(home) = path.parent().and_then(Path::parent) {
+            self.interp.heap.properties.insert(
+                "java.home".to_string(),
+                home.to_string_lossy().to_string(),
+            );
+        }
         self.interp.loader.add_jimage(path)
     }
 

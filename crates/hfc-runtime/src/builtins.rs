@@ -1050,6 +1050,80 @@ fn registry_holder(heap: &mut Heap, key: Option<Value>, value: Value) -> usize {
     })
 }
 
+/// Every value a built-in registry holds, in registration order.
+fn registry_values(heap: &mut Heap, kind: &str) -> Vec<Value> {
+    // What code registered: the general table, plus the item and block paths,
+    // which record their own objects (a block's facts hang off them).
+    let mut values: Vec<Value> = heap
+        .registry_entries
+        .iter()
+        .filter(|entry| entry.kind == kind)
+        .map(|entry| entry.value.clone())
+        .collect();
+    match kind {
+        "BLOCK" => values.extend(
+            heap.registered_blocks
+                .iter()
+                .map(|record| Value::Object(Some(record.object))),
+        ),
+        "ITEM" => values.extend(
+            heap.registered_items
+                .iter()
+                .map(|record| Value::Object(Some(record.object))),
+        ),
+        _ => {}
+    }
+    // The host's snapshot names the vanilla entries; their objects are the
+    // runtime's stand-ins, in the order the snapshot lists them.
+    let snapshot: Vec<String> = match kind {
+        "ITEM" => heap.registries.items.iter().cloned().collect(),
+        "BLOCK" => heap.registries.blocks.iter().cloned().collect(),
+        _ => Vec::new(),
+    };
+    // An entry a mod registered is that mod's own object: yielding a stand-in
+    // for the same id would give the registry two objects for one entry, and
+    // vanilla code compares them by identity (`BlockEntity.validateBlockState`).
+    let registered: std::collections::HashSet<String> = if kind == "BLOCK" {
+        heap.registered_blocks
+            .iter()
+            .map(|record| record.id.clone())
+            .collect()
+    } else {
+        heap.registered_items
+            .iter()
+            .map(|record| record.id.clone())
+            .chain(heap.registered_block_items.iter().map(|(id, _, _)| id.clone()))
+            .collect()
+    };
+    for id in snapshot {
+        if registered.contains(&id) {
+            continue;
+        }
+        let already = values.iter().any(|value| {
+            value.as_obj().is_some_and(|object| {
+                heap.get_native::<Item>(object).is_some_and(|item| item.id == id)
+                    || heap
+                        .get_native::<crate::minecraft::Block>(object)
+                        .is_some_and(|block| block.id == id)
+            })
+        });
+        if already {
+            continue;
+        }
+        let object = if kind == "BLOCK" {
+            heap.alloc_native(crate::minecraft::Block {
+                id,
+                is_crop: false,
+                max_age: 0,
+            })
+        } else {
+            heap.alloc_native(Item { id })
+        };
+        values.push(Value::Object(Some(object)));
+    }
+    values
+}
+
 /// The id a mod object was registered under in registry `kind`, or a vanilla
 /// item/block stand-in's own id.
 fn registered_id(heap: &Heap, kind: &str, value: &Value) -> Option<String> {
@@ -1146,6 +1220,21 @@ fn builtin_registry_method(
                 holder,
             });
             handled(Value::Object(Some(holder)))
+        }
+        // Iteration: what code registered through this registry, in
+        // registration order. For items and blocks the host's snapshot of the
+        // vanilla list is there too (it names every entry); for the other
+        // registries the runtime has no vanilla contents, so it yields what was
+        // registered in code — which is what vanilla's own initializers do
+        // (`Fluids` registers its fluids, then walks the registry it filled).
+        ("iterator" | "stream", 1) => {
+            let values = registry_values(heap, &kind);
+            let value = if method_name == "stream" {
+                heap.alloc_stream(values)
+            } else {
+                heap.alloc_iterator(values)
+            };
+            handled(Value::Object(Some(value)))
         }
         ("getKey", 2) => match registered_id(heap, &kind, &args[1]) {
             Some(id) => {
@@ -1435,7 +1524,7 @@ fn particle_layout(descriptor: &str) -> Option<ParticleLayout> {
 
 /// The system property table `System.getProperties` hands out, made once and
 /// kept in a singleton so a mod that sets a property sees it later.
-fn system_properties(heap: &mut Heap) -> usize {
+pub(crate) fn system_properties(heap: &mut Heap) -> usize {
     if let Some(id) = heap.get_singleton("system.properties") {
         return id;
     }
@@ -2165,16 +2254,6 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 2b. Unsafe & JVM Internals
     // -------------------------------------------------------------
-    if class_name == "java/lang/invoke/MethodHandles" {
-        if method_name == "lookup" {
-            let lid = heap.alloc(JavaObject::Instance {
-                class_name: "java/lang/invoke/MethodHandles$Lookup".to_string(),
-                fields: HashMap::new(),
-            });
-            return BuiltinResult::Handled(Value::Object(Some(lid)));
-        }
-    }
-
     if class_name == "java/lang/invoke/MethodHandles$Lookup" {
         if method_name == "findVarHandle" && args.len() >= 3 {
             let field_name = if let Some(id) = args[2].as_obj() {
@@ -2790,6 +2869,40 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::NULL);
     }
 
+    // The runtime is the one class loader: every class it runs comes from it, so
+    // the JDK's loader hierarchy collapses to a single stand-in. `Charset` and
+    // others ask whether a loader is the system one.
+    if class_name == "java/lang/ClassLoader"
+        && matches!(
+            method_name,
+            "getSystemClassLoader" | "getPlatformClassLoader" | "getBootClassLoader"
+        )
+    {
+        let key = format!("classloader.{method_name}");
+        let id = match heap.get_singleton(&key) {
+            Some(id) => id,
+            None => {
+                let mut fields = HashMap::new();
+                fields.insert("boot".to_string(), Value::from_bool(true));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/lang/ClassLoader".into(),
+                    fields,
+                });
+                heap.set_singleton(&key, id);
+                id
+            }
+        };
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+    if class_name == "jdk/internal/misc/VM" && method_name == "isSystemDomainLoader" {
+        // Every loader the runtime hands out is its own.
+        let system = args.first().and_then(|value| value.as_obj()).is_some_and(|id| {
+            matches!(heap.get(id), Some(JavaObject::Instance { class_name, .. })
+                if class_name == "java/lang/ClassLoader")
+        });
+        return BuiltinResult::Handled(Value::from_bool(system));
+    }
+
     if class_name == "java/lang/Throwable" {
         if method_name == "fillInStackTrace" {
             return BuiltinResult::Handled(args.get(0).cloned().unwrap_or(Value::NULL));
@@ -3352,7 +3465,9 @@ pub fn dispatch_builtin(
             let len = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .map(|s| s.len() as i32)
+                // `String.length` counts UTF-16 code units, not bytes or
+                // code points: an astral character is two.
+                .map(|s| s.encode_utf16().count() as i32)
                 .unwrap_or(0);
             return BuiltinResult::Handled(Value::Int(len));
         } else if method_name == "compareTo" && args.len() >= 2 {
@@ -4483,51 +4598,6 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 8. java/nio/file/Path, Paths, Files & File
     // -------------------------------------------------------------
-    if class_name == "java/nio/file/Path" {
-        if method_name == "resolve" && args.len() >= 2 {
-            let sub = args[1]
-                .as_obj()
-                .and_then(|id| heap.get_string(id))
-                .unwrap_or("sub")
-                .to_string();
-            let mut fields = HashMap::new();
-            let pid = heap.alloc_string(&sub);
-            fields.insert("path".into(), Value::Object(Some(pid)));
-            let new_path = heap.alloc(JavaObject::Instance {
-                class_name: "java/nio/file/Path".into(),
-                fields,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(new_path)));
-        } else if method_name == "toString" && !args.is_empty() {
-            if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
-                    if let Some(p) = fields.get("path") {
-                        return BuiltinResult::Handled(p.clone());
-                    }
-                }
-            }
-            let sid = heap.alloc_string("config");
-            return BuiltinResult::Handled(Value::Object(Some(sid)));
-        } else if method_name == "toFile" {
-            let fid = heap.alloc(JavaObject::Instance {
-                class_name: "java/io/File".into(),
-                fields: HashMap::new(),
-            });
-            return BuiltinResult::Handled(Value::Object(Some(fid)));
-        }
-    }
-
-    if class_name == "java/nio/file/Paths" && method_name == "get" {
-        let sid = heap.alloc_string("config");
-        let mut fields = HashMap::new();
-        fields.insert("path".into(), Value::Object(Some(sid)));
-        let id = heap.alloc(JavaObject::Instance {
-            class_name: "java/nio/file/Path".into(),
-            fields,
-        });
-        return BuiltinResult::Handled(Value::Object(Some(id)));
-    }
-
     if class_name == "jdk/internal/util/ReferencedKeyMap" && method_name == "removeStaleReferences"
     {
         return BuiltinResult::Handled(Value::NULL);
@@ -4830,6 +4900,22 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 11. Logging: org/slf4j & org/apache/logging/log4j
     // -------------------------------------------------------------
+    // Netty's own logger factory is the one Minecraft's connection code and
+    // Netty's leak detector build their loggers from; it answers a logger the
+    // same way slf4j's factory does.
+    if class_name == "io/netty/util/internal/logging/InternalLoggerFactory"
+        && (method_name == "getInstance" || method_name == "newInstance")
+    {
+        let mut fields = HashMap::new();
+        let nid = heap.alloc_string("HFC");
+        fields.insert("name".into(), Value::Object(Some(nid)));
+        let lid = heap.alloc(JavaObject::Instance {
+            class_name: "io/netty/util/internal/logging/InternalLogger".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(lid)));
+    }
+
     if (class_name == "org/slf4j/LoggerFactory"
         || class_name == "org/apache/logging/log4j/LogManager"
         || class_name == "org/apache/log4j/LogManager")
@@ -4885,6 +4971,23 @@ pub fn dispatch_builtin(
     // 12. Fabric Loader API
     // -------------------------------------------------------------
     if class_name == "net/fabricmc/loader/api/FabricLoader" {
+        // The loader's directories are the game folder the runtime runs in.
+        if matches!(method_name, "getConfigDir" | "getGameDir") {
+            let dir = crate::fs_builtins::game_dir(heap);
+            let path = if method_name == "getConfigDir" {
+                crate::vfs::join(&dir, "config")
+            } else {
+                dir
+            };
+            let text = heap.alloc_string(path);
+            let mut fields = HashMap::new();
+            fields.insert("path".to_string(), Value::Object(Some(text)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/nio/file/Path".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
         if method_name == "getInstance" {
             let id = heap.alloc(JavaObject::Instance {
                 class_name: "net/fabricmc/loader/api/FabricLoader".into(),
@@ -5269,9 +5372,15 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 13. Fabric Event API: EventFactory & Event
     // -------------------------------------------------------------
-    if class_name.contains("networking")
-        || class_name.contains("Networking")
-        || class_name.starts_with("net/fabricmc/fabric/api/command")
+    // Fabric's networking and command APIs are host-side: a packet is never
+    // sent and a command is never run, so their registration calls do nothing.
+    // Constructors and static initializers are not registration calls: they
+    // must run their own bytecode, or a class's event/registry statics stay
+    // null.
+    if !matches!(method_name, "<init>" | "<clinit>")
+        && (class_name.contains("networking")
+            || class_name.contains("Networking")
+            || class_name.starts_with("net/fabricmc/fabric/api/command"))
     {
         if method_name.starts_with("register") || method_name == "isSupported" {
             return BuiltinResult::Handled(Value::Int(1));
@@ -7299,6 +7408,42 @@ pub fn dispatch_builtin(
             }
             _ => {}
         }
+    }
+    // A `BlockState` the runtime models carries `propertyKeys`/`propertyValues`;
+    // `StateHolder.getValue(property)` reads them so a mod's `tick` or
+    // `getStateForPlacement` gets the value the state was built with.
+    if matches!(
+        class_name,
+        "net/minecraft/world/level/block/state/BlockState"
+            | "net/minecraft/world/level/block/state/StateHolder"
+            | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+    ) && method_name == "getValue"
+        && args.len() == 2
+    {
+        let (keys, values) = match args[0].as_obj().and_then(|id| heap.get(id)) {
+            Some(JavaObject::Instance { fields, .. }) => (
+                fields.get("propertyKeys").and_then(Value::as_obj),
+                fields.get("propertyValues").and_then(Value::as_obj),
+            ),
+            _ => (None, None),
+        };
+        let (Some(keys), Some(values)) = (keys, values) else {
+            return BuiltinResult::NotHandled;
+        };
+        let keys = match heap.get(keys) {
+            Some(JavaObject::Array { elements, .. }) => elements.clone(),
+            _ => return BuiltinResult::NotHandled,
+        };
+        let values = match heap.get(values) {
+            Some(JavaObject::Array { elements, .. }) => elements.clone(),
+            _ => return BuiltinResult::NotHandled,
+        };
+        if let Some(position) = keys.iter().position(|key| *key == args[1]) {
+            return BuiltinResult::Handled(
+                values.get(position).cloned().unwrap_or(Value::NULL),
+            );
+        }
+        return BuiltinResult::NotHandled;
     }
     if class_name == "net/minecraft/world/item/ItemStack" {
         if method_name == "getItem" && !args.is_empty() {

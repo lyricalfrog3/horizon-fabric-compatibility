@@ -241,6 +241,13 @@ impl Interpreter {
             "()Ljava/util/Iterator;",
             std::slice::from_ref(collection),
         )?;
+        // The call returned because the collection threw: reading it as an
+        // empty collection would hide the failure.
+        if let Some(exception) = self.pending_exception.take() {
+            let text = self.describe_exception(&exception);
+            self.pending_exception = Some(exception);
+            return Err(failure(format!("iterating threw {text}")));
+        }
         let mut items = Vec::new();
         while self
             .execute_method(

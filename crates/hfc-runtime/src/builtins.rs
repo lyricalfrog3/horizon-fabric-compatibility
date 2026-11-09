@@ -1475,6 +1475,77 @@ fn builtin_registry_method(
         // registries the runtime has no vanilla contents, so it yields what was
         // registered in code — which is what vanilla's own initializers do
         // (`Fluids` registers its fluids, then walks the registry it filled).
+        // `HolderGetter.get(TagKey)` / `getOrThrow(TagKey)` on a built-in
+        // registry: a tag's members when the host's snapshot has it, and
+        // `Optional.empty()` when it does not — which is what the JDK's
+        // `getOrThrow` turns into its "Missing tag" error. Answering a present
+        // but *empty* set instead made vanilla's own `getOrThrow` succeed and
+        // hide the gap.
+        ("get", 2) | ("getOrThrow", 2)
+            if args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<TagKey>(id))
+                .is_some() =>
+        {
+            let tag = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<TagKey>(id))
+                .map(|tag| tag.id.clone())?;
+            let full = if tag.contains(':') {
+                tag
+            } else {
+                format!("minecraft:{tag}")
+            };
+            let members = heap.registries.tag_members(&kind, &full);
+            if members.is_empty() {
+                if method_name == "getOrThrow" {
+                    return handled(Value::NULL);
+                }
+                let mut fields = HashMap::new();
+                fields.insert("present".to_string(), Value::from_bool(false));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Optional".into(),
+                    fields,
+                });
+                return handled(Value::Object(Some(id)));
+            }
+            let holders: Vec<Value> = members
+                .iter()
+                .map(|member| {
+                    let (namespace, path) = member
+                        .split_once(':')
+                        .unwrap_or(("minecraft", member.as_str()));
+                    let (namespace, path) = (namespace.to_string(), path.to_string());
+                    let location = heap.alloc_identifier(&namespace, &path);
+                    let key = resource_key(heap, &kind, location);
+                    registry_holder(heap, Some(key), Value::NULL)
+                })
+                .map(|id| Value::Object(Some(id)))
+                .collect();
+            let named = {
+                let tag_value = args[1].clone();
+                let list = heap.alloc_list(holders);
+                let mut fields = HashMap::new();
+                fields.insert("key".to_string(), tag_value);
+                fields.insert("list".to_string(), Value::Object(Some(list)));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/core/HolderSet$Named".into(),
+                    fields,
+                });
+                Value::Object(Some(id))
+            };
+            if method_name == "getOrThrow" {
+                return handled(named);
+            }
+            let mut fields = HashMap::new();
+            fields.insert("present".to_string(), Value::from_bool(true));
+            fields.insert("value".to_string(), named);
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields,
+            });
+            handled(Value::Object(Some(id)))
+        }
         ("iterator" | "stream", 1) => {
             let values = registry_values(heap, &kind);
             let value = if method_name == "stream" {

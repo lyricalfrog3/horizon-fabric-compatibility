@@ -158,23 +158,45 @@ configure a mod the way they do in the real game (`tests/config_files.rs` pins t
 Right Click Harvest and Legendary Tooltips write). Unresolved calls returning defaults is also why a test can pass without a feature
 working; check `Interpreter::missing` (set `trace_missing`) before claiming a path runs.
 
-Exceptions are frame-local. The Code attribute's exception table is read, and `athrow`,
-array index/null errors and integer division by zero run a handler of the *same method* that
-covers them (`catch_locally`). An exception nothing in that method catches does not unwind into
-the caller: the method ends, or the opcode takes its old lenient result. Full unwinding was tried
-and reverted: the real JDK, Netty, joml and Minecraft code a mod pulls in throws dozens of
-exceptions the runtime otherwise answers with defaults (`Pattern.compile`,
-`Class.getDeclaredMethod`, `StackWalker`, Jankson in JamLib's config save, ...), and unwinding
-them aborted static initializers, including Right Click Harvest's config. Those need real host
-boundaries first; each is a place where the runtime is still wrong, not only silent.
+### Exceptions
+
+A thrown value unwinds. `athrow` takes the object and looks for a handler of the *current* frame
+that covers the throw point and accepts it through the real class hierarchy; with no such handler
+the exception becomes the interpreter's pending exception and the frame ends, so the caller checks
+its own covering handlers at the call site (`Interpreter::fault_is_caught`). A `finally` is the
+catch-all entry of the exception table, so it runs on the way out. Leaving a class initializer
+turns anything but an `Error` into `ExceptionInInitializerError`, as a JVM does.
+
+The exceptions are the JDK's own classes, built by their own `(String)`/`(Throwable)`
+constructors, so `getMessage`, `getCause`, `getClass().getSimpleName()` and `toString` are the
+real answers. The JVM-defined ones are raised where the runtime used to answer a default:
+`NullPointerException` (naming the receiver or field), `ClassCastException`,
+`ArrayIndexOutOfBoundsException`, `NegativeArraySizeException` and
+`ArithmeticException: / by zero`. A class whose initializer throws fails once with
+`ExceptionInInitializerError` (cause attached) and answers `NoClassDefFoundError` after that.
+
+Two boundaries keep the runtime honest without turning its own gaps into mod failures:
+
+- **A fault the interpreter detects** (division by zero, a null receiver, array bounds, a bad cast)
+  is only thrown when a handler on the interpreted stack would catch it. On a JVM the fault would
+  end the call, but here the null or the stand-in behind it almost always comes from something the
+  runtime does not model yet, and throwing it would abort the entrypoint. When nothing would catch
+  it, the instruction keeps its lenient answer and the gap shows in `Interpreter::missing`. A cast
+  or a field store is only checked when both the value's class and the target are real classes the
+  loader has, for the same reason.
+- **An exception escaping a host call** (an entrypoint, an event listener, a bridge method) has no
+  caller to unwind into, so it is reported as `class.method threw X` instead of being handed back
+  as a default result. The one exception is a failure the runtime caused itself (a symbol it
+  lacks): that is logged with the symbol and does not poison the class, because a JVM would never
+  have taken that path.
 
 A differential suite ([`tests/jvm_diff.rs`](../../crates/hfc-runtime/tests/jvm_diff.rs)) compiles small
 Java programs from `crates/hfc-runtime/tests/jvm/` and runs each on the machine's JVM and in the
 interpreter over the JDK image the client uses, comparing their labelled output.
 [`tests/jvm/known_divergences.toml`](../../crates/hfc-runtime/tests/jvm/known_divergences.toml) is
-the maintained list of what the interpreter still gets wrong (exception unwinding, Java's float
-and concatenation formatting, JDK collection printing); it may only shrink, and each entry is a
-bug in the general path.
+the maintained list of what the interpreter still gets wrong (Java's float and concatenation
+formatting, a `super.field` read, records, immutable collections); it may only shrink, and each
+entry is a bug in the general path.
 
 Other known gaps found by running Veinminer (Kotlin): a null that would throw in a JVM still
 loops (Kotlin's null-parameter message walks an empty stack trace), and there are no real threads,

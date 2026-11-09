@@ -350,6 +350,12 @@ impl Interpreter {
                             .collect();
                         Some(self.array_of("java/lang/Class", classes))
                     }
+                    // A JVM without `-ea` disables assertions; the runtime
+                    // makes no assertion checks, so it reports them disabled
+                    // (JDK classes gate their `assert` bodies on this).
+                    "desiredAssertionStatus" | "desiredAssertionStatus0" => {
+                        Some(Value::from_bool(false))
+                    }
                     "isInterface" => Some(Value::from_bool(
                         self.loader.get_or_load_mut(&class).ok()??.is_interface,
                     )),

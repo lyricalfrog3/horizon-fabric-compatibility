@@ -105,6 +105,17 @@ monotonic `nanoTime`, `Runtime.availableProcessors`, `String.intern` and the flo
 conversions come from the host with the values a JVM reports. Mods' config files are read and
 written through it.
 
+Java exceptions propagate. A `throw` unwinds frame by frame until a caller's `catch` covers the
+call site (`finally` runs on the way out), catch types match through the real class hierarchy, and
+the exceptions are the JDK's own classes, so `getMessage`/`getCause` are real. The faults a JVM
+raises are raised here too where the runtime used to answer a default — a null receiver, a bad
+cast, an array index, a negative array size, `/ by zero` — a failed static initializer answers
+`ExceptionInInitializerError` then `NoClassDefFoundError`, and an exception escaping an entrypoint
+is reported as `class.method threw X` rather than passed back as a default. A fault the runtime
+detects is only thrown when something would catch it: the null behind it usually comes from a part
+of Minecraft the runtime does not model yet, and the interpreter records that gap instead of
+aborting the mod.
+
 The runtime's own lists, maps and sets behave as the JDK classes they stand for: whatever the
 collection builtins do not answer runs as `AbstractList`/`AbstractSet`/`AbstractMap` bytecode
 (`toString`, `listIterator`, `equals`, `List.sort`), `TreeMap`/`TreeSet` and the JDK's

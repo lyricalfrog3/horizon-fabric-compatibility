@@ -639,14 +639,16 @@ fn farmers_delight_food_its_tab_and_blocks_are_exported() {
         .expect("the canvas sign is a block");
     assert!(!sign.states.is_empty(), "{sign:?}");
     assert!(sign.unreadable.is_empty(), "{:?}", sign.unreadable);
-    // `BlockStateProperties.HALF` is an enum (lower/upper), not a boolean.
+    // `BlockStateProperties.HALF` is an enum (upper/lower), not a boolean.
+    // `DoubleBlockHalf` declares UPPER then LOWER, and `EnumProperty.create`
+    // keeps `getEnumConstants()` order, so the real game answers upper first.
     let rice = blocks
         .iter()
         .find(|block| block.id == "farmersdelight:wild_rice")
         .expect("wild rice is a block");
     assert_eq!(
         rice.properties.get("half"),
-        Some(&vec!["lower".to_string(), "upper".to_string()]),
+        Some(&vec!["upper".to_string(), "lower".to_string()]),
         "{rice:?}"
     );
 

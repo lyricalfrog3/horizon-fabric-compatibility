@@ -2,6 +2,8 @@ use hfc_runtime::bridge::{FabricBridge, Flow, HostBridge, RightClickBlockEvent};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+mod common;
+
 #[derive(Default)]
 struct MockHost {
     blocks: HashMap<[i32; 3], (String, HashMap<String, String>)>,
@@ -47,7 +49,12 @@ fn test_fabric_bridge_right_click_harvest() {
     host.blocks
         .insert([5, 64, 5], ("minecraft:wheat".into(), props));
 
-    let mut bridge = FabricBridge::new();
+    // The mods' bytecode runs against the real Minecraft and JDK classes;
+    // without an installation the test has nothing real to run on.
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        eprintln!("skipping: no Minecraft installation");
+        return;
+    };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -113,7 +120,12 @@ fn test_fabric_bridge_immature_crop_passes() {
     host.blocks
         .insert([5, 64, 5], ("minecraft:wheat".into(), props));
 
-    let mut bridge = FabricBridge::new();
+    // The mods' bytecode runs against the real Minecraft and JDK classes;
+    // without an installation the test has nothing real to run on.
+    let Some(mut bridge) = common::bridge_with_vanilla() else {
+        eprintln!("skipping: no Minecraft installation");
+        return;
+    };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

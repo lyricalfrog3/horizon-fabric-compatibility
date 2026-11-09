@@ -53,6 +53,19 @@ fn alloc_path(heap: &mut Heap, path: &str) -> Value {
     Value::Object(Some(id))
 }
 
+/// The `jar:` provider Minecraft's `Util` looks for: the runtime reads jar
+/// entries itself, so this only names the scheme.
+fn jar_provider(heap: &mut Heap) -> Value {
+    let mut fields = HashMap::new();
+    let scheme = heap.alloc_string("jar");
+    fields.insert("scheme".to_string(), Value::Object(Some(scheme)));
+    let id = heap.alloc(JavaObject::Instance {
+        class_name: "java/nio/file/spi/FileSystemProvider".into(),
+        fields,
+    });
+    Value::Object(Some(id))
+}
+
 fn alloc_bytes(heap: &mut Heap, bytes: &[u8]) -> Value {
     let id = heap.alloc(JavaObject::Array {
         elem_type: "byte".into(),
@@ -157,6 +170,87 @@ fn unix_file_system(
     match method_name {
         // The constructor's `static { initIDs(); }`; nothing to register here.
         "initIDs" | "registerNatives" => handled(Value::NULL),
+        // `File` keeps its path exactly as given (normalized) and asks these
+        // for the directory part; `File.getParent`, `getParentFile` and
+        // everything built on them need them answered.
+        "getSeparator" => handled(Value::Int('/' as i32)),
+        "getPathSeparator" => handled(Value::Int(':' as i32)),
+        "normalize" => {
+            let text = file_path(heap, args.get(1)?)?;
+            let mut out = String::with_capacity(text.len());
+            for ch in text.chars() {
+                if ch == '/' && out.ends_with('/') && out.len() > 1 {
+                    continue;
+                }
+                out.push(ch);
+            }
+            if out.len() > 1 && out.ends_with('/') {
+                out.pop();
+            }
+            let sid = heap.alloc_string(out);
+            handled(Value::Object(Some(sid)))
+        }
+        // A Unix path has a one-character prefix (`/`) when it is absolute.
+        "prefixLength" => {
+            let text = file_path(heap, args.get(1)?)?;
+            handled(Value::Int(i32::from(text.starts_with('/'))))
+        }
+        "resolve" if args.len() == 3 => {
+            // resolve(parent, child): an absolute child stands on its own.
+            let parent = file_path(heap, &args[1])?;
+            let child = file_path(heap, &args[2])?;
+            let joined = if child.starts_with('/') {
+                child
+            } else if parent.is_empty() {
+                child
+            } else {
+                vfs::join(&parent, &child)
+            };
+            let sid = heap.alloc_string(joined);
+            handled(Value::Object(Some(sid)))
+        }
+        "resolve" => {
+            // resolve(File): the file's absolute path — a relative one is
+            // resolved against the working directory, as `File.getAbsolutePath`
+            // reports.
+            let text = file_path(heap, args.get(1)?)?;
+            let absolute = if text.starts_with('/') {
+                text
+            } else {
+                vfs::join(&game_dir(heap), &text)
+            };
+            let sid = heap.alloc_string(absolute);
+            handled(Value::Object(Some(sid)))
+        }
+        "getDefaultParent" => {
+            let sid = heap.alloc_string("/");
+            handled(Value::Object(Some(sid)))
+        }
+        "fromURIPath" => {
+            let mut text = file_path(heap, args.get(1)?)?;
+            if text.len() > 1 && text.ends_with('/') {
+                text.pop();
+            }
+            let sid = heap.alloc_string(text);
+            handled(Value::Object(Some(sid)))
+        }
+        "isAbsolute" => {
+            let text = file_path(heap, args.get(1)?)?;
+            handled(Value::from_bool(text.starts_with('/')))
+        }
+        "isInvalid" => handled(Value::from_bool(false)),
+        // The working directory of the "process": the game folder.
+        "getCWD" => {
+            let dir = game_dir(heap);
+            let sid = heap.alloc_string(dir);
+            let mut fields = HashMap::new();
+            fields.insert("path".to_string(), Value::Object(Some(sid)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/io/File".into(),
+                fields,
+            });
+            handled(Value::Object(Some(id)))
+        }
         "canonicalize0" | "canonicalize" => {
             let path = path(1)?;
             let sid = heap.alloc_string(heap.fs.canonicalize(&path));
@@ -362,11 +456,31 @@ pub fn file_system_method(
         "java/nio/file/FileSystems" if method_name == "getDefault" => {
             handled(inert(heap, "java/nio/file/FileSystem"))
         }
-        // The runtime's file system is not built from JDK providers, so there
-        // is none to list (no `jar:` provider either: jar entries are read by
-        // the runtime's own paths). A caller looking for one finds it absent.
+        // The runtime's own file system is not a JDK provider, but Minecraft's
+        // `Util` looks one up by scheme for `jar:` and throws when there is
+        // none. The runtime reads jar entries itself, so the provider it is
+        // given is the one that answers for the runtime: it names the scheme
+        // and hands out the runtime's file system, and reads nothing itself.
         "java/nio/file/spi/FileSystemProvider" if method_name == "installedProviders" => {
-            handled(Value::Object(Some(heap.alloc_list(Vec::new()))))
+            let provider = jar_provider(heap);
+            handled(Value::Object(Some(heap.alloc_list(vec![provider]))))
+        }
+        // The provider object's own methods (Minecraft asks `getScheme`).
+        "java/nio/file/spi/FileSystemProvider" => {
+            let scheme = args
+                .first()
+                .and_then(|value| value.as_obj())
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get("scheme").cloned(),
+                    _ => None,
+                });
+            match (method_name, scheme) {
+                ("getScheme", Some(scheme)) => handled(scheme),
+                ("newFileSystem" | "getFileSystem" | "getPath", Some(_)) => {
+                    handled(inert(heap, "java/nio/file/FileSystem"))
+                }
+                _ => return None,
+            }
         }
         "java/nio/file/FileSystem" if method_name == "newWatchService" => {
             handled(inert(heap, "java/nio/file/WatchService"))

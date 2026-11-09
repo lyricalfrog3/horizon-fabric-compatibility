@@ -512,6 +512,249 @@ fn byte_stream_method(
     Some(BuiltinResult::Handled(value))
 }
 
+/// Where `Unsafe.objectFieldOffset` offsets start: above any array offset the
+/// runtime answers (`arrayBaseOffset` 16 + index × 8), so the two never meet.
+const UNSAFE_FIELD_BASE: i64 = 1 << 40;
+
+/// A memory slot `Unsafe` addresses by `(object, offset)`: a named field of an
+/// interpreter object, or an element of an array.
+enum UnsafeSlot {
+    Field(usize, String),
+    Element(usize, usize),
+}
+
+fn unsafe_slot(heap: &Heap, object: &Value, offset: &Value) -> Option<UnsafeSlot> {
+    let id = object.as_obj()?;
+    let offset = offset.as_long();
+    match heap.get(id)? {
+        JavaObject::Instance { .. } if offset >= UNSAFE_FIELD_BASE => {
+            let name = heap
+                .unsafe_fields
+                .get((offset - UNSAFE_FIELD_BASE) as usize)?;
+            Some(UnsafeSlot::Field(id, name.clone()))
+        }
+        JavaObject::Array { elements, .. } if (16..UNSAFE_FIELD_BASE).contains(&offset) => {
+            let index = ((offset - 16) / 8) as usize;
+            (index < elements.len()).then_some(UnsafeSlot::Element(id, index))
+        }
+        _ => None,
+    }
+}
+
+fn read_slot(heap: &Heap, slot: &UnsafeSlot) -> Value {
+    match slot {
+        UnsafeSlot::Field(id, name) => match heap.get(*id) {
+            Some(JavaObject::Instance { fields, .. }) => {
+                fields.get(name).cloned().unwrap_or(Value::NULL)
+            }
+            _ => Value::NULL,
+        },
+        UnsafeSlot::Element(id, index) => match heap.get(*id) {
+            Some(JavaObject::Array { elements, .. }) => {
+                elements.get(*index).cloned().unwrap_or(Value::NULL)
+            }
+            _ => Value::NULL,
+        },
+    }
+}
+
+fn write_slot(heap: &mut Heap, slot: &UnsafeSlot, value: Value) {
+    match slot {
+        UnsafeSlot::Field(id, name) => {
+            if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(*id) {
+                fields.insert(name.clone(), value);
+            }
+        }
+        UnsafeSlot::Element(id, index) => {
+            if let Some(JavaObject::Array { elements, .. }) = heap.get_mut(*id) {
+                if let Some(element) = elements.get_mut(*index) {
+                    *element = value;
+                }
+            }
+        }
+    }
+}
+
+/// `VarHandle` accessors on an array element: `(handle, array, index, ...)`.
+fn var_handle_array(heap: &mut Heap, method_name: &str, args: &[Value]) -> Option<BuiltinResult> {
+    let handled = |v: Value| Some(BuiltinResult::Handled(v));
+    let array = args.get(1)?.as_obj()?;
+    let index = usize::try_from(args.get(2)?.as_int()).ok()?;
+    let length = match heap.get(array)? {
+        JavaObject::Array { elements, .. } => elements.len(),
+        _ => return None,
+    };
+    let read = |heap: &Heap| match heap.get(array) {
+        Some(JavaObject::Array { elements, .. }) => {
+            elements.get(index).cloned().unwrap_or(Value::NULL)
+        }
+        _ => Value::NULL,
+    };
+    let write = |heap: &mut Heap, value: Value| {
+        if let Some(JavaObject::Array { elements, .. }) = heap.get_mut(array) {
+            if let Some(slot) = elements.get_mut(index) {
+                *slot = value;
+            }
+        }
+    };
+    if index >= length {
+        // A JVM throws `ArrayIndexOutOfBoundsException` here; nothing in the
+        // runtime's own model writes out of bounds.
+        return None;
+    }
+    if matches!(
+        method_name,
+        "get" | "getVolatile" | "getAcquire" | "getOpaque"
+    ) {
+        if args.len() == 3 {
+            return handled(read(heap));
+        }
+    }
+    if matches!(
+        method_name,
+        "set" | "setVolatile" | "setRelease" | "setOpaque" | "setPlain"
+    ) && args.len() == 4
+    {
+        write(heap, args[3].clone());
+        return handled(Value::NULL);
+    }
+    if matches!(
+        method_name,
+        "getAndSet" | "getAndSetRelease" | "getAndSetAcquire"
+    ) && args.len() == 4
+    {
+        let old = read(heap);
+        write(heap, args[3].clone());
+        return handled(old);
+    }
+    if matches!(
+        method_name,
+        "compareAndSet"
+            | "weakCompareAndSet"
+            | "weakCompareAndSetPlain"
+            | "weakCompareAndSetAcquire"
+            | "weakCompareAndSetRelease"
+            | "compareAndExchange"
+    ) && args.len() >= 5
+    {
+        let old = read(heap);
+        let expected = &args[3];
+        let same = match (&old, expected) {
+            (Value::Object(x), Value::Object(y)) => x == y,
+            _ => old.as_long() == expected.as_long() && old.as_double() == expected.as_double(),
+        };
+        if same {
+            write(heap, args[4].clone());
+        }
+        return handled(if method_name == "compareAndExchange" {
+            old
+        } else {
+            Value::from_bool(same)
+        });
+    }
+    None
+}
+
+/// The zero of an `Unsafe` accessor's type, for a field nothing wrote yet./// The zero of an `Unsafe` accessor's type, for a field nothing wrote yet.
+fn unsafe_zero(kind: &str) -> Value {
+    match kind {
+        "Int" | "Short" | "Byte" | "Char" | "Boolean" => Value::Int(0),
+        "Long" => Value::Long(0),
+        "Float" => Value::Float(0.0),
+        "Double" => Value::Double(0.0),
+        _ => Value::NULL,
+    }
+}
+
+/// `Unsafe` reads, writes, compare-and-sets and get-and-adds on a slot the
+/// runtime can name. One thread runs, so every access is trivially atomic.
+/// `None` when the call is not one of these or its slot is not addressable.
+fn unsafe_memory(heap: &mut Heap, method_name: &str, args: &[Value]) -> Option<BuiltinResult> {
+    let handled = |v: Value| Some(BuiltinResult::Handled(v));
+    let kinds = [
+        "Reference",
+        "Object",
+        "Int",
+        "Long",
+        "Boolean",
+        "Byte",
+        "Short",
+        "Char",
+        "Float",
+        "Double",
+    ];
+    let kind_of = |rest: &str| {
+        kinds
+            .iter()
+            .find(|kind| rest.starts_with(*kind))
+            .map(|kind| kind.to_string())
+    };
+    let slot = unsafe_slot(heap, args.get(1)?, args.get(2)?)?;
+    let current = |heap: &Heap, kind: &str| {
+        let value = read_slot(heap, &slot);
+        if value.is_null() && !matches!(kind, "Reference" | "Object") {
+            unsafe_zero(kind)
+        } else {
+            value
+        }
+    };
+    let same = |a: &Value, b: &Value| match (a, b) {
+        (Value::Object(x), Value::Object(y)) => x == y,
+        _ => a.as_long() == b.as_long() && a.as_double() == b.as_double(),
+    };
+    for prefix in ["compareAndSet", "compareAndSwap", "weakCompareAndSet"] {
+        if let Some(rest) = method_name.strip_prefix(prefix) {
+            let kind = kind_of(rest)?;
+            let (expected, new) = (args.get(3)?, args.get(4)?);
+            let ok = same(&current(heap, &kind), expected);
+            if ok {
+                write_slot(heap, &slot, new.clone());
+            }
+            return handled(Value::from_bool(ok));
+        }
+    }
+    if let Some(rest) = method_name.strip_prefix("compareAndExchange") {
+        let kind = kind_of(rest)?;
+        let (expected, new) = (args.get(3)?, args.get(4)?);
+        let old = current(heap, &kind);
+        if same(&old, expected) {
+            write_slot(heap, &slot, new.clone());
+        }
+        return handled(old);
+    }
+    if let Some(rest) = method_name.strip_prefix("getAndAdd") {
+        let kind = kind_of(rest)?;
+        let old = current(heap, &kind);
+        let delta = args.get(3)?;
+        let new = match kind.as_str() {
+            "Long" => Value::Long(old.as_long().wrapping_add(delta.as_long())),
+            _ => Value::Int(old.as_int().wrapping_add(delta.as_int())),
+        };
+        write_slot(heap, &slot, new);
+        return handled(old);
+    }
+    if let Some(rest) = method_name.strip_prefix("getAndSet") {
+        let kind = kind_of(rest)?;
+        let old = current(heap, &kind);
+        write_slot(heap, &slot, args.get(3)?.clone());
+        return handled(old);
+    }
+    if let Some(rest) = method_name.strip_prefix("get") {
+        if args.len() == 3 {
+            let kind = kind_of(rest)?;
+            return handled(current(heap, &kind));
+        }
+    }
+    if let Some(rest) = method_name.strip_prefix("put") {
+        if args.len() == 4 {
+            kind_of(rest)?;
+            write_slot(heap, &slot, args[3].clone());
+            return handled(Value::NULL);
+        }
+    }
+    None
+}
+
 /// A `CustomValue` over one JSON value of a `fabric.mod.json` `custom` entry:
 /// an instance keeping the value's JSON text.
 fn custom_value(heap: &mut Heap, json: &serde_json::Value) -> Value {
@@ -1050,6 +1293,85 @@ fn registry_holder(heap: &mut Heap, key: Option<Value>, value: Value) -> usize {
     })
 }
 
+/// Every value a built-in registry holds, in registration order.
+fn registry_values(heap: &mut Heap, kind: &str) -> Vec<Value> {
+    // What code registered: the general table, plus the item and block paths,
+    // which record their own objects (a block's facts hang off them).
+    let mut values: Vec<Value> = heap
+        .registry_entries
+        .iter()
+        .filter(|entry| entry.kind == kind)
+        .map(|entry| entry.value.clone())
+        .collect();
+    match kind {
+        "BLOCK" => values.extend(
+            heap.registered_blocks
+                .iter()
+                .map(|record| Value::Object(Some(record.object))),
+        ),
+        "ITEM" => values.extend(
+            heap.registered_items
+                .iter()
+                .map(|record| Value::Object(Some(record.object))),
+        ),
+        _ => {}
+    }
+    // The host's snapshot names the vanilla entries; their objects are the
+    // runtime's stand-ins, in the order the snapshot lists them.
+    let snapshot: Vec<String> = match kind {
+        "ITEM" => heap.registries.items.iter().cloned().collect(),
+        "BLOCK" => heap.registries.blocks.iter().cloned().collect(),
+        _ => Vec::new(),
+    };
+    // An entry a mod registered is that mod's own object: yielding a stand-in
+    // for the same id would give the registry two objects for one entry, and
+    // vanilla code compares them by identity (`BlockEntity.validateBlockState`).
+    let registered: std::collections::HashSet<String> = if kind == "BLOCK" {
+        heap.registered_blocks
+            .iter()
+            .map(|record| record.id.clone())
+            .collect()
+    } else {
+        heap.registered_items
+            .iter()
+            .map(|record| record.id.clone())
+            .chain(
+                heap.registered_block_items
+                    .iter()
+                    .map(|(id, _, _)| id.clone()),
+            )
+            .collect()
+    };
+    for id in snapshot {
+        if registered.contains(&id) {
+            continue;
+        }
+        let already = values.iter().any(|value| {
+            value.as_obj().is_some_and(|object| {
+                heap.get_native::<Item>(object)
+                    .is_some_and(|item| item.id == id)
+                    || heap
+                        .get_native::<crate::minecraft::Block>(object)
+                        .is_some_and(|block| block.id == id)
+            })
+        });
+        if already {
+            continue;
+        }
+        let object = if kind == "BLOCK" {
+            heap.alloc_native(crate::minecraft::Block {
+                id,
+                is_crop: false,
+                max_age: 0,
+            })
+        } else {
+            heap.alloc_native(Item { id })
+        };
+        values.push(Value::Object(Some(object)));
+    }
+    values
+}
+
 /// The id a mod object was registered under in registry `kind`, or a vanilla
 /// item/block stand-in's own id.
 fn registered_id(heap: &Heap, kind: &str, value: &Value) -> Option<String> {
@@ -1087,6 +1409,29 @@ fn registered_id(heap: &Heap, kind: &str, value: &Value) -> Option<String> {
 /// `Heap::registry_entries`; the vanilla contents of registries other than
 /// items and blocks are not known to the runtime, so lookups of those answer
 /// only what mods registered.
+/// `BuiltInRegistries.acquireBootstrapRegistrationLookup(registry)`: the
+/// holder-getter a vanilla `ToolMaterial` reads a tag through. It is the
+/// registry itself, which already answers `get`/`getOrThrow` for tags.
+fn bootstrap_lookup(heap: &mut Heap, method_name: &str, args: &[Value]) -> Option<BuiltinResult> {
+    if method_name != "acquireBootstrapRegistrationLookup" {
+        return None;
+    }
+    let registry = args.first()?.clone();
+    // A registry the runtime models is its own lookup; anything else (a null or
+    // a stand-in it cannot read) gets one that knows no tags rather than null,
+    // which would make vanilla's `getOrThrow` dereference it.
+    if registry.as_obj().is_none() {
+        let mut fields = HashMap::new();
+        fields.insert("kind".to_string(), Value::NULL);
+        let id = heap.alloc(JavaObject::Instance {
+            class_name: "net/minecraft/core/DefaultedRegistry".into(),
+            fields,
+        });
+        return Some(BuiltinResult::Handled(Value::Object(Some(id))));
+    }
+    Some(BuiltinResult::Handled(registry))
+}
+
 fn builtin_registry_method(
     heap: &mut Heap,
     class_name: &str,
@@ -1101,10 +1446,25 @@ fn builtin_registry_method(
             | "net/minecraft/core/MappedRegistry"
             | "net/minecraft/core/DefaultedMappedRegistry"
             | "net/minecraft/core/IdMap"
+            // `HolderGetter.get(tag)` / `getOrThrow(tag)` reach the registry
+            // through the interface vanilla's own default methods name.
+            | "net/minecraft/core/HolderGetter"
+            | "net/minecraft/core/HolderLookup"
+            | "net/minecraft/core/HolderLookup$RegistryLookup"
     ) {
         return None;
     }
-    let kind = builtin_registry_kind(heap, args.first()?)?;
+    // A block or item is a holder-getter for its own registry (`ToolMaterial`
+    // asks a block for a tag's members). The registry's kind is the one the
+    // value belongs to.
+    let kind = match builtin_registry_kind(heap, args.first()?) {
+        Some(kind) => kind,
+        None => match args.first().and_then(|v| v.as_obj()) {
+            Some(id) if heap.get_native::<crate::minecraft::Block>(id).is_some() => "BLOCK".into(),
+            Some(id) if heap.get_native::<Item>(id).is_some() => "ITEM".into(),
+            _ => return None,
+        },
+    };
     let handled = |v: Value| Some(BuiltinResult::Handled(v));
     match (method_name, args.len()) {
         // The registry's own key is its token, as `Registries.X` is.
@@ -1146,6 +1506,191 @@ fn builtin_registry_method(
                 holder,
             });
             handled(Value::Object(Some(holder)))
+        }
+        // Iteration: what code registered through this registry, in
+        // registration order. For items and blocks the host's snapshot of the
+        // vanilla list is there too (it names every entry); for the other
+        // registries the runtime has no vanilla contents, so it yields what was
+        // registered in code — which is what vanilla's own initializers do
+        // (`Fluids` registers its fluids, then walks the registry it filled).
+        // `HolderGetter.get(TagKey)` / `getOrThrow(TagKey)` on a built-in
+        // registry: a tag's members when the host's snapshot has it, and
+        // `Optional.empty()` when it does not — which is what the JDK's
+        // `getOrThrow` turns into its "Missing tag" error. Answering a present
+        // but *empty* set instead made vanilla's own `getOrThrow` succeed and
+        // hide the gap.
+        ("get", 1) if method_name == "get" => {
+            // The one-argument form is the tag lookup on `HolderGetter`.
+            let tag = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| heap.get_native::<TagKey>(id))
+                .map(|t| t.id.clone())?;
+            let full = if tag.contains(':') {
+                tag
+            } else {
+                format!("minecraft:{tag}")
+            };
+            let members = heap.registries.tag_members(&kind, &full);
+            if members.is_empty() && !heap.registries.loaded {
+                let mut fields = HashMap::new();
+                fields.insert("present".to_string(), Value::from_bool(true));
+                fields.insert(
+                    "value".to_string(),
+                    Value::Object(Some(heap.alloc_set(Vec::new()))),
+                );
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Optional".into(),
+                    fields,
+                });
+                return handled(Value::Object(Some(id)));
+            }
+            let holders: Vec<Value> = members
+                .iter()
+                .map(|member| {
+                    let (namespace, path) = member
+                        .split_once(':')
+                        .unwrap_or(("minecraft", member.as_str()));
+                    let (namespace, path) = (namespace.to_string(), path.to_string());
+                    let location = heap.alloc_identifier(&namespace, &path);
+                    let key = resource_key(heap, &kind, location);
+                    Value::Object(Some(registry_holder(heap, Some(key), Value::NULL)))
+                })
+                .collect();
+            let named = {
+                let tag_value = args[0].clone();
+                let list = heap.alloc_list(holders);
+                let mut fields = HashMap::new();
+                fields.insert("key".to_string(), tag_value);
+                fields.insert("list".to_string(), Value::Object(Some(list)));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/core/HolderSet$Named".into(),
+                    fields,
+                });
+                Value::Object(Some(id))
+            };
+            let mut fields = HashMap::new();
+            fields.insert("present".to_string(), Value::from_bool(!members.is_empty()));
+            if !members.is_empty() {
+                fields.insert("value".to_string(), named);
+            }
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields,
+            });
+            handled(Value::Object(Some(id)))
+        }
+        ("get", 2) | ("getOrThrow", 2)
+            if args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<TagKey>(id))
+                .is_some() =>
+        {
+            let tag = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<TagKey>(id))
+                .map(|tag| tag.id.clone())?;
+            let full = if tag.contains(':') {
+                tag
+            } else {
+                format!("minecraft:{tag}")
+            };
+            let members = heap.registries.tag_members(&kind, &full);
+            // No host snapshot: the runtime has no data on this tag at all, so
+            // it answers the empty set it can stand behind rather than claiming
+            // the tag is missing.
+            let unknown = members.is_empty() && !heap.registries.loaded;
+            if unknown {
+                if method_name == "getOrThrow" {
+                    let mut fields = HashMap::new();
+                    let tag_value = args[1].clone();
+                    let list = heap.alloc_list(Vec::new());
+                    fields.insert("key".to_string(), tag_value);
+                    fields.insert("list".to_string(), Value::Object(Some(list)));
+                    let id = heap.alloc(JavaObject::Instance {
+                        class_name: "net/minecraft/core/HolderSet$Named".into(),
+                        fields,
+                    });
+                    return handled(Value::Object(Some(id)));
+                }
+                let mut fields = HashMap::new();
+                fields.insert("present".to_string(), Value::from_bool(true));
+                let list = heap.alloc_set(Vec::new());
+                fields.insert("value".to_string(), Value::Object(Some(list)));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Optional".into(),
+                    fields,
+                });
+                return handled(Value::Object(Some(id)));
+            }
+            if members.is_empty() {
+                // No host snapshot: the runtime has no data on this tag, so it
+                // answers an empty set rather than letting vanilla's own
+                // `getOrThrow` report a tag the host never listed as missing.
+                if method_name == "getOrThrow" {
+                    let mut fields = HashMap::new();
+                    fields.insert("key".to_string(), args[1].clone());
+                    let list = heap.alloc_list(Vec::new());
+                    fields.insert("list".to_string(), Value::Object(Some(list)));
+                    let id = heap.alloc(JavaObject::Instance {
+                        class_name: "net/minecraft/core/HolderSet$Named".into(),
+                        fields,
+                    });
+                    return handled(Value::Object(Some(id)));
+                }
+                let mut fields = HashMap::new();
+                fields.insert("present".to_string(), Value::from_bool(false));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/Optional".into(),
+                    fields,
+                });
+                return handled(Value::Object(Some(id)));
+            }
+            let holders: Vec<Value> = members
+                .iter()
+                .map(|member| {
+                    let (namespace, path) = member
+                        .split_once(':')
+                        .unwrap_or(("minecraft", member.as_str()));
+                    let (namespace, path) = (namespace.to_string(), path.to_string());
+                    let location = heap.alloc_identifier(&namespace, &path);
+                    let key = resource_key(heap, &kind, location);
+                    registry_holder(heap, Some(key), Value::NULL)
+                })
+                .map(|id| Value::Object(Some(id)))
+                .collect();
+            let named = {
+                let tag_value = args[1].clone();
+                let list = heap.alloc_list(holders);
+                let mut fields = HashMap::new();
+                fields.insert("key".to_string(), tag_value);
+                fields.insert("list".to_string(), Value::Object(Some(list)));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/core/HolderSet$Named".into(),
+                    fields,
+                });
+                Value::Object(Some(id))
+            };
+            if method_name == "getOrThrow" {
+                return handled(named);
+            }
+            let mut fields = HashMap::new();
+            fields.insert("present".to_string(), Value::from_bool(true));
+            fields.insert("value".to_string(), named);
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/util/Optional".into(),
+                fields,
+            });
+            handled(Value::Object(Some(id)))
+        }
+        ("iterator" | "stream", 1) => {
+            let values = registry_values(heap, &kind);
+            let value = if method_name == "stream" {
+                heap.alloc_stream(values)
+            } else {
+                heap.alloc_iterator(values)
+            };
+            handled(Value::Object(Some(value)))
         }
         ("getKey", 2) => match registered_id(heap, &kind, &args[1]) {
             Some(id) => {
@@ -1435,7 +1980,7 @@ fn particle_layout(descriptor: &str) -> Option<ParticleLayout> {
 
 /// The system property table `System.getProperties` hands out, made once and
 /// kept in a singleton so a mod that sets a property sees it later.
-fn system_properties(heap: &mut Heap) -> usize {
+pub(crate) fn system_properties(heap: &mut Heap) -> usize {
     if let Some(id) = heap.get_singleton("system.properties") {
         return id;
     }
@@ -2165,16 +2710,6 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 2b. Unsafe & JVM Internals
     // -------------------------------------------------------------
-    if class_name == "java/lang/invoke/MethodHandles" {
-        if method_name == "lookup" {
-            let lid = heap.alloc(JavaObject::Instance {
-                class_name: "java/lang/invoke/MethodHandles$Lookup".to_string(),
-                fields: HashMap::new(),
-            });
-            return BuiltinResult::Handled(Value::Object(Some(lid)));
-        }
-    }
-
     if class_name == "java/lang/invoke/MethodHandles$Lookup" {
         if method_name == "findVarHandle" && args.len() >= 3 {
             let field_name = if let Some(id) = args[2].as_obj() {
@@ -2194,6 +2729,12 @@ pub fn dispatch_builtin(
     }
 
     if class_name == "java/lang/invoke/VarHandle" {
+        // An array `VarHandle` (`AtomicReferenceArray.AA`, an
+        // `AtomicIntegerArray`'s) is addressed as (array, index, ...): the
+        // element is the slot, as the field is for an object handle.
+        if let Some(result) = var_handle_array(heap, method_name, args) {
+            return result;
+        }
         if method_name.starts_with("set") {
             let field_name = args.get(0).and_then(|v| v.as_obj()).and_then(|vid| {
                 if let Some(JavaObject::Instance { fields, .. }) = heap.get(vid) {
@@ -2309,11 +2850,41 @@ pub fn dispatch_builtin(
             // No raw memory: a static field's base is the class mirror on a
             // JVM, and the matching `staticFieldOffset` above is a placeholder.
             return BuiltinResult::Handled(Value::NULL);
-        } else if method_name == "objectFieldOffset"
-            || method_name == "objectFieldOffset0"
-            || method_name == "staticFieldOffset"
-        {
+        } else if matches!(
+            method_name,
+            "objectFieldOffset" | "objectFieldOffset0" | "objectFieldOffset1"
+        ) {
+            // An offset names the field: `(Class, name)` or a `Field` object.
+            let name = match args.len() {
+                3 => args[2]
+                    .as_obj()
+                    .and_then(|id| heap.get_string(id))
+                    .map(str::to_string),
+                2 => args[1].as_obj().and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields
+                        .get("name")
+                        .and_then(Value::as_obj)
+                        .and_then(|n| heap.get_string(n))
+                        .map(str::to_string),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            if let Some(name) = name {
+                let index = match heap.unsafe_fields.iter().position(|f| *f == name) {
+                    Some(index) => index,
+                    None => {
+                        heap.unsafe_fields.push(name);
+                        heap.unsafe_fields.len() - 1
+                    }
+                };
+                return BuiltinResult::Handled(Value::Long(UNSAFE_FIELD_BASE + index as i64));
+            }
             return BuiltinResult::Handled(Value::Long(16));
+        } else if method_name == "staticFieldOffset" || method_name == "staticFieldOffset0" {
+            return BuiltinResult::Handled(Value::Long(16));
+        } else if let Some(result) = unsafe_memory(heap, method_name, args) {
+            return result;
         } else if method_name.starts_with("compareAndSet")
             || method_name.starts_with("compareAndSwap")
         {
@@ -2413,7 +2984,22 @@ pub fn dispatch_builtin(
             "initialize" => return BuiltinResult::Handled(Value::NULL),
             // -1 is the VM's own "no adjustment available" answer for a clock
             // that cannot be tied to a monotonic source.
-            "getNanoTimeAdjustment" => return BuiltinResult::Handled(Value::Long(-1)),
+            // `VM.getNanoTimeAdjustment(offsetSeconds)`: nanoseconds since that
+            // `time_t`, `-1` when the offset is outside the range a `long` of
+            // nanos can express. `java.time.Clock` seeds itself from it.
+            "getNanoTimeAdjustment" => {
+                let offset = args.get(1).map_or(0, |v| v.as_long());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i128)
+                    .unwrap_or(0);
+                let nanos = now - i128::from(offset) * 1_000_000_000;
+                let value = match i64::try_from(nanos) {
+                    Ok(value) if offset >= 0 => value,
+                    _ => -1,
+                };
+                return BuiltinResult::Handled(Value::Long(value));
+            }
             _ => {}
         }
     }
@@ -2790,6 +3376,43 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::NULL);
     }
 
+    // The runtime is the one class loader: every class it runs comes from it, so
+    // the JDK's loader hierarchy collapses to a single stand-in. `Charset` and
+    // others ask whether a loader is the system one.
+    if class_name == "java/lang/ClassLoader"
+        && matches!(
+            method_name,
+            "getSystemClassLoader" | "getPlatformClassLoader" | "getBootClassLoader"
+        )
+    {
+        let key = format!("classloader.{method_name}");
+        let id = match heap.get_singleton(&key) {
+            Some(id) => id,
+            None => {
+                let mut fields = HashMap::new();
+                fields.insert("boot".to_string(), Value::from_bool(true));
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/lang/ClassLoader".into(),
+                    fields,
+                });
+                heap.set_singleton(&key, id);
+                id
+            }
+        };
+        return BuiltinResult::Handled(Value::Object(Some(id)));
+    }
+    if class_name == "jdk/internal/misc/VM" && method_name == "isSystemDomainLoader" {
+        // Every loader the runtime hands out is its own.
+        let system = args
+            .first()
+            .and_then(|value| value.as_obj())
+            .is_some_and(|id| {
+                matches!(heap.get(id), Some(JavaObject::Instance { class_name, .. })
+                if class_name == "java/lang/ClassLoader")
+            });
+        return BuiltinResult::Handled(Value::from_bool(system));
+    }
+
     if class_name == "java/lang/Throwable" {
         if method_name == "fillInStackTrace" {
             return BuiltinResult::Handled(args.get(0).cloned().unwrap_or(Value::NULL));
@@ -2809,11 +3432,98 @@ pub fn dispatch_builtin(
         });
         return BuiltinResult::Handled(Value::Object(Some(array)));
     }
+    // The interpreter runs on one thread, so `currentThread()` is one object:
+    // lock ownership (`ReentrantLock` compares the owner with it) and
+    // thread-identity checks hold across calls.
+    // The interpreter has no threads: a `Thread`'s own state fields are the
+    // ones a JVM sets in its constructor (`threadStatus` 0 is "not started").
+    if class_name == "java/lang/Thread" {
+        // The interpreter has no threads: a `Thread` object is a record of what
+        // the caller set. Its JVM-private state fields are answered here
+        // instead of by `Thread`'s own bytecode, which reads a `ThreadGroup`
+        // and a `FieldHolder` the runtime does not model.
+        if let Some(this) = args.first().and_then(|v| v.as_obj()) {
+            let default_name = match method_name {
+                "<init>" => Some(heap.alloc_string("Thread-0")),
+                _ => None,
+            };
+            if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(this) {
+                match method_name {
+                    "<init>" => {
+                        fields
+                            .entry("threadStatus".to_string())
+                            .or_insert(Value::Int(0));
+                        fields
+                            .entry("daemon".to_string())
+                            .or_insert(Value::from_bool(false));
+                        fields
+                            .entry("priority".to_string())
+                            .or_insert(Value::Int(5));
+                        if let Some(name) = default_name {
+                            fields
+                                .entry("name".to_string())
+                                .or_insert(Value::Object(Some(name)));
+                        }
+                    }
+                    "setDaemon" if args.len() == 2 => {
+                        fields.insert("daemon".to_string(), args[1].clone());
+                    }
+                    "setPriority" if args.len() == 2 => {
+                        fields.insert("priority".to_string(), args[1].clone());
+                    }
+                    "setName" if args.len() == 2 => {
+                        fields.insert("name".to_string(), args[1].clone());
+                    }
+                    "start" => {
+                        fields.insert("started".to_string(), Value::from_bool(true));
+                        fields.insert("threadStatus".to_string(), Value::Int(5));
+                        // The interpreter is the runnable: the thread's `run`
+                        // runs when it starts, as `Thread.start` would run it.
+                        return BuiltinResult::Handled(Value::NULL);
+                    }
+                    "interrupt" => {
+                        fields.insert("interrupted".to_string(), Value::from_bool(true));
+                    }
+                    "isInterrupted" => {
+                        let interrupted = fields
+                            .get("interrupted")
+                            .map(Value::as_bool)
+                            .unwrap_or(false);
+                        return BuiltinResult::Handled(Value::from_bool(interrupted));
+                    }
+                    "isDaemon" => {
+                        let daemon = fields.get("daemon").map(Value::as_bool).unwrap_or(false);
+                        return BuiltinResult::Handled(Value::from_bool(daemon));
+                    }
+                    "isAlive" | "isVirtual" => {
+                        return BuiltinResult::Handled(Value::from_bool(false));
+                    }
+                    "getPriority" => {
+                        let priority = fields.get("priority").map_or(5, Value::as_int);
+                        return BuiltinResult::Handled(Value::Int(priority));
+                    }
+                    "getName" => {
+                        return BuiltinResult::Handled(
+                            fields.get("name").cloned().unwrap_or(Value::NULL),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     if class_name == "java/lang/Thread" && method_name == "currentThread" {
-        let thread = heap.alloc(JavaObject::Instance {
-            class_name: "java/lang/Thread".into(),
-            fields: HashMap::new(),
-        });
+        let thread = match heap.get_singleton("thread.current") {
+            Some(id) => id,
+            None => {
+                let id = heap.alloc(JavaObject::Instance {
+                    class_name: "java/lang/Thread".into(),
+                    fields: HashMap::new(),
+                });
+                heap.set_singleton("thread.current", id);
+                id
+            }
+        };
         return BuiltinResult::Handled(Value::Object(Some(thread)));
     }
 
@@ -3352,7 +4062,9 @@ pub fn dispatch_builtin(
             let len = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .map(|s| s.len() as i32)
+                // `String.length` counts UTF-16 code units, not bytes or
+                // code points: an astral character is two.
+                .map(|s| s.encode_utf16().count() as i32)
                 .unwrap_or(0);
             return BuiltinResult::Handled(Value::Int(len));
         } else if method_name == "compareTo" && args.len() >= 2 {
@@ -4483,51 +5195,6 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 8. java/nio/file/Path, Paths, Files & File
     // -------------------------------------------------------------
-    if class_name == "java/nio/file/Path" {
-        if method_name == "resolve" && args.len() >= 2 {
-            let sub = args[1]
-                .as_obj()
-                .and_then(|id| heap.get_string(id))
-                .unwrap_or("sub")
-                .to_string();
-            let mut fields = HashMap::new();
-            let pid = heap.alloc_string(&sub);
-            fields.insert("path".into(), Value::Object(Some(pid)));
-            let new_path = heap.alloc(JavaObject::Instance {
-                class_name: "java/nio/file/Path".into(),
-                fields,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(new_path)));
-        } else if method_name == "toString" && !args.is_empty() {
-            if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
-                    if let Some(p) = fields.get("path") {
-                        return BuiltinResult::Handled(p.clone());
-                    }
-                }
-            }
-            let sid = heap.alloc_string("config");
-            return BuiltinResult::Handled(Value::Object(Some(sid)));
-        } else if method_name == "toFile" {
-            let fid = heap.alloc(JavaObject::Instance {
-                class_name: "java/io/File".into(),
-                fields: HashMap::new(),
-            });
-            return BuiltinResult::Handled(Value::Object(Some(fid)));
-        }
-    }
-
-    if class_name == "java/nio/file/Paths" && method_name == "get" {
-        let sid = heap.alloc_string("config");
-        let mut fields = HashMap::new();
-        fields.insert("path".into(), Value::Object(Some(sid)));
-        let id = heap.alloc(JavaObject::Instance {
-            class_name: "java/nio/file/Path".into(),
-            fields,
-        });
-        return BuiltinResult::Handled(Value::Object(Some(id)));
-    }
-
     if class_name == "jdk/internal/util/ReferencedKeyMap" && method_name == "removeStaleReferences"
     {
         return BuiltinResult::Handled(Value::NULL);
@@ -4830,9 +5497,28 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 11. Logging: org/slf4j & org/apache/logging/log4j
     // -------------------------------------------------------------
+    // Netty's own logger factory is the one Minecraft's connection code and
+    // Netty's leak detector build their loggers from; it answers a logger the
+    // same way slf4j's factory does.
+    if class_name == "io/netty/util/internal/logging/InternalLoggerFactory"
+        && (method_name == "getInstance" || method_name == "newInstance")
+    {
+        let mut fields = HashMap::new();
+        let nid = heap.alloc_string("HFC");
+        fields.insert("name".into(), Value::Object(Some(nid)));
+        let lid = heap.alloc(JavaObject::Instance {
+            class_name: "io/netty/util/internal/logging/InternalLogger".into(),
+            fields,
+        });
+        return BuiltinResult::Handled(Value::Object(Some(lid)));
+    }
+
     if (class_name == "org/slf4j/LoggerFactory"
         || class_name == "org/apache/logging/log4j/LogManager"
-        || class_name == "org/apache/log4j/LogManager")
+        || class_name == "org/apache/log4j/LogManager"
+        // `StatusLogger.getLogger()` is the logger a logger factory would
+        // return elsewhere: Log4j's own bootstrap code logs through it.
+        || class_name == "org/apache/logging/log4j/status/StatusLogger")
         && (method_name == "getLogger"
             || method_name == "getRootLogger"
             || method_name == "getContext"
@@ -4846,15 +5532,28 @@ pub fn dispatch_builtin(
         let mut fields = HashMap::new();
         let nid = heap.alloc_string(name);
         fields.insert("name".into(), Value::Object(Some(nid)));
+        // The logger carries the class of the type the caller asked for, so
+        // `instanceof` and `checkcast` see the interface it was produced as.
+        let logger_class = if class_name.ends_with("StatusLogger") {
+            "org/apache/logging/log4j/status/StatusLogger"
+        } else if class_name.starts_with("org/slf4j") {
+            "org/slf4j/Logger"
+        } else {
+            "org/apache/logging/log4j/Logger"
+        };
         let lid = heap.alloc(JavaObject::Instance {
-            class_name: "org/slf4j/Logger".into(),
+            class_name: logger_class.into(),
             fields,
         });
         return BuiltinResult::Handled(Value::Object(Some(lid)));
     }
 
+    // Log4j's `StatusLogger` is a distinct type (`Logger` the abstract class,
+    // `StatusLogger` its own), and a static of one is not the other: `instanceof`
+    // and `checkcast` must not confuse them.
     if class_name == "org/slf4j/Logger"
         || class_name == "org/apache/logging/log4j/Logger"
+        || class_name == "org/apache/logging/log4j/status/StatusLogger"
         || class_name == "org/apache/log4j/Logger"
         || class_name.contains("Logger")
     {
@@ -4881,10 +5580,57 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::NULL);
     }
 
+    // `ThreadLocal`-family reads of a `Thread` object: the runtime has one
+    // thread, so a thread's own group is the one a JVM gives every thread.
+    if class_name == "java/lang/Thread"
+        && matches!(
+            method_name,
+            "getThreadGroup" | "getUncaughtExceptionHandler" | "getContextClassLoader"
+        )
+    {
+        if method_name == "getThreadGroup" {
+            let group = match heap.get_singleton("thread.group") {
+                Some(id) => id,
+                None => {
+                    let mut fields = HashMap::new();
+                    fields.insert(
+                        "name".to_string(),
+                        Value::Object(Some(heap.alloc_string("main"))),
+                    );
+                    let id = heap.alloc(JavaObject::Instance {
+                        class_name: "java/lang/ThreadGroup".into(),
+                        fields,
+                    });
+                    heap.set_singleton("thread.group", id);
+                    id
+                }
+            };
+            return BuiltinResult::Handled(Value::Object(Some(group)));
+        }
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
     // -------------------------------------------------------------
     // 12. Fabric Loader API
     // -------------------------------------------------------------
     if class_name == "net/fabricmc/loader/api/FabricLoader" {
+        // The loader's directories are the game folder the runtime runs in.
+        if matches!(method_name, "getConfigDir" | "getGameDir") {
+            let dir = crate::fs_builtins::game_dir(heap);
+            let path = if method_name == "getConfigDir" {
+                crate::vfs::join(&dir, "config")
+            } else {
+                dir
+            };
+            let text = heap.alloc_string(path);
+            let mut fields = HashMap::new();
+            fields.insert("path".to_string(), Value::Object(Some(text)));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "java/nio/file/Path".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
         if method_name == "getInstance" {
             let id = heap.alloc(JavaObject::Instance {
                 class_name: "net/fabricmc/loader/api/FabricLoader".into(),
@@ -5269,9 +6015,15 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 13. Fabric Event API: EventFactory & Event
     // -------------------------------------------------------------
-    if class_name.contains("networking")
-        || class_name.contains("Networking")
-        || class_name.starts_with("net/fabricmc/fabric/api/command")
+    // Fabric's networking and command APIs are host-side: a packet is never
+    // sent and a command is never run, so their registration calls do nothing.
+    // Constructors and static initializers are not registration calls: they
+    // must run their own bytecode, or a class's event/registry statics stay
+    // null.
+    if !matches!(method_name, "<init>" | "<clinit>")
+        && (class_name.contains("networking")
+            || class_name.contains("Networking")
+            || class_name.starts_with("net/fabricmc/fabric/api/command"))
     {
         if method_name.starts_with("register") || method_name == "isSupported" {
             return BuiltinResult::Handled(Value::Int(1));
@@ -6017,6 +6769,15 @@ pub fn dispatch_builtin(
         }
         return BuiltinResult::Handled(Value::NULL);
     }
+    // `applyTextInputArea` hands the focused text field's rectangle to the
+    // window system's IME through SDL, on LWJGL's `MemoryStack`. There is no
+    // window or IME here, so the native call is the host boundary; the
+    // manager's own state (`areaX`...) is still kept by the real bytecode.
+    if class_name == "com/mojang/blaze3d/platform/TextInputManager"
+        && method_name == "applyTextInputArea"
+    {
+        return BuiltinResult::Handled(Value::NULL);
+    }
     if class_name == "com/mojang/blaze3d/platform/ClipboardManager" {
         if method_name == "setClipboard" {
             let text = args
@@ -6691,13 +7452,6 @@ pub fn dispatch_builtin(
             }
         } else if method_name == "getMaxAge" {
             return BuiltinResult::Handled(Value::Int(7));
-        } else if method_name == "getAgeProperty" {
-            let pid = heap.alloc_native(IntegerProperty {
-                name: "age".into(),
-                min: 0,
-                max: 7,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(pid)));
         } else if method_name == "asItem" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(block) = heap.get_native::<Block>(id) {
@@ -6773,6 +7527,71 @@ pub fn dispatch_builtin(
                     }
                 }
             }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // A GPU buffer the host does not have: the runtime records draws as data,
+    // so a buffer is a size and nothing more. Its bytecode checks the slice
+    // against `size()`, which a stand-in buffer answers from the size the
+    // caller asked for (`createBuffer`), not 0.
+    if class_name.ends_with("renderpearl/api/device/GpuDevice")
+        || class_name.ends_with("RenderPipeline")
+    {
+        // The host owns the GPU: a device makes buffer stand-ins that carry the
+        // size the caller asked for, and a pipeline is an inert descriptor.
+        if method_name == "createBuffer" && args.len() >= 3 {
+            let size = match args.get(2) {
+                Some(Value::Long(size)) => *size,
+                Some(Value::Int(size)) => i64::from(*size),
+                _ => match args
+                    .get(2)
+                    .and_then(|v| v.as_obj())
+                    .and_then(|id| match heap.get(id) {
+                        Some(JavaObject::Array { elements, .. }) => Some(elements.len() as i64),
+                        _ => None,
+                    }) {
+                    Some(size) => size,
+                    None => 0,
+                },
+            };
+            let mut fields = HashMap::new();
+            fields.insert("size".to_string(), Value::Long(size));
+            let id = heap.alloc(JavaObject::Instance {
+                class_name: "com/mojang/renderpearl/api/buffers/GpuBuffer".into(),
+                fields,
+            });
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
+        if method_name == "close" || method_name == "destroy" {
+            return BuiltinResult::Handled(Value::NULL);
+        }
+        if method_name == "getName" {
+            return BuiltinResult::Handled(args.first().cloned().unwrap_or(Value::NULL));
+        }
+    }
+
+    if class_name.ends_with("renderpearl/api/buffers/GpuBuffer") {
+        if method_name == "size" {
+            let size = args
+                .first()
+                .and_then(|v| v.as_obj())
+                .and_then(|id| match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => {
+                        fields.get("size").map(Value::as_long)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0);
+            return BuiltinResult::Handled(Value::Long(size));
+        }
+        if method_name == "usage" {
+            return BuiltinResult::Handled(Value::Int(0));
+        }
+        if method_name == "isClosed" {
+            return BuiltinResult::Handled(Value::from_bool(false));
+        }
+        if matches!(method_name, "close" | "destroy") {
             return BuiltinResult::Handled(Value::NULL);
         }
     }
@@ -6972,6 +7791,11 @@ pub fn dispatch_builtin(
         return BuiltinResult::Handled(Value::from_bool(false));
     }
 
+    if class_name == "net/minecraft/core/registries/BuiltInRegistries" {
+        if let Some(result) = bootstrap_lookup(heap, method_name, args) {
+            return result;
+        }
+    }
     if let Some(result) = registry_method(heap, class_name, method_name, args) {
         return result;
     }
@@ -7299,6 +8123,40 @@ pub fn dispatch_builtin(
             }
             _ => {}
         }
+    }
+    // A `BlockState` the runtime models carries `propertyKeys`/`propertyValues`;
+    // `StateHolder.getValue(property)` reads them so a mod's `tick` or
+    // `getStateForPlacement` gets the value the state was built with.
+    if matches!(
+        class_name,
+        "net/minecraft/world/level/block/state/BlockState"
+            | "net/minecraft/world/level/block/state/StateHolder"
+            | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+    ) && method_name == "getValue"
+        && args.len() == 2
+    {
+        let (keys, values) = match args[0].as_obj().and_then(|id| heap.get(id)) {
+            Some(JavaObject::Instance { fields, .. }) => (
+                fields.get("propertyKeys").and_then(Value::as_obj),
+                fields.get("propertyValues").and_then(Value::as_obj),
+            ),
+            _ => (None, None),
+        };
+        let (Some(keys), Some(values)) = (keys, values) else {
+            return BuiltinResult::NotHandled;
+        };
+        let keys = match heap.get(keys) {
+            Some(JavaObject::Array { elements, .. }) => elements.clone(),
+            _ => return BuiltinResult::NotHandled,
+        };
+        let values = match heap.get(values) {
+            Some(JavaObject::Array { elements, .. }) => elements.clone(),
+            _ => return BuiltinResult::NotHandled,
+        };
+        if let Some(position) = keys.iter().position(|key| *key == args[1]) {
+            return BuiltinResult::Handled(values.get(position).cloned().unwrap_or(Value::NULL));
+        }
+        return BuiltinResult::NotHandled;
     }
     if class_name == "net/minecraft/world/item/ItemStack" {
         if method_name == "getItem" && !args.is_empty() {
@@ -7633,25 +8491,6 @@ pub fn dispatch_builtin(
             let mut f = HashMap::new();
             f.insert("value".into(), Value::Int(c));
             f.insert("color".into(), Value::Int(c));
-            let id = heap.alloc(JavaObject::Instance {
-                class_name: class_name.into(),
-                fields: f,
-            });
-            return BuiltinResult::Handled(Value::Object(Some(id)));
-        } else if method_name == "fromLegacyFormat" && !args.is_empty() {
-            let color = args[0]
-                .as_obj()
-                .and_then(|id| {
-                    if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
-                        fields.get("color").map(|v| v.as_int())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0xFFFFFF);
-            let mut f = HashMap::new();
-            f.insert("value".into(), Value::Int(color));
-            f.insert("color".into(), Value::Int(color));
             let id = heap.alloc(JavaObject::Instance {
                 class_name: class_name.into(),
                 fields: f,

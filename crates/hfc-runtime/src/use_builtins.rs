@@ -142,6 +142,17 @@ impl Interpreter {
             .cloned()
             .ok_or_else(|| failure(format!("{} has no state {key}", request.block)))?;
         let prepared = self.prepare_placement(request, world)?;
+        // The block's block entity, made the first time it is used: the mod's
+        // own code reads it (`getBlockEntity` on the level answers it), and a
+        // pot's contents live there.
+        let block_object = Value::Object(Some(block.clone()));
+        let _ = self.block_entity_at(
+            &block_object,
+            &request.block,
+            request.pos,
+            &state,
+            prepared.level,
+        );
         let initial = self
             .heap
             .get_native::<ItemStack>(prepared.stack)
@@ -154,10 +165,12 @@ impl Interpreter {
 
         let mut consumed = false;
         let mut item_outcome = None;
-        // An empty hand skips `useItemOn`: the inherited `BlockBehaviour`
-        // default answers `TRY_WITH_EMPTY_HAND` for an empty stack, so a mod
-        // override that does nothing for one is treated the same.
-        if use_item && !request.item.is_empty() && request.item != "minecraft:air" {
+        // Vanilla's `ServerPlayerGameMode.useItemOn` runs `useItemOn` with
+        // whatever the hand holds, an empty stack included: a mod's override
+        // that reacts to the empty hand (a cooking pot opening its menu, a
+        // block that only lights for a flint and steel) must see the call.
+        // Only an empty hand with no override to run skips it.
+        if use_item {
             let result = self.execute_method(
                 BLOCK,
                 "useItemOn",

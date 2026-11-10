@@ -215,6 +215,221 @@ impl super::FabricBridge {
     }
 }
 
+/// The `BlockState` object of a registered block's state, made on demand.
+/// Tests use it; nothing in the host calls it.
+#[doc(hidden)]
+impl super::FabricBridge {
+    /// The mod's own inventory on a kept block entity (`getInventory()` of a
+    /// block entity that holds an `ItemStackHandler` rather than a `Container`):
+    /// how many slots it has, for tests.
+    #[doc(hidden)]
+    pub fn debug_block_entity_inventory_slots(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+    ) -> Option<i32> {
+        let handler = self.debug_block_entity_handler(pos, block)?;
+        Some(
+            self.interp
+                .execute_method(
+                    "vectorwing/farmersdelight/refabricated/inventory/ItemStackHandler",
+                    "getSlotCount",
+                    "()I",
+                    &[handler],
+                )
+                .ok()?
+                .as_int(),
+        )
+    }
+
+    /// Put a stack in a kept block entity's own inventory slot, for a mod whose
+    /// inventory is not a `Container` (`ItemStackHandler.setStackInSlot`).
+    #[doc(hidden)]
+    pub fn debug_set_block_entity_inventory(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+        slot: i32,
+        item: &str,
+        count: i32,
+    ) {
+        let Some(handler) = self.debug_block_entity_handler(pos, block) else {
+            return;
+        };
+        let stack = self
+            .interp
+            .heap
+            .alloc_item_stack(crate::minecraft::ItemStack::new(item, count));
+        let _ = self.interp.execute_method(
+            "vectorwing/farmersdelight/refabricated/inventory/ItemStackHandler",
+            "setStackInSlot",
+            "(ILnet/minecraft/world/item/ItemStack;)V",
+            &[handler, Value::Int(slot), Value::Object(Some(stack))],
+        );
+    }
+
+    /// The stack in a kept block entity's own inventory slot, for a mod whose
+    /// inventory is not a `Container`.
+    #[doc(hidden)]
+    pub fn debug_block_entity_inventory(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+        slot: i32,
+    ) -> Option<(String, i32)> {
+        let handler = self.debug_block_entity_handler(pos, block)?;
+        let stack = self
+            .interp
+            .execute_method(
+                "vectorwing/farmersdelight/refabricated/inventory/ItemStackHandler",
+                "getStackInSlot",
+                "(I)Lnet/minecraft/world/item/ItemStack;",
+                &[handler, Value::Int(slot)],
+            )
+            .ok()?;
+        let stack = self
+            .interp
+            .heap
+            .get_native::<crate::minecraft::ItemStack>(stack.as_obj()?)?;
+        Some((stack.item.id.clone(), stack.count))
+    }
+
+    /// A kept block entity's own inventory object (`getInventory()`), asked
+    /// through the entity's real class, for tests.
+    fn debug_block_entity_handler(&mut self, pos: [i32; 3], block: &str) -> Option<Value> {
+        let entity = *self
+            .interp
+            .heap
+            .kept_block_entities()
+            .get(&(pos, block.to_string()))?;
+        let class = match self.interp.heap.get(entity) {
+            Some(JavaObject::Instance { class_name, .. }) => class_name.clone(),
+            _ => return None,
+        };
+        self.interp
+            .execute_method(
+                &class,
+                "getInventory",
+                "()Lvectorwing/farmersdelight/refabricated/inventory/ItemStackHandler;",
+                &[Value::Object(Some(entity))],
+            )
+            .ok()
+            .filter(|value| !value.is_null())
+    }
+
+    /// Write one of a kept block entity's own fields, for tests.
+    #[doc(hidden)]
+    pub fn debug_set_block_entity_field(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+        field: &str,
+        value: i32,
+    ) {
+        let Some(id) = self
+            .interp
+            .heap
+            .block_entities
+            .get(&(pos, block.to_string()))
+            .copied()
+        else {
+            return;
+        };
+        if let Some(JavaObject::Instance { fields, .. }) = self.interp.heap.get_mut(id) {
+            fields.insert(field.to_string(), Value::Int(value));
+        }
+    }
+
+    /// A field of a kept block entity, for tests that check what a tick did
+    /// to the mod's own state (`cookTime`, `cookTimeTotal`).
+    #[doc(hidden)]
+    pub fn debug_block_entity_field(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+        field: &str,
+    ) -> Option<i32> {
+        let id = *self
+            .interp
+            .heap
+            .block_entities
+            .get(&(pos, block.to_string()))?;
+        match self.interp.heap.get(id) {
+            Some(JavaObject::Instance { fields, .. }) => fields.get(field).map(Value::as_int),
+            _ => None,
+        }
+    }
+
+    /// The `ItemStack` in a kept block entity's own container slot, for tests.
+    #[doc(hidden)]
+    pub fn debug_block_entity_item(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+        slot: i32,
+    ) -> Option<(String, i32)> {
+        let id = *self
+            .interp
+            .heap
+            .block_entities
+            .get(&(pos, block.to_string()))?;
+        let stack = self
+            .interp
+            .execute_method(
+                "net/minecraft/world/Container",
+                "getItem",
+                "(I)Lnet/minecraft/world/item/ItemStack;",
+                &[Value::Object(Some(id)), Value::Int(slot)],
+            )
+            .ok()?;
+        let stack = self
+            .interp
+            .heap
+            .get_native::<crate::minecraft::ItemStack>(stack.as_obj()?)?;
+        Some((stack.item.id.clone(), stack.count))
+    }
+
+    /// Put an `ItemStack` in a kept block entity's own container slot, for
+    /// tests.
+    #[doc(hidden)]
+    pub fn debug_set_block_entity_item(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+        slot: i32,
+        item: &str,
+        count: i32,
+    ) {
+        let Some(id) = self
+            .interp
+            .heap
+            .block_entities
+            .get(&(pos, block.to_string()))
+            .copied()
+        else {
+            return;
+        };
+        let stack = self
+            .interp
+            .heap
+            .alloc_item_stack(crate::minecraft::ItemStack::new(item, count));
+        let _ = self.interp.execute_method(
+            "net/minecraft/world/Container",
+            "setItem",
+            "(ILnet/minecraft/world/item/ItemStack;)V",
+            &[
+                Value::Object(Some(id)),
+                Value::Int(slot),
+                Value::Object(Some(stack)),
+            ],
+        );
+    }
+
+    pub fn debug_state_object(&mut self, id: &str, key: &str) -> Option<Value> {
+        self.interp.mod_state_objects(id).ok()?.get(key).cloned()
+    }
+}
+
 /// The host's blocks within the placement radius of `pos`.
 fn world_around(
     host: &dyn super::HostBridge,
@@ -374,6 +589,24 @@ pub struct BlockEffects {
     pub drops: Vec<ItemDrop>,
     /// The blocks it removed.
     pub removals: Vec<BlockRemoval>,
+    /// The menu its code opened (`Player.openMenu`): the slots and title the
+    /// host should show, read from the provider's own `createMenu`.
+    pub menu: Option<OpenedMenu>,
+}
+
+/// A menu a mod's block entity (or another `MenuProvider`) opened, as its own
+/// `createMenu` built it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenedMenu {
+    /// The title `getDisplayName` answered, as plain text.
+    pub title: String,
+    /// The menu's slot count (`AbstractContainerMenu.slots.size()`).
+    pub slots: usize,
+    /// What each slot holds, by index.
+    pub items: Vec<Option<(String, i32)>>,
+    /// The slots a click may put a stack into, from the menu's own
+    /// `mayPlace`/`canPlaceItem` answers where they are readable.
+    pub input: Vec<usize>,
 }
 
 /// What using a registered block (right-click) did.
@@ -421,7 +654,7 @@ impl super::FabricBridge {
         if use_suppressed(event.sneaking, main_item.as_deref(), off_item.as_deref()) {
             return BlockUse::NotOverridden;
         }
-        let mut use_item = fact.overrides.iter().any(|o| o.ends_with(".useItemOn"));
+        let use_item = fact.overrides.iter().any(|o| o.ends_with(".useItemOn"));
         let mut use_without_item = fact
             .overrides
             .iter()
@@ -450,13 +683,6 @@ impl super::FabricBridge {
             item: if event.off_hand { off_item } else { main_item }.unwrap_or_default(),
             replace_clicked: false,
         };
-        // An empty hand has nothing for `useItemOn` to do.
-        if use_item && (request.item.is_empty() || request.item == "minecraft:air") {
-            use_item = false;
-            if !use_without_item {
-                return BlockUse::NotOverridden;
-            }
-        }
         let started = std::time::Instant::now();
         let world = world_around(host, event.pos);
         let previous = self.interp.step_budget;
@@ -607,15 +833,16 @@ impl super::FabricBridge {
     /// The changes, block ticks and particles a level a mod's code wrote is
     /// holding, drained.
     fn effects_of(&mut self, level: usize) -> hfc_core::Result<BlockEffects> {
-        let (particles, scheduled, dropped, broken) =
+        let (particles, scheduled, dropped, broken, menus) =
             match self.interp.heap.get_native_mut::<Level>(level) {
                 Some(level) => (
                     std::mem::take(&mut level.particles),
                     std::mem::take(&mut level.scheduled),
                     std::mem::take(&mut level.dropped_stacks),
                     std::mem::take(&mut level.broken),
+                    std::mem::take(&mut level.menus),
                 ),
-                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             };
         let schedules = scheduled
             .into_iter()
@@ -684,18 +911,41 @@ impl super::FabricBridge {
                 count: count as u32,
             })
             .collect();
+        // A menu the code opened (`Player.openMenu`): ask its provider for the
+        // menu itself, so the slots and title are the mod's own.
+        let menu = menus.last().copied().and_then(|provider| {
+            let _ = level;
+            self.interp.menu_of_provider(provider)
+        });
         Ok(BlockEffects {
             changes,
             schedules,
             particles,
             drops,
             removals,
+            menu,
         })
     }
 
     /// Apply the effects of a mod block's code through the host: property
     /// writes (a write that replaces the block with another is reported), the
     /// block ticks it scheduled, and the particles it sent.
+    /// The menu a block's use opened, and the block it is on, taken once: the
+    /// host shows it after the use's other effects are applied.
+    pub fn take_opened_menu(&mut self) -> Option<(String, OpenedMenu)> {
+        let block = self.pending_menu_block.take()?;
+        let menu = self.pending_menu.take()?;
+        Some((block, menu))
+    }
+
+    /// Remember the menu a use opened, for [`FabricBridge::take_opened_menu`].
+    pub(super) fn remember_opened_menu(&mut self, block: &str, menu: &BlockEffects) {
+        if let Some(opened) = &menu.menu {
+            self.pending_menu = Some(opened.clone());
+            self.pending_menu_block = Some(block.to_string());
+        }
+    }
+
     pub fn apply_block_effects(&self, host: &mut dyn super::HostBridge, effects: &BlockEffects) {
         for change in &effects.changes {
             if host.block(change.pos) != change.block {
@@ -824,5 +1074,425 @@ mod tests {
         // Nothing is there now: no removal is recorded.
         assert!(!level.destroy_block(&pos, true));
         assert_eq!(level.broken.len(), 1);
+    }
+}
+
+/// A block entity as the host keeps it: the block it belongs to, its position,
+/// and the mod's own object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockEntityKeeper {
+    pub block: String,
+    pub pos: [i32; 3],
+}
+
+impl super::FabricBridge {
+    /// Make the block entity of the registered block at `pos` if there is none
+    /// yet, and answer whether the block has one. The entity is the mod's own
+    /// (`EntityBlock.newBlockEntity`), kept for the position: its fields, its
+    /// container and its ticker are its own code's.
+    pub fn ensure_block_entity(
+        &mut self,
+        host: &dyn super::HostBridge,
+        pos: [i32; 3],
+        block_id: &str,
+    ) -> bool {
+        let Some(fact) = self
+            .interp
+            .heap
+            .block_facts
+            .iter()
+            .find(|b| b.id == block_id)
+        else {
+            return false;
+        };
+        if !fact.has_block_entity {
+            return false;
+        }
+        if self
+            .interp
+            .heap
+            .kept_block_entities()
+            .contains_key(&(pos, block_id.to_string()))
+        {
+            return true;
+        }
+        let world = world_around(host, pos);
+        let properties = host.block_properties(pos);
+        let key = crate::place_builtins::state_key_of(&properties);
+        let block = Value::Object(
+            self.interp
+                .heap
+                .registered_blocks
+                .iter()
+                .find(|b| b.id == block_id)
+                .map(|b| b.object),
+        );
+        let previous = self.interp.step_budget;
+        self.interp.step_budget = Some(crate::place_builtins::PLACEMENT_BUDGET);
+        let level = self.interp.snapshot_level(&world).ok();
+        let state = self
+            .interp
+            .mod_state_objects(block_id)
+            .ok()
+            .and_then(|states| {
+                states
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| states.values().next().cloned())
+            });
+        let made = match (level, state) {
+            (Some(level), Some(state)) => self
+                .interp
+                .block_entity_at(&block, block_id, pos, &state, level)
+                .ok()
+                .flatten()
+                .is_some(),
+            _ => false,
+        };
+        self.interp.step_budget = previous;
+        if !made
+            && self
+                .interp
+                .heap
+                .block_entity_failures
+                .insert(block_id.to_string())
+        {
+            log::warn!("Fabric: {block_id}'s newBlockEntity made no block entity");
+        }
+        made
+    }
+
+    /// Whether the registered block `id` makes a block entity (`EntityBlock`).
+    pub fn block_entity_declared(&self, id: &str) -> bool {
+        self.interp
+            .heap
+            .block_facts
+            .iter()
+            .find(|b| b.id == id)
+            .is_some_and(|b| b.has_block_entity)
+    }
+
+    /// The position and block of every block entity the runtime keeps.
+    pub fn kept_block_entity_positions(&self) -> Vec<([i32; 3], String)> {
+        self.interp
+            .heap
+            .kept_block_entities()
+            .keys()
+            .map(|(pos, block)| (*pos, block.clone()))
+            .collect()
+    }
+
+    /// How many block entities the runtime keeps for Fabric blocks.
+    pub fn kept_block_entity_count(&self) -> usize {
+        self.interp.heap.kept_block_entities().len()
+    }
+
+    /// The state of a kept block entity, saved through its own
+    /// `saveAdditional` into a `ValueOutput` the runtime records: the tree the
+    /// host can store in the block entity's NBT and hand back through
+    /// [`FabricBridge::load_block_entity`].
+    pub fn save_block_entity(
+        &mut self,
+        pos: [i32; 3],
+        block_id: &str,
+    ) -> Option<Vec<(String, crate::value_io_builtins::StoredValue)>> {
+        let entity = *self
+            .interp
+            .heap
+            .kept_block_entities()
+            .get(&(pos, block_id.to_string()))?;
+        let output = crate::value_io_builtins::alloc_output(&mut self.interp.heap);
+        self.interp
+            .execute_method(
+                "net/minecraft/world/level/block/entity/BlockEntity",
+                "saveAdditional",
+                "(Lnet/minecraft/world/level/storage/ValueOutput;)V",
+                &[Value::Object(Some(entity)), Value::Object(Some(output))],
+            )
+            .ok()?;
+        Some(crate::value_io_builtins::flat_values(
+            &self.interp.heap,
+            output,
+        ))
+    }
+
+    /// Make the block entity at `pos` if there is none, then load `values` into
+    /// it through its own `loadAdditional`.
+    pub fn load_block_entity(
+        &mut self,
+        host: &dyn super::HostBridge,
+        pos: [i32; 3],
+        block_id: &str,
+        values: Vec<(String, crate::value_io_builtins::StoredValue)>,
+    ) -> bool {
+        if !self.ensure_block_entity(host, pos, block_id) {
+            return false;
+        }
+        let Some(entity) = self
+            .interp
+            .heap
+            .kept_block_entities()
+            .get(&(pos, block_id.to_string()))
+            .copied()
+        else {
+            return false;
+        };
+        let input = crate::value_io_builtins::input_from_flat(&mut self.interp.heap, &values);
+        self.interp
+            .execute_method(
+                "net/minecraft/world/level/block/entity/BlockEntity",
+                "loadAdditional",
+                "(Lnet/minecraft/world/level/storage/ValueInput;)V",
+                &[Value::Object(Some(entity)), Value::Object(Some(input))],
+            )
+            .is_ok()
+    }
+
+    /// Make the mod's own inventory match `items` (the stacks the host's menu
+    /// shows), one slot at a time, so the block's code reads what the player
+    /// put in. Slots the menu does not show are left as they are.
+    pub fn sync_menu_items(
+        &mut self,
+        pos: [i32; 3],
+        block_id: &str,
+        items: &[Option<(String, i32)>],
+    ) -> usize {
+        let mut written = 0;
+        for (slot, stack) in items.iter().enumerate() {
+            if self.set_menu_slot(
+                pos,
+                block_id,
+                slot,
+                stack.as_ref().map(|(i, c)| (i.as_str(), *c)),
+            ) {
+                written += 1;
+            }
+        }
+        written
+    }
+
+    /// The slots a mod block's menu shows and what they hold, read from the
+    /// block entity the container's `slots` come from: the host keeps the
+    /// shown stacks in step with the mod's own inventory, so a cooking tick
+    /// reads what the player put in.
+    pub fn menu_slot(
+        &mut self,
+        pos: [i32; 3],
+        block_id: &str,
+        slot: usize,
+    ) -> Option<(String, i32)> {
+        let entity = *self
+            .interp
+            .heap
+            .kept_block_entities()
+            .get(&(pos, block_id.to_string()))?;
+        let class = match self.interp.heap.get(entity) {
+            Some(JavaObject::Instance { class_name, .. }) => class_name.clone(),
+            _ => return None,
+        };
+        // The menu's slots read a `Container` the entity answers; a mod's own
+        // inventory (`ItemStackHandler`) is read through the entity's own
+        // accessor, which `read_mod_container` asked when the host declared it.
+        let container = self
+            .interp
+            .execute_method(
+                &class,
+                "getInventory",
+                "()Lvectorwing/farmersdelight/refabricated/inventory/ItemStackHandler;",
+                &[Value::Object(Some(entity))],
+            )
+            .ok()
+            .filter(|value| !value.is_null());
+        let stack = match container {
+            Some(handler) => self.interp.execute_method(
+                "vectorwing/farmersdelight/refabricated/inventory/ItemStackHandler",
+                "getStackInSlot",
+                "(I)Lnet/minecraft/world/item/ItemStack;",
+                &[handler, Value::Int(slot as i32)],
+            ),
+            None => self.interp.execute_method(
+                "net/minecraft/world/Container",
+                "getItem",
+                "(I)Lnet/minecraft/world/item/ItemStack;",
+                &[Value::Object(Some(entity)), Value::Int(slot as i32)],
+            ),
+        }
+        .ok()?;
+        let stack = self
+            .interp
+            .heap
+            .get_native::<crate::minecraft::ItemStack>(stack.as_obj()?)?;
+        (stack.count > 0 && stack.item.id != "minecraft:air")
+            .then(|| (stack.item.id.clone(), stack.count))
+    }
+
+    /// Set the stack in one of a mod block's menu slots, through the same
+    /// `Container`/inventory the block's own code reads.
+    pub fn set_menu_slot(
+        &mut self,
+        pos: [i32; 3],
+        block_id: &str,
+        slot: usize,
+        stack: Option<(&str, i32)>,
+    ) -> bool {
+        let Some(entity) = self
+            .interp
+            .heap
+            .kept_block_entities()
+            .get(&(pos, block_id.to_string()))
+            .copied()
+        else {
+            return false;
+        };
+        let class = match self.interp.heap.get(entity) {
+            Some(JavaObject::Instance { class_name, .. }) => class_name.clone(),
+            _ => return false,
+        };
+        let stack = stack
+            .map(|(item, count)| {
+                Value::Object(Some(
+                    self.interp
+                        .heap
+                        .alloc_item_stack(crate::minecraft::ItemStack::new(item, count)),
+                ))
+            })
+            .unwrap_or(Value::NULL);
+        let handler = self
+            .interp
+            .execute_method(
+                &class,
+                "getInventory",
+                "()Lvectorwing/farmersdelight/refabricated/inventory/ItemStackHandler;",
+                &[Value::Object(Some(entity))],
+            )
+            .ok()
+            .filter(|value| !value.is_null());
+        let result = match handler {
+            Some(handler) => self.interp.execute_method(
+                "vectorwing/farmersdelight/refabricated/inventory/ItemStackHandler",
+                "setStackInSlot",
+                "(ILnet/minecraft/world/item/ItemStack;)V",
+                &[handler, Value::Int(slot as i32), stack],
+            ),
+            None => self.interp.execute_method(
+                "net/minecraft/world/Container",
+                "setItem",
+                "(ILnet/minecraft/world/item/ItemStack;)V",
+                &[Value::Object(Some(entity)), Value::Int(slot as i32), stack],
+            ),
+        };
+        result.is_ok()
+    }
+
+    /// Every kept block entity whose block declares a ticker: run its tick
+    /// over the host's world. The host calls this once a game tick; what each
+    /// tick changed is applied through the host. Answers how many ran.
+    pub fn tick_block_entities(&mut self, host: &mut dyn super::HostBridge) -> usize {
+        let kept: Vec<([i32; 3], String)> = self
+            .interp
+            .heap
+            .kept_block_entities()
+            .keys()
+            .cloned()
+            .collect();
+        let mut ran = 0;
+        for (pos, block) in kept {
+            // A block that was broken or replaced no longer has its entity.
+            if host.block(pos) != block {
+                self.interp.heap.block_entities.remove(&(pos, block));
+                continue;
+            }
+            if let Some(effects) = self.tick_block_entity(host, pos, &block) {
+                self.apply_block_effects(host, &effects);
+                ran += 1;
+            }
+        }
+        ran
+    }
+
+    /// Run the block entity's own ticker at `pos` (the block's `getTicker`
+    /// answered one), over the host's blocks around it, and report what the
+    /// tick changed: the same effects a block tick's are.
+    pub fn tick_block_entity(
+        &mut self,
+        host: &dyn super::HostBridge,
+        pos: [i32; 3],
+        block_id: &str,
+    ) -> Option<BlockEffects> {
+        let entity = *self
+            .interp
+            .heap
+            .kept_block_entities()
+            .get(&(pos, block_id.to_string()))?;
+        let block = Value::Object(
+            self.interp
+                .heap
+                .registered_blocks
+                .iter()
+                .find(|b| b.id == block_id)
+                .map(|b| b.object),
+        );
+        let world = world_around(host, pos);
+        let properties = host.block_properties(pos);
+        let key = crate::place_builtins::state_key_of(&properties);
+        let started = std::time::Instant::now();
+        self.interp.heap.begin_scope();
+        let previous = self.interp.step_budget;
+        self.interp.step_budget = Some(crate::place_builtins::TICK_BUDGET);
+        let result = (|| -> std::result::Result<usize, String> {
+            let level = self
+                .interp
+                .snapshot_level(&world)
+                .map_err(|e| e.to_string())?;
+            let state = self
+                .interp
+                .mod_state_objects(block_id)
+                .map_err(|e| e.to_string())?
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| format!("{block_id} has no state {key}"))?;
+            let ticker = self
+                .interp
+                .block_entity_ticker(&block, level, &state, entity)
+                .ok_or_else(|| format!("{block_id}'s getTicker answered none"))?;
+            self.interp
+                .tick_block_entity(&ticker, level, pos, &state, entity)
+                .map_err(|e| e.to_string())?;
+            Ok(level)
+        })();
+        let used = crate::place_builtins::TICK_BUDGET - self.interp.step_budget.unwrap_or(0);
+        self.interp.step_budget = previous;
+        let took = started.elapsed();
+        if took.as_millis() > 20 {
+            log::warn!("tick of {block_id}'s block entity took {took:?} ({used} instructions)");
+        }
+        let effects = match result {
+            Ok(level) => self.effects_of(level).ok(),
+            Err(error) => {
+                if self
+                    .interp
+                    .heap
+                    .block_entity_failures
+                    .insert(block_id.to_string())
+                {
+                    log::warn!("Fabric: {block_id}'s block entity tick failed: {error}");
+                }
+                None
+            }
+        };
+        // A block entity's tick runs on the object kept between calls, so its
+        // scope must be kept whenever the entity itself was touched.
+        let mark = self.interp.heap.scope_mark().unwrap_or(0);
+        let kept = self.interp.heap.scope_escaped()
+            || self.interp.heap.refs_into(mark)
+            || self.interp.static_refs_into(mark)
+            || entity >= mark;
+        if !self.interp.heap.end_scope(kept) && self.scope_kept_logged.insert(block_id.to_string())
+        {
+            log::debug!(
+                "block entity {block_id} kept heap objects (its fields hold them); its scope was not released"
+            );
+        }
+        effects
     }
 }

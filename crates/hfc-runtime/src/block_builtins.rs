@@ -269,7 +269,7 @@ impl Interpreter {
         Ok(items)
     }
 
-    fn instance_field(&self, object: &Value, name: &str) -> Option<Value> {
+    pub(crate) fn instance_field(&self, object: &Value, name: &str) -> Option<Value> {
         match self.heap.get(object.as_obj()?)? {
             JavaObject::Instance { fields, .. } => fields.get(name).cloned(),
             _ => None,

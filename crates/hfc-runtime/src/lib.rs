@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod block_builtins;
+pub mod block_entity_builtins;
 pub mod bridge;
 pub mod builtins;
 pub mod census;
@@ -14,6 +15,7 @@ pub mod interp;
 pub mod item_builtins;
 pub mod jimage;
 pub mod loader;
+pub mod menu_builtins;
 pub mod minecraft;
 pub mod mixin;
 pub mod num_builtins;
@@ -23,6 +25,7 @@ pub mod registry;
 pub mod text_io;
 pub mod use_builtins;
 pub mod value;
+pub mod value_io_builtins;
 pub mod vfs;
 
 pub use bridge::FabricModMetadata;

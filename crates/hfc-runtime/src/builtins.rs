@@ -7318,6 +7318,16 @@ pub fn dispatch_builtin(
 
     // BlockState
     if class_name == "net/minecraft/world/level/block/state/BlockState" {
+        if method_name == "asState" && !args.is_empty() {
+            // `BlockStateBase.asState` answers the state itself: the runtime's
+            // modelled states are not a separate base object.
+            if let Some(id) = args[0]
+                .as_obj()
+                .filter(|id| heap.get_native::<BlockState>(*id).is_some())
+            {
+                return BuiltinResult::Handled(Value::Object(Some(id)));
+            }
+        }
         if method_name == "canBeReplaced" && !args.is_empty() {
             // `BlockBehaviour.Properties.replaceable()`: air, fluids, plants.
             // The `minecraft:replaceable` tag lists exactly those.
@@ -7599,6 +7609,11 @@ pub fn dispatch_builtin(
     // Level / ServerLevel
     if class_name == "net/minecraft/world/level/Level"
         || class_name == "net/minecraft/server/level/ServerLevel"
+        // The interfaces a level is read through (`LevelHeightAccessor`'s
+        // build height, `LevelReader`'s blocks).
+        || class_name == "net/minecraft/world/level/LevelHeightAccessor"
+        || class_name == "net/minecraft/world/level/LevelReader"
+        || class_name == "net/minecraft/world/level/BlockGetter"
     {
         if method_name == "isClientSide" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
@@ -7622,6 +7637,42 @@ pub fn dispatch_builtin(
                     return BuiltinResult::Handled(Value::Object(Some(sid)));
                 }
             }
+        } else if (method_name == "getMinY"
+            || method_name == "getMaxY"
+            || method_name == "getHeight")
+            && !args.is_empty()
+        {
+            // `LevelHeightAccessor`: the build height the snapshot holds. A
+            // mod block's heat check (`LevelHeightAccessor.getMinY`) and any
+            // block that clamps to the world read it.
+            let bounds = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<Level>(id))
+                .map(|level| (level.min_y, level.max_y));
+            if let Some((min_y, max_y)) = bounds {
+                let value = match method_name {
+                    "getMinY" => min_y,
+                    "getMaxY" => max_y,
+                    _ => max_y - min_y,
+                };
+                return BuiltinResult::Handled(Value::Int(value));
+            }
+        } else if method_name == "hasChunk" && args.len() >= 3 {
+            // `LevelReader.hasChunk(x, z)`: the snapshot holds the world's
+            // radius around the position, so a chunk is there when any block
+            // of it is.
+            let within = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_native::<Level>(id))
+                .zip(Some((args[1].as_int(), args[2].as_int())))
+                .is_some_and(|(level, (x, z))| {
+                    level
+                        .blocks
+                        .keys()
+                        .chain(level.mod_states.keys())
+                        .any(|at| (at[0] >> 4) == x && (at[2] >> 4) == z)
+                });
+            return BuiltinResult::Handled(Value::from_bool(within));
         } else if method_name == "isOutsideBuildHeight" && args.len() >= 2 {
             let y = match args[1]
                 .as_obj()
@@ -7644,8 +7695,18 @@ pub fn dispatch_builtin(
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
         } else if method_name == "getBlockEntity" && args.len() >= 2 {
-            // The runtime's level snapshot holds block states, not block
-            // entities: a mod asking for one gets null, as an empty chunk.
+            // The block entity the block's own `newBlockEntity` made for this
+            // position, when the bridge put one in the snapshot; null where
+            // there is none, as a chunk without block entities answers.
+            if let (Some(id), Some(pos_id)) = (args[0].as_obj(), args[1].as_obj())
+                && let Some(pos) = heap.get_native::<BlockPos>(pos_id)
+                && let Some(entity) = heap
+                    .get_native::<Level>(id)
+                    .and_then(|level| level.block_entities.get(&[pos.x, pos.y, pos.z]))
+                    .copied()
+            {
+                return BuiltinResult::Handled(Value::Object(Some(entity)));
+            }
             return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "scheduleTick" && args.len() >= 4 {
             // The bridge hands the schedule to the host, which runs the
@@ -7961,6 +8022,71 @@ pub fn dispatch_builtin(
                 fields,
             });
             return BuiltinResult::Handled(Value::Object(Some(aid)));
+        } else if method_name == "openMenu" && args.len() >= 2 {
+            // `ServerPlayer.openMenu(MenuProvider)`: the host opens the menu
+            // the provider builds. The bridge reads the provider off the level
+            // and asks it for `createMenu`, so a block's own menu type is the
+            // one shown. The `OptionalInt` answer is an absent one: the window
+            // id is the host's.
+            if let (Some(pid), Some(provider)) = (args[0].as_obj(), args[1].as_obj()) {
+                let level = heap
+                    .get_native::<Player>(pid)
+                    .map(|player| player.level_id)
+                    .filter(|level| heap.get_native::<Level>(*level).is_some());
+                if let Some(level) = level {
+                    heap.get_native_mut::<Level>(level)
+                        .expect("the level was just checked")
+                        .menus
+                        .push(provider);
+                }
+                let empty = heap.alloc(JavaObject::Instance {
+                    class_name: "java/util/OptionalInt".into(),
+                    fields: HashMap::new(),
+                });
+                return BuiltinResult::Handled(Value::Object(Some(empty)));
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        } else if method_name == "getInventory" && !args.is_empty() {
+            // The player's inventory: `add(stack)` hands the stack to the
+            // host (a meal the pot gave back, a remainder), `getContainerSize`,
+            // `isEmpty` and `getItem` read what it already holds, which the
+            // runtime does not track and answers empty.
+            if let Some(pid) = args[0].as_obj() {
+                let inventory = heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/world/entity/player/Inventory".into(),
+                    fields: HashMap::from([("player".to_string(), Value::Int(pid as i32))]),
+                });
+                return BuiltinResult::Handled(Value::Object(Some(inventory)));
+            }
+        } else if method_name == "drop" && args.len() >= 2 {
+            // `Player.drop(stack, dropAround, prediction)`: the item goes to
+            // the host's world at the player, which is what a pot does with a
+            // meal its inventory refused.
+            if let Some(stack) = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<ItemStack>(id))
+                .map(|stack| (stack.item.id.clone(), stack.count))
+                .filter(|(item, count)| *count > 0 && item != "minecraft:air")
+            {
+                let level = args[0]
+                    .as_obj()
+                    .and_then(|id| heap.get_native::<Player>(id))
+                    .map(|player| (player.level_id, player.position));
+                if let Some((level, position)) = level
+                    && let Some(level) = heap.get_native_mut::<Level>(level)
+                {
+                    level.dropped_stacks.push((
+                        BlockPos {
+                            x: position[0].floor() as i32,
+                            y: position[1].floor() as i32,
+                            z: position[2].floor() as i32,
+                        },
+                        stack.0,
+                        stack.1,
+                    ));
+                }
+                return BuiltinResult::Handled(Value::NULL);
+            }
         } else if method_name == "getFoodData" {
             let fid = heap.alloc(JavaObject::Instance {
                 class_name: "net/minecraft/world/food/FoodData".into(),
@@ -7980,6 +8106,64 @@ pub fn dispatch_builtin(
             || method_name == "giveExperiencePoints"
         {
             return BuiltinResult::Handled(Value::NULL);
+        }
+    }
+
+    // Inventory: the contents are not tracked, so `add(stack)` records the
+    // stack for the host instead of pretending it went in. A pot hands the
+    // meal it made back through its menu, not through this call, so nothing a
+    // player sees depends on it; a mod that checks the answer still gets the
+    // truth (the stack was taken).
+    if class_name == "net/minecraft/world/entity/player/Inventory" {
+        if method_name == "add" && args.len() >= 2 {
+            let added = args[1]
+                .as_obj()
+                .and_then(|id| heap.get_native::<ItemStack>(id))
+                .map(|stack| (stack.item.id.clone(), stack.count))
+                .filter(|(item, count)| *count > 0 && item != "minecraft:air");
+            if let Some((item, count)) = added {
+                // `Level.dropped_stacks` is the host's "give the player this":
+                // the world is the only channel the runtime has.
+                if let Some(level) = args[0]
+                    .as_obj()
+                    .and_then(|id| heap.get_native::<Player>(id))
+                    .map(|player| player.level_id)
+                    .and_then(|level| heap.get_native_mut::<Level>(level))
+                {
+                    level
+                        .dropped_stacks
+                        .push((BlockPos { x: 0, y: 0, z: 0 }, item, count));
+                }
+            }
+            return BuiltinResult::Handled(Value::from_bool(true));
+        }
+        if matches!(
+            method_name,
+            "getContainerSize" | "getFreeSlot" | "getSelectedSlot"
+        ) {
+            return BuiltinResult::Handled(Value::Int(0));
+        }
+        if method_name == "isEmpty" {
+            return BuiltinResult::Handled(Value::from_bool(true));
+        }
+        if matches!(method_name, "getItem" | "removeItem" | "getSelected") {
+            return BuiltinResult::Handled(Value::Object(Some(
+                heap.alloc_item_stack(ItemStack::empty()),
+            )));
+        }
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
+    // 26.3's `ValueOutput`/`ValueInput`: the tree a block entity saves into
+    // and loads from (`saveAdditional`/`loadAdditional`).
+    if matches!(
+        class_name,
+        "net/minecraft/world/level/storage/ValueOutput"
+            | "net/minecraft/world/level/storage/ValueInput"
+    ) {
+        if let Some(value) = crate::value_io_builtins::dispatch(heap, class_name, method_name, args)
+        {
+            return BuiltinResult::Handled(value);
         }
     }
 
@@ -8011,6 +8195,47 @@ pub fn dispatch_builtin(
             "getMaxDamage" => Value::Int(stack.map_or(0, |stack| stack.max_damage)),
             "getDamageValue" => Value::Int(stack.map_or(0, |stack| stack.damage)),
             _ => Value::from_bool(stack.is_some_and(|stack| stack.max_damage > 0)),
+        });
+    }
+    // `ItemStack.getCraftingRemainder`: 26.3 answers an `ItemStackTemplate`
+    // (the item and its components), which vanilla's own crafting uses to
+    // leave a bucket behind. A mod that checks a meal's remainder (a pot's
+    // ingredient) gets nothing when the item has none, as vanilla's empty
+    // remainder answers.
+    if class_name == "net/minecraft/world/item/ItemStack" && method_name == "getCraftingRemainder" {
+        // A mod's own item says so through the `minecraft:use_remainder`
+        // component its `Item.Properties` set.
+        let remainder = args
+            .first()
+            .and_then(|value| value.as_obj())
+            .and_then(|id| heap.get_native::<ItemStack>(id))
+            .and_then(|stack| {
+                let item = stack.item.id.clone();
+                let component = heap
+                    .registered_items
+                    .iter()
+                    .find(|record| record.id == item)
+                    .and_then(|record| record.properties.components.get("minecraft:use_remainder"))
+                    .cloned();
+                component
+                    .and_then(|value| {
+                        value
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .map(str::to_string)
+                    })
+                    .map(|remainder| (remainder, stack))
+            });
+        return BuiltinResult::Handled(match remainder {
+            Some((item, _)) => {
+                let id = heap.alloc_string(item);
+                let template = heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/world/item/ItemStackTemplate".into(),
+                    fields: HashMap::from([("item".to_string(), Value::Object(Some(id)))]),
+                });
+                Value::Object(Some(template))
+            }
+            None => Value::NULL,
         });
     }
     if class_name == "net/minecraft/world/item/ItemStack" && method_name == "getEnchantments" {
@@ -8124,6 +8349,19 @@ pub fn dispatch_builtin(
             _ => {}
         }
     }
+    // `BlockBehaviour$BlockStateBase.asState()` on a state: the state itself.
+    if class_name == "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+        && method_name == "asState"
+        && !args.is_empty()
+    {
+        if let Some(id) = args[0]
+            .as_obj()
+            .filter(|id| heap.get_native::<BlockState>(*id).is_some())
+        {
+            return BuiltinResult::Handled(Value::Object(Some(id)));
+        }
+    }
+
     // A `BlockState` the runtime models carries `propertyKeys`/`propertyValues`;
     // `StateHolder.getValue(property)` reads them so a mod's `tick` or
     // `getStateForPlacement` gets the value the state was built with.

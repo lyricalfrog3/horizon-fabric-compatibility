@@ -679,6 +679,7 @@ impl FabricBridge {
             }
             BlockUse::Handled(effects) => {
                 self.apply_block_effects(host, &effects);
+                self.remember_opened_menu(&block_id, &effects);
                 return Flow::Cancel;
             }
         }

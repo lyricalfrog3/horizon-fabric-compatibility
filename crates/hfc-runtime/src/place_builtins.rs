@@ -300,6 +300,17 @@ impl Interpreter {
             }
             level.blocks.insert(*at, state);
         }
+        // The block entities the host's world has at those positions: a mod's
+        // `Level.getBlockEntity` must answer the one its own code made.
+        for ((at, id), entity) in &self.heap.block_entities {
+            if world
+                .blocks
+                .iter()
+                .any(|(position, block, ..)| position == at && block == id)
+            {
+                level.block_entities.insert(*at, *entity);
+            }
+        }
         Ok(self.heap.alloc_level(level))
     }
 

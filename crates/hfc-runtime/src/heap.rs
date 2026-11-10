@@ -64,6 +64,14 @@ pub struct Heap {
     pub(crate) block_facts_shapes: bool,
     /// The `BlockState` objects of registered blocks, by block id and state key.
     pub(crate) block_state_objects: HashMap<String, HashMap<String, Value>>,
+    /// The block entities standing in the host's world, by position and block
+    /// id: the heap id of the mod's own `BlockEntity` object, made through the
+    /// block's `newBlockEntity` the first time it is asked for. They outlive a
+    /// call: a pot keeps its contents between right clicks.
+    pub(crate) block_entities: HashMap<([i32; 3], String), usize>,
+    /// Blocks whose `newBlockEntity` threw or answered nothing, logged once
+    /// each so a clicked block does not flood the log.
+    pub(crate) block_entity_failures: std::collections::HashSet<String>,
     /// One `ThreadLocal`'s value: the interpreter runs one thread, so a value
     /// per `ThreadLocal` object is exactly what a JVM's thread map holds.
     pub(crate) thread_locals: HashMap<usize, Value>,
@@ -172,6 +180,8 @@ impl Heap {
             block_ids: std::collections::HashSet::new(),
             block_facts_shapes: false,
             block_state_objects: HashMap::new(),
+            block_entities: HashMap::new(),
+            block_entity_failures: std::collections::HashSet::new(),
             thread_locals: HashMap::new(),
             unsafe_fields: Vec::new(),
             thread_local_initializers: HashMap::new(),
@@ -183,6 +193,29 @@ impl Heap {
             scope: None,
             escaped: false,
         }
+    }
+
+    /// The heap id of a registered block's own object, for tests and the
+    /// bridge that check what the mod's code sees.
+    #[doc(hidden)]
+    pub fn registered_block_object(&self, id: &str) -> Option<usize> {
+        self.registered_blocks
+            .iter()
+            .find(|b| b.id == id)
+            .map(|b| b.object)
+    }
+
+    /// The `BlockState` object of a registered block's state, for tests.
+    #[doc(hidden)]
+    pub fn state_object(&self, id: &str, key: &str) -> Option<Value> {
+        self.block_state_objects.get(id)?.get(key).cloned()
+    }
+
+    /// The block entities kept between calls, `(position, block id)` to the
+    /// object's heap id, for tests.
+    #[doc(hidden)]
+    pub fn kept_block_entities(&self) -> &HashMap<([i32; 3], String), usize> {
+        &self.block_entities
     }
 
     pub fn get_singleton(&self, key: &str) -> Option<usize> {
@@ -290,6 +323,7 @@ impl Heap {
                 .block_state_objects
                 .values()
                 .any(|states| states.values().any(value))
+            || self.block_entities.values().any(|id| *id >= mark)
         {
             return true;
         }

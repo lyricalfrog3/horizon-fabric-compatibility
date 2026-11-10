@@ -863,17 +863,86 @@ object the hand and the use share) is refused the same way until a host hook can
 (the item is the one in that hand). Budget 20M instructions per call; a call over 50 ms is
 logged.
 
-Not run: `getTicker`/`BlockEntityTicker` (a ticking block entity), neighbour updates
+Not run: neighbour updates
 (`updateShape`, `neighborChanged`), block-entity data and per-stack container rules. mdm's two
 non-container block entities (`DecorationPlacementBlockEntity`, `WallClockBlockEntity`) declare
 no fields and no methods (javap): they store nothing to save. What a wall clock draws (the level
 time) and where a decoration places itself are the mod's renderer, which the host does not run;
 those blocks stay decoration, as their declarations say.
 
-### Scheduled block ticks (stage C3, ticking)
+### Block entities (stage C4)
 
-Block code can schedule its block's own tick (`Level.scheduleTick(pos, this, delay)`; a running
-sink re-schedules itself every 2 ticks while lit). The runtime records the call on its `Level`
+A registered block that implements `EntityBlock` has a block entity made by its own
+`newBlockEntity` (`block_entity_builtins.rs`). The runtime keeps the mod's real object per
+position (`Heap::block_entities`), so its fields, its inventory and its menu are the mod's code;
+`Level.getBlockEntity` on the snapshot answers it, `BlockEntity.setLevel` is given the snapshot's
+level, and a use or tick creates one if the runtime has none yet. The host makes one when a block
+is placed and when it is right-clicked (`FabricBridge::ensure_block_entity`).
+
+`getTicker` is called with the entity's own `getType()`; the `BlockEntityTicker` it answers is run
+as `tick(level, pos, state, entity)` once per game tick for every kept entity whose block is still
+there (`FabricBridge::tick_block_entities`, from `Game::tick_fabric_block_entities`). A tick's
+effects go through the host exactly as a block tick's do.
+
+Saving runs the entity's own `saveAdditional` into a `ValueOutput`, and loading runs
+`loadAdditional` from a `ValueInput` (`value_io_builtins.rs`). The storage interface is modelled
+as a value tree (`putInt`, `getIntOr`, `putString`, `putBoolean`, `putIntArray`, `child`,
+`childOrEmpty`, `discard`, `isEmpty`); the host stores it in the block entity's compound under
+`HorizonFabric` (`game/fabric_bridge/block_entity_nbt.rs`) before a chunk is snapshotted, and
+feeds it back on load.
+
+Tested with Farmers Delight's cooking pot (`tests/block_entities.rs`, real jar): the entity is its
+own `CookingPotBlockEntity` with a 9-slot `ItemStackHandler`, `useItemOn` runs on an empty hand and
+consumes the click, the ticker runs `cookingTick` (its `cookTime` field was 10 and the tick left
+8), and `saveAdditional`/`loadAdditional` round-trip `CookTime`/`CookTimeTotal`.
+
+### A block's own menu (stage C4)
+
+`Player.openMenu(provider)` records the provider on the snapshot's `Level`; the bridge asks it
+for the menu (`Player.openMenu`'s provider is the block entity, whether it implements
+`MenuProvider`'s two-argument `createMenu(int, Inventory)` or Fabric's three-argument
+`createMenu(int, Inventory, Player)`), reads `AbstractContainerMenu.slots` for the stacks shown and
+each `Slot.mayPlace` for the slots that take a click, and reports it as `BlockEffects.menu`. The
+host takes it once (`FabricBridge::take_opened_menu`) after applying the use, and shows it with
+the title `getDisplayName` answered. Two ways, by what the client knows:
+
+- **The mod's own screen, when the client has one.** The menu's type is looked up in the
+  client's own `MenuScreens.SCREENS` (vanilla's map for vanilla menus; `ExtendedMenuType`
+  registrations add mod entries). When an entry exists, the runtime calls the registered
+  `ScreenConstructor.create(menu, inventory, title)` directly with the already-built menu
+  (not the network `fromPacket`, which would re-create the menu from a packet) and shows it
+  with `Minecraft.setScreen`. The host follows that screen (`Game::fabric_follow_screen`,
+  `Screen::Fabric`) and replays its display list; it draws no host grid and writes no host
+  items. A click runs the real screen's slot code, which writes the block entity's own
+  inventory, so the block's `saveAdditional` (run by `Game::fabric_save_block_entities`)
+  persists what the player put in with no host-side copy. This is the general path: it
+  branches only on whether the menu's own `getType` has a `MenuScreens` entry, so it works
+  for any mod that registers a screen for its menu type.
+- **The host's grid, when the client has no screen for the type.** The host draws a vanilla
+  grid for the slot count (a `MOD_MENUS` lookup); a menu whose slot count no host screen
+  draws is reported and not shown. The screen's slots are written back into the block
+  entity's own inventory through `FabricBridge::sync_menu_items`, so a cooking tick reads
+  what the player put in.
+
+Tested with the cooking pot (`tests/block_entities.rs`, real jar): its own `CookingPotMenu`
+builds (45 slots, titled "Cooking Pot", its result slot outside the slots a click may fill);
+opening it installs the mod's own `CookingPotScreen` (built by the registered `ScreenConstructor`
+for the pot's `MenuType`) and rendering it draws the pot's own `cooking_pot.png` background; and
+a click's stack reaches the pot's `ItemStackHandler` (slot 0 read back as `minecraft:beef` x2).
+In the game the pot opens its own screen (background, bowl slot, recipe-book button, title)
+instead of a double-chest grid, and reopens with the pot's contents, before and after a save
+and reload.
+
+Not run: `preRemoveSideEffects` (a pot dropping its meal on break); codec-based save data
+(`ValueOutput.store`/`storeNullable`/`read`/`list` take a `com.mojang.serialization.Codec`, which
+the runtime does not implement, so a slot list written through
+`ContainerHelper.saveAllItems` is not saved and a container's own contents do not survive a
+reload); the player-inventory side of a real screen (the host's player inventory is synthetic
+and empty, and `Inventory.getDisplayName` is unhandled, so a screen's player slots and its
+"Inventory" label draw empty); and the recipe check a cooking tick makes, which needs
+`RecipeManager` and the mod's recipe type, so a pot's recipe book opens but a pot cooks nothing
+yet.
+ 2 ticks while lit). The runtime records the call on its `Level`
 snapshot; `HostBridge::schedule_block_tick` hands it to the host, which keeps it per dimension and,
 when the game tick is due, runs `FabricBridge::tick_block`. That runs the block's real
 `Block.tick(state, ServerLevel, pos, RandomSource)` over the host's blocks around it, under

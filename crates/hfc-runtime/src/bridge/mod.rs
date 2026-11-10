@@ -16,7 +16,8 @@ use std::path::Path;
 pub use crate::place_builtins::PlacementRequest;
 pub use blocks::{
     BlockChange, BlockContainer, BlockEffects, BlockRemoval, BlockSchedule, BlockSound, BlockUse,
-    ContainerRead, ItemDrop, ParticleBurst, PlacedBy, Placement, RegisteredBlock, RegisteredState,
+    ContainerRead, ItemDrop, OpenedMenu, ParticleBurst, PlacedBy, Placement, RegisteredBlock,
+    RegisteredState,
 };
 pub use items::{CreativeTabAddition, RegisteredItem, TabPlacement};
 
@@ -288,6 +289,11 @@ pub struct FabricBridge {
     /// Block ids whose use was already reported as changing the held item, so
     /// a click on one does not flood the log.
     hand_change_logged: std::collections::HashSet<String>,
+    /// The menu a block's use opened (`Player.openMenu`), for the host to show
+    /// once it has applied the use's effects.
+    pending_menu: Option<blocks::OpenedMenu>,
+    /// The block whose use opened `pending_menu`.
+    pending_menu_block: Option<String>,
     /// Block ids whose tick had to keep its heap scope (class init, a static
     /// or a cache kept a scoped object), logged once each.
     scope_kept_logged: std::collections::HashSet<String>,
@@ -358,6 +364,8 @@ impl FabricBridge {
             last_render_tick: None,
             hovered_tooltip: None,
             block_facts_cache: block_cache::BlockFactsCache::new(None),
+            pending_menu: None,
+            pending_menu_block: None,
             hand_change_logged: std::collections::HashSet::new(),
             scope_kept_logged: std::collections::HashSet::new(),
             census: None,
@@ -511,6 +519,8 @@ impl FabricBridge {
             last_render_tick: None,
             hovered_tooltip: None,
             block_facts_cache: block_cache::BlockFactsCache::new(None),
+            pending_menu: None,
+            pending_menu_block: None,
             hand_change_logged: std::collections::HashSet::new(),
             scope_kept_logged: std::collections::HashSet::new(),
             census: None,
@@ -959,6 +969,20 @@ impl FabricBridge {
                 ))
                 .or_default()
                 .push(added.clone());
+        }
+        // An `@Accessor`/`@Invoker` mixin is an interface Mixin merges into its
+        // target class, so a value of that class is an instance of it: a cast
+        // to the accessor interface must succeed (Fabric's own lookup API casts
+        // a `BlockEntityType` to `BlockEntityTypeAccessor`).
+        for accessor in &self.mixins.accessors {
+            let interfaces = self
+                .interp
+                .mixin_interfaces
+                .entry(accessor.target_class.clone())
+                .or_default();
+            if !interfaces.contains(&accessor.interface) {
+                interfaces.push(accessor.interface.clone());
+            }
         }
         self.interp.mixin_accessors = self
             .mixins

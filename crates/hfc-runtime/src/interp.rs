@@ -949,13 +949,15 @@ impl Interpreter {
     /// A fresh, uninitialized instance of `cls`, as `new` produces before the
     /// constructor runs.
     #[inline(never)]
-    pub(crate) fn alloc_uninitialized(&mut self, cls: &str) -> usize {
+    pub fn alloc_uninitialized(&mut self, cls: &str) -> usize {
         match cls {
             "java/util/ArrayList" | "java/util/LinkedList" => {
                 self.heap.alloc(JavaObject::List(Vec::new()))
             }
-            // `TreeMap`/`TreeSet` are not modelled: their order is the
-            // comparator's, so they run as the JDK's own bytecode.
+            // `TreeMap`/`TreeSet` run as the JDK's own bytecode too, and so do
+            // `EnumMap`/`EnumSet`: their order is the enum's, and their
+            // `typeCheck` compares `getClass()` with the `keyType` their own
+            // constructor stored, which only real bytecode keeps.
             "java/util/HashMap"
             | "java/util/LinkedHashMap"
             | "java/util/concurrent/ConcurrentHashMap" => {

@@ -655,6 +655,15 @@ pub struct Level {
     /// `Level.scheduleTick` calls, in order: position, the block's heap id and
     /// the delay in ticks.
     pub scheduled: Vec<([i32; 3], usize, i32)>,
+    /// The block entities standing in this snapshot, by position: the heap id
+    /// of the mod's own `BlockEntity` object, made by `EntityBlock.newBlockEntity`
+    /// (`Level.getBlockEntity` answers it).
+    pub block_entities: HashMap<[i32; 3], usize>,
+    /// Block entities made during this call, for the bridge to keep for the
+    /// host's position (`newBlockEntity` on first use or tick).
+    pub made_block_entities: Vec<([i32; 3], usize)>,
+    /// `Player.openMenu(MenuProvider)` calls, in order: the provider object.
+    pub menus: Vec<usize>,
 }
 
 impl Level {
@@ -672,6 +681,9 @@ impl Level {
             broken: Vec::new(),
             particles: Vec::new(),
             scheduled: Vec::new(),
+            block_entities: HashMap::new(),
+            made_block_entities: Vec::new(),
+            menus: Vec::new(),
         }
     }
 
@@ -752,6 +764,12 @@ pub struct Player {
     /// `setItemInHand` put another stack (or none, `Some(None)`) in the
     /// acting hand.
     pub hand_replaced: Option<Option<usize>>,
+    /// What `Player.getInventory().add(stack)` put in the player's inventory:
+    /// `(item id, count)` per call, for the host to give.
+    pub added: Vec<(String, i32)>,
+    /// `LivingEntity.equipment`: the heap id of the player's real
+    /// `EntityEquipment`, made the first time mod code reads it.
+    pub equipment: Option<usize>,
 }
 
 impl Player {
@@ -772,6 +790,8 @@ impl Player {
             hand_stack: None,
             hand_is_off: false,
             hand_replaced: None,
+            added: Vec::new(),
+            equipment: None,
         }
     }
 }

@@ -107,7 +107,14 @@ install the result safely.
 - Fabric Loader entry points, Mixins, access wideners and Fabric API.
 - Client screens, keybinds, HUD, rendering hooks and client events; the experimental runtime
   has a partial screen host, but it is not part of the installer and makes no general claim.
-- Networking, entities, block entities, menus, inventories as *behaviour*.
+- Networking, entities and recipes as *behaviour*. The experimental runtime runs a registered
+  block's own block entity (`newBlockEntity`, `getTicker` and its tick, `saveAdditional`/
+  `loadAdditional` through `ValueOutput`/`ValueInput`) and the menu its code opens with
+  `Player.openMenu` (shown as the mod's own screen when the client registers one for the menu's
+  type via `MenuScreens`, else the host's container grid backed by the block entity's own
+  inventory), but not codec-based save data or a recipe check; see
+  `docs/architecture/fabric-runtime.md` (stage C4).
+- Inventories as *behaviour* outside a block's own block entity code.
 - Anything that requires Minecraft Java classes or a JVM.
 - Iris/OptiFine shader packs.
 - Automatic generation or compilation of native Horizon mods.

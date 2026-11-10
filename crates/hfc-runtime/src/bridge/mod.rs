@@ -49,6 +49,13 @@ pub trait HostBridge {
     fn held_item(&self) -> Option<String> {
         None
     }
+    /// The player's own inventory, slot by slot (`(item, count)`; `None` for
+    /// an empty slot). A screen draws these in its player-slot region, so a
+    /// host that answers nothing shows an empty strip. Hosts that cannot say
+    /// leave the default (no slots).
+    fn inventory(&self) -> Vec<Option<(String, i32)>> {
+        Vec::new()
+    }
     /// The item id in the player's off hand, if the host knows it.
     fn off_hand_item(&self) -> Option<String> {
         None

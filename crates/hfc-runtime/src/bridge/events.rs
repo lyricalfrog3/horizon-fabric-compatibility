@@ -528,6 +528,9 @@ impl FabricBridge {
         if block_id == "minecraft:air" || block_id.is_empty() {
             return Flow::Continue;
         }
+        // The player's own inventory, for the menu a block may open: its
+        // player slots read this snapshot.
+        self.interp.heap.inventory = host.inventory();
 
         // 1. Prepare initial BlockState from Host
         let mut block_state = BlockState::new(&block_id);

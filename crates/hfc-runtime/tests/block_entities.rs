@@ -53,6 +53,8 @@ fn farmers_delight() -> Option<FabricBridge> {
 struct World {
     heated: bool,
     held: Option<String>,
+    /// The player's own inventory, as the host reports it.
+    inventory: Vec<Option<(String, i32)>>,
 }
 
 impl HostBridge for World {
@@ -100,6 +102,9 @@ impl HostBridge for World {
     fn held_item(&self) -> Option<String> {
         self.held.clone()
     }
+    fn inventory(&self) -> Vec<Option<(String, i32)>> {
+        self.inventory.clone()
+    }
 }
 
 fn click() -> RightClickBlockEvent {
@@ -123,6 +128,7 @@ fn a_blocks_new_block_entity_is_the_mods_own_object_and_keeps_its_contents() {
     let world = World {
         heated: false,
         held: None,
+        inventory: Vec::new(),
     };
     assert!(
         bridge.ensure_block_entity(&world, [4, 1, 4], POT),
@@ -183,6 +189,7 @@ fn the_pots_own_use_runs_with_an_empty_hand_and_consumes_the_click() {
         let world = World {
             heated: false,
             held: held.clone(),
+            inventory: Vec::new(),
         };
         let outcome = bridge.block_used(&world, &click());
         assert!(
@@ -212,6 +219,7 @@ fn the_pots_ticker_runs_its_own_cooking_tick() {
     let world = World {
         heated: true,
         held: None,
+        inventory: Vec::new(),
     };
     assert!(bridge.ensure_block_entity(&world, [4, 1, 4], POT));
     // With nothing in it, `hasInput()` is false: the tick clamps `cookTime`
@@ -234,6 +242,7 @@ fn the_pots_ticker_runs_its_own_cooking_tick() {
     let mut world = World {
         heated: true,
         held: None,
+        inventory: Vec::new(),
     };
     assert_eq!(bridge.tick_block_entities(&mut world), 1);
     world.heated = false;
@@ -268,6 +277,7 @@ fn the_pots_save_and_load_runs_its_own_methods() {
     let world = World {
         heated: false,
         held: None,
+        inventory: Vec::new(),
     };
     assert!(bridge.ensure_block_entity(&world, [4, 1, 4], POT));
     let saved = bridge
@@ -319,6 +329,7 @@ fn a_saved_field_is_the_one_the_entity_holds() {
     let world = World {
         heated: false,
         held: None,
+        inventory: Vec::new(),
     };
     assert!(bridge.ensure_block_entity(&world, [4, 1, 4], POT));
     bridge.debug_set_block_entity_field([4, 1, 4], POT, "cookTime", 37);
@@ -421,6 +432,7 @@ fn the_pots_own_menu_builds_from_its_create_menu() {
     let mut world = World {
         heated: false,
         held: None,
+        inventory: Vec::new(),
     };
     // The host's own path: the click runs the block's use and keeps the menu
     // it opened for the host to show.
@@ -456,6 +468,7 @@ fn a_menu_click_reaches_the_pots_own_inventory() {
     let world = World {
         heated: true,
         held: None,
+        inventory: Vec::new(),
     };
     let BlockUse::Handled(_) = bridge.block_used(&world, &click()) else {
         panic!("the pot's use did not run");
@@ -484,6 +497,7 @@ fn a_registered_menu_type_opens_the_mods_own_screen() {
     let mut world = World {
         heated: false,
         held: None,
+        inventory: Vec::new(),
     };
     // The pot's own use runs and opens its menu; with a `MenuScreens` entry
     // for the pot's `MenuType`, the host also shows the mod's real screen.
@@ -527,5 +541,96 @@ fn a_registered_menu_type_opens_the_mods_own_screen() {
             GuiDraw::Blit { texture, .. } if texture.contains("cooking_pot")
         )),
         "the pot screen's draws miss its own background texture: {draws:?}"
+    );
+}
+
+/// A mod screen's player slots show what the player really carries. The menu
+/// lists them through `Inventory.getItem`, which answered an empty stack for
+/// every slot before the host's own inventory reached the snapshot, so the
+/// strip drew blank while the player held items.
+#[test]
+fn the_player_inventory_reaches_the_pots_menu() {
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    let mut world = World {
+        heated: false,
+        held: None,
+        inventory: vec![
+            Some(("minecraft:beef".into(), 3)),
+            None,
+            Some(("farmersdelight:tomato".into(), 7)),
+        ],
+    };
+    assert_eq!(
+        bridge.right_click_block(&mut world, &click()),
+        hfc_runtime::bridge::Flow::Cancel,
+        "the pot's use did not consume the click"
+    );
+    let (block, menu) = bridge.take_opened_menu().expect("the pot opened no menu");
+    assert_eq!(block, POT);
+    // The pot's menu has 45 slots: 9 of its own, then 36 player slots
+    // (`CookingPotMenu`'s layout), so the player's inventory appears in the
+    // menu's own items.
+    assert_eq!(menu.slots, 45, "the pot's menu changed shape");
+    let carried: Vec<(usize, String, i32)> = menu
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            slot.as_ref()
+                .map(|(item, count)| (index, item.clone(), *count))
+        })
+        .collect();
+    assert!(
+        carried
+            .iter()
+            .any(|(_, item, count)| item == "minecraft:beef" && *count == 3),
+        "the player's beef did not reach the menu: {carried:?}"
+    );
+    assert!(
+        carried
+            .iter()
+            .any(|(_, item, count)| item == "farmersdelight:tomato" && *count == 7),
+        "the player's tomato did not reach the menu: {carried:?}"
+    );
+}
+
+/// An open screen is drawn from the pointer's own position. Rendering it with
+/// the mouse at (0, 0) whatever the pointer does left every hover state, slot
+/// highlight and tooltip out of the display list, so the menu looked dead.
+#[test]
+fn a_screens_draws_follow_the_pointer() {
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    let mut world = World {
+        heated: false,
+        held: None,
+        inventory: Vec::new(),
+    };
+    assert_eq!(
+        bridge.right_click_block(&mut world, &click()),
+        hfc_runtime::bridge::Flow::Cancel
+    );
+    let _ = bridge.take_opened_menu();
+    assert!(bridge.has_screen(), "the pot opened no screen");
+
+    // Away from every widget, then over the pot's own recipe-book button
+    // (the screen blits it at (557, 311) and turns it bright while hovered).
+    bridge.mouse_moved(2.0, 2.0);
+    let away = bridge
+        .render_screen(1280, 720, 0.0)
+        .expect("render failed")
+        .expect("no draws");
+    bridge.mouse_moved(560.0, 320.0);
+    let over = bridge
+        .render_screen(1280, 720, 0.0)
+        .expect("render failed")
+        .expect("no draws");
+    assert_ne!(
+        away, over,
+        "the screen drew the same list with the pointer in two places: \
+         the mouse position never reached it"
     );
 }

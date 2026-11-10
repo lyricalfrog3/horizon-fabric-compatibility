@@ -109,6 +109,13 @@ impl FabricBridge {
             .interp
             .heap
             .alloc_native(GuiGraphics::new(width, height));
+        // The pointer's own position: a screen draws hover states, tooltips
+        // and slot highlights from it, so a screen rendered with (0, 0) looks
+        // dead whatever the mouse does.
+        let (mouse_x, mouse_y) = (
+            self.last_mouse.0.round() as i32,
+            self.last_mouse.1.round() as i32,
+        );
         self.interp
             .with_budget(super::ENTRYPOINT_BUDGET, |interp| {
                 interp.execute_method(
@@ -118,8 +125,8 @@ impl FabricBridge {
                     &[
                         screen,
                         Value::Object(Some(graphics)),
-                        Value::Int(0),
-                        Value::Int(0),
+                        Value::Int(mouse_x),
+                        Value::Int(mouse_y),
                         Value::Float(partial_tick),
                     ],
                 )

@@ -8114,7 +8114,21 @@ pub fn dispatch_builtin(
     // meal it made back through its menu, not through this call, so nothing a
     // player sees depends on it; a mod that checks the answer still gets the
     // truth (the stack was taken).
-    if class_name == "net/minecraft/world/entity/player/Inventory" {
+    // The player's inventory answers through `Container` as well as through
+    // its own class: `Slot.getItem` calls `Container.getItem` through the
+    // interface, so a builtin keyed on `Inventory` alone never sees the read
+    // and every player slot of a screen drew empty.
+    if class_name == "net/minecraft/world/entity/player/Inventory"
+        || (class_name == "net/minecraft/world/Container"
+            && args
+                .first()
+                .and_then(|value| value.as_obj())
+                .and_then(|id| heap.get(id))
+                .is_some_and(|object| {
+                    matches!(object, JavaObject::Instance { class_name, .. }
+                        if class_name == "net/minecraft/world/entity/player/Inventory")
+                }))
+    {
         if method_name == "add" && args.len() >= 2 {
             let added = args[1]
                 .as_obj()
@@ -8141,15 +8155,42 @@ pub fn dispatch_builtin(
             method_name,
             "getContainerSize" | "getFreeSlot" | "getSelectedSlot"
         ) {
-            return BuiltinResult::Handled(Value::Int(0));
+            let inventory = heap.inventory.clone();
+            return BuiltinResult::Handled(match method_name {
+                // `getFreeSlot` is the first empty main slot; the snapshot's
+                // own length is the honest answer for one it does not know.
+                "getContainerSize" => Value::Int(inventory.len() as i32),
+                _ => Value::Int(
+                    inventory
+                        .iter()
+                        .position(|slot| slot.is_none())
+                        .map(|slot| slot as i32)
+                        .unwrap_or(0),
+                ),
+            });
         }
         if method_name == "isEmpty" {
-            return BuiltinResult::Handled(Value::from_bool(true));
+            return BuiltinResult::Handled(Value::from_bool(
+                heap.inventory.iter().all(Option::is_none),
+            ));
         }
         if matches!(method_name, "getItem" | "removeItem" | "getSelected") {
-            return BuiltinResult::Handled(Value::Object(Some(
-                heap.alloc_item_stack(ItemStack::empty()),
-            )));
+            // Read the host's own inventory through the level the player's
+            // snapshot carries: a screen draws these slots, and answering
+            // empty for all of them made a mod screen show a blank player
+            // strip while the player's inventory really held items.
+            let inventory = heap.inventory.clone();
+            let slot = args.get(1).map(Value::as_int).unwrap_or(0);
+            let held = usize::try_from(slot)
+                .ok()
+                .and_then(|slot| inventory.get(slot).cloned().flatten());
+            let stack = match held {
+                Some((item, count)) if count > 0 && item != "minecraft:air" => {
+                    ItemStack::new(&item, count)
+                }
+                _ => ItemStack::empty(),
+            };
+            return BuiltinResult::Handled(Value::Object(Some(heap.alloc_item_stack(stack))));
         }
         return BuiltinResult::Handled(Value::NULL);
     }

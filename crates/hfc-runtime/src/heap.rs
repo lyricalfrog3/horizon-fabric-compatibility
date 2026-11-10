@@ -30,6 +30,11 @@ pub struct Heap {
     /// What mods asked of the host's desktop (open a link or a folder, copy
     /// text), taken by the host with `FabricBridge::take_host_requests`.
     pub host_requests: Vec<crate::bridge::HostRequest>,
+    /// The player's own inventory as the host last reported it, slot by slot
+    /// (`(item, count)`, `None` for an empty slot). `Inventory.getItem` reads
+    /// it: a screen's player slots are built from an `Inventory` the runtime
+    /// allocates itself, so they must not depend on one carrying a player.
+    pub inventory: Vec<Option<(String, i32)>>,
     /// The text `ClipboardManager.getClipboard` answers: the last text a mod
     /// copied, or what the host put there.
     pub clipboard: String,
@@ -170,6 +175,7 @@ impl Heap {
             identifiers: HashMap::new(),
             registries: crate::registry::Registries::default(),
             host_requests: Vec::new(),
+            inventory: Vec::new(),
             clipboard: String::new(),
             registered_items: Vec::new(),
             registered_blocks: Vec::new(),

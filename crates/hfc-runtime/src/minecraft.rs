@@ -770,6 +770,11 @@ pub struct Player {
     /// `LivingEntity.equipment`: the heap id of the player's real
     /// `EntityEquipment`, made the first time mod code reads it.
     pub equipment: Option<usize>,
+    /// `Player.containerMenu`: the menu this player has open, as a heap id.
+    /// `AbstractContainerMenu.clicked` reads it back through
+    /// `MultiPlayerGameMode.handleContainerInput`, which is what runs a slot
+    /// click's rules; without it a click had no menu to apply to.
+    pub container_menu: Option<usize>,
 }
 
 impl Player {
@@ -792,6 +797,7 @@ impl Player {
             hand_replaced: None,
             added: Vec::new(),
             equipment: None,
+            container_menu: None,
         }
     }
 }

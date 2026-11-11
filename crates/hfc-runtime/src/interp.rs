@@ -733,6 +733,18 @@ impl Interpreter {
                 _ => Value::NULL,
             };
         }
+        // `Player.containerMenu`: the menu the player has open. A JVM field
+        // reads through the player's own class; a host-backed `Player` is a
+        // native object, so a mod's bytecode (`handleContainerInput` reads
+        // `player.containerMenu`) has to find it here.
+        if field_name == "containerMenu" {
+            if let Some(player) = self.heap.get_native::<Player>(id) {
+                return player
+                    .container_menu
+                    .map(|menu| Value::Object(Some(menu)))
+                    .unwrap_or(Value::NULL);
+            }
+        }
         if field_name == "gameMode" {
             if let Some(player) = self.heap.get_native::<Player>(id) {
                 let level_id = player.level_id;
@@ -4500,6 +4512,26 @@ impl Interpreter {
 
         if class_name == "net/minecraft/sounds/SoundEvents" {
             let id = self.heap.alloc_string(field_name);
+            return Value::Object(Some(id));
+        }
+
+        // `DataComponents`' constants name the component types an item's
+        // `DataComponentMap` is keyed by. The real `<clinit>` registers them
+        // into Minecraft's built-in registries (tens of seconds in the
+        // interpreter), and a stand-in for the wrong class makes every
+        // component lookup miss: `ItemStack.getMaxStackSize()` then answers
+        // the `getOrDefault` fallback of 1 for every item, and vanilla's own
+        // `ItemStackHandler.extractItem` takes its "partial" branch and
+        // destroys the stack. The stand-in keeps the field's own name, which
+        // is what a component lookup compares.
+        if class_name == "net/minecraft/core/component/DataComponents" {
+            let name = self.heap.alloc_string(field_name);
+            let mut fields = HashMap::new();
+            fields.insert("name".to_string(), Value::Object(Some(name)));
+            let id = self.heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/core/component/DataComponentType".into(),
+                fields,
+            });
             return Value::Object(Some(id));
         }
 

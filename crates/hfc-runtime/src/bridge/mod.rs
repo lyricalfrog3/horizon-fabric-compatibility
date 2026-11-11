@@ -631,6 +631,57 @@ impl FabricBridge {
         self.interp.missing.clone()
     }
 
+    /// `AbstractContainerMenu.getCarried()` of the open screen's own menu,
+    /// as the host's click path leaves it: `(item, count)` when the menu
+    /// carries a stack, `None` when it carries nothing.
+    pub fn debug_menu_carried(&mut self) -> Option<(String, i32)> {
+        let screen = self.current_screen()?;
+        let menu = self.menu_of_screen(&screen)?;
+        let carried = self
+            .interp
+            .execute_method(
+                "net/minecraft/world/inventory/AbstractContainerMenu",
+                "getCarried",
+                "()Lnet/minecraft/world/item/ItemStack;",
+                &[menu],
+            )
+            .ok()?;
+        let id = carried.as_obj()?;
+        self.interp
+            .heap
+            .get_native::<ItemStack>(id)
+            .map(|stack| (stack.item.id.clone(), stack.count))
+            .filter(|(item, count)| *count > 0 && item != "minecraft:air")
+    }
+
+    /// Where a menu slot sits in GUI pixels: the open screen's `leftPos`/
+    /// `topPos` plus the slot's own `x`/`y`. This is the point the client's
+    /// mouse handler sends, so a test clicks where a player would.
+    pub fn debug_menu_slot_screen_pos(&mut self, slot: usize) -> Option<(f64, f64)> {
+        let screen = self.current_screen()?;
+        let menu = self.menu_of_screen(&screen)?;
+        let x = self.interp.instance_field(&screen, "leftPos")?.as_int();
+        let y = self.interp.instance_field(&screen, "topPos")?.as_int();
+        let entry = self
+            .interp
+            .execute_method(
+                "net/minecraft/world/inventory/AbstractContainerMenu",
+                "getSlot",
+                "(I)Lnet/minecraft/world/inventory/Slot;",
+                &[menu, Value::Int(slot as i32)],
+            )
+            .ok()?;
+        let slot_x = self.interp.instance_field(&entry, "x")?.as_int();
+        let slot_y = self.interp.instance_field(&entry, "y")?.as_int();
+        // The middle of the 16x16 slot, as a player aims.
+        Some((f64::from(x + slot_x + 8), f64::from(y + slot_y + 8)))
+    }
+
+    /// The menu the open screen shows (`Screen.menu`).
+    fn menu_of_screen(&self, screen: &Value) -> Option<Value> {
+        self.interp.instance_field(screen, "menu")
+    }
+
     /// Walk every entrypoint's transitive class references. Classes found are
     /// parsed and cached; classes that no registered jar or JDK image provides
     /// are reported, which is what a mod will actually fail on.

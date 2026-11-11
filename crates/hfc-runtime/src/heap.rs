@@ -101,6 +101,21 @@ pub struct Heap {
     /// A scoped object was stored where the final reference scan cannot see
     /// it (a class's static fields, the interpreter's caches).
     escaped: bool,
+    /// Objects older than the open scope that were written since it opened
+    /// ([`Heap::note_write`]). An id `>= mark` did not exist when the scope
+    /// opened, so an older object can only hold one if this scope wrote it
+    /// there: scanning the written objects is the same question as scanning
+    /// the whole heap, without walking every object the game ever allocated.
+    dirty: Vec<usize>,
+    /// The scope generation each object was last written in, parallel to
+    /// `objects`. A write notes the id only once per scope, so the barrier is
+    /// an array store rather than a hash lookup.
+    write_stamp: Vec<u32>,
+    /// The generation [`Heap::begin_scope`] gave the open scope.
+    write_epoch: u32,
+    /// How many objects the last [`Heap::refs_into`] examined, for tests that
+    /// pin the scan to the writes rather than to the heap size.
+    scanned: std::cell::Cell<usize>,
 }
 
 /// One `WritableRegistry.register(key, value, info)` into a built-in registry.
@@ -198,6 +213,10 @@ impl Heap {
             unsupported_creative_tab_calls: Vec::new(),
             scope: None,
             escaped: false,
+            dirty: Vec::new(),
+            write_stamp: Vec::new(),
+            write_epoch: 1,
+            scanned: std::cell::Cell::new(0),
         }
     }
 
@@ -273,6 +292,16 @@ impl Heap {
     pub fn begin_scope(&mut self) {
         self.scope = Some(self.objects.len());
         self.escaped = false;
+        self.dirty.clear();
+        // A fresh generation invalidates every older write's stamp, so the
+        // clears that `end_scope` would otherwise need a walk for.
+        self.write_epoch = self.write_epoch.wrapping_add(1);
+        if self.write_epoch == 0 {
+            // The generation counter wrapped: every stamp is stale, so forget
+            // them rather than mistake an old write for this scope's.
+            self.write_stamp.fill(0);
+            self.write_epoch = 1;
+        }
     }
 
     /// The open scope's first id, when one is open.
@@ -292,6 +321,14 @@ impl Heap {
         self.escaped
     }
 
+    /// The number of objects the last [`Heap::refs_into`] examined: the writes
+    /// since the scope opened, not the whole heap. A test pins it so a
+    /// regression back to the full scan is visible.
+    #[doc(hidden)]
+    pub fn refs_scanned(&self) -> usize {
+        self.scanned.get()
+    }
+
     /// Close the open scope, truncating the objects allocated inside it unless
     /// `escaped` (or an earlier [`Heap::note_escape`]) says something kept
     /// one. Returns whether it truncated.
@@ -303,13 +340,21 @@ impl Heap {
         self.escaped = false;
         if !escaped {
             self.objects.truncate(mark);
+            self.write_stamp.truncate(mark);
         }
+        self.dirty.clear();
         !escaped
     }
 
     /// Whether an id `>= mark` is reachable from what the heap keeps between
     /// calls (interned ids, singletons, registrations, the block state cache)
-    /// or from any object older than `mark`.
+    /// or from an object older than `mark`.
+    ///
+    /// An id `>= mark` was allocated after the scope opened, so the only way
+    /// an older object can hold one is a write this scope made into it. The
+    /// scan therefore walks the objects written since the scope opened (the
+    /// write barrier in [`Heap::get_mut`]) instead of every object on the
+    /// heap: with a large modpack the full walk cost milliseconds per tick.
     pub fn refs_into(&self, mark: usize) -> bool {
         let value = |value: &Value| value.as_obj().is_some_and(|id| id >= mark);
         if self.interned_strings.values().any(|id| *id >= mark)
@@ -333,16 +378,27 @@ impl Heap {
         {
             return true;
         }
-        self.objects[..mark.min(self.objects.len())]
-            .iter()
-            .flatten()
-            .any(|object| object_refs_into(object, mark))
+        // A write into an object allocated after `mark` needs no scan: the
+        // whole object is freed with the scope unless the checks above keep it.
+        let mut scanned = 0;
+        let found = self.dirty.iter().filter(|id| **id < mark).any(|id| {
+            scanned += 1;
+            self.objects
+                .get(*id)
+                .and_then(Option::as_ref)
+                .is_some_and(|object| object_refs_into(object, mark))
+        });
+        self.scanned.set(scanned);
+        found
     }
 
     /// Allocate a new object and return its ID.
     pub fn alloc(&mut self, obj: JavaObject) -> usize {
         let id = self.objects.len();
         self.objects.push(Some(obj));
+        // Keep the write-stamp array parallel to `objects`: a slot allocated
+        // in the open scope is freed with it, so it only needs a neutral stamp.
+        self.write_stamp.push(0);
         id
     }
 
@@ -418,8 +474,38 @@ impl Heap {
     }
 
     /// Get a mutable object reference by ID.
+    ///
+    /// This is the heap's write barrier: a mutable borrow is the only way to
+    /// store a scoped object into an older one, so the id is noted and
+    /// [`Heap::refs_into`] scans it when the scope closes.
     pub fn get_mut(&mut self, id: usize) -> Option<&mut JavaObject> {
+        self.note_write(id);
         self.objects.get_mut(id).and_then(Option::as_mut)
+    }
+
+    /// Note that `id` may have been written, so the reference scan examines it
+    /// when the open scope closes. Reads go through [`Heap::get`] and are not
+    /// noted. An id written twice in one scope is noted once: the stamp is a
+    /// generation number, not a flag that needs clearing.
+    pub fn note_write(&mut self, id: usize) {
+        let Some(mark) = self.scope else {
+            return;
+        };
+        // An object allocated inside the scope goes away with it unless
+        // something outside keeps it, and reaching such an object from outside
+        // means passing through an older one this scan would see. So only
+        // writes into older objects can change the answer.
+        if id >= mark {
+            return;
+        }
+        if self.write_stamp.len() <= id {
+            self.write_stamp.resize(self.objects.len(), 0);
+        }
+        if self.write_stamp[id] == self.write_epoch {
+            return;
+        }
+        self.write_stamp[id] = self.write_epoch;
+        self.dirty.push(id);
     }
 
     /// Get a string value by ID.
@@ -597,5 +683,117 @@ mod scope_tests {
         // The intern table hands the id out later, so it must survive.
         assert!(heap.refs_into(mark));
         assert!(!heap.end_scope(true));
+    }
+
+    /// The scan is bounded by what the scope wrote, not by the heap: a heap of
+    /// many untouched objects is as cheap to close as a small one. This is the
+    /// regression guard for the full-heap walk that cost ~8 ms per block
+    /// entity tick in a modpack.
+    #[test]
+    fn the_scan_examines_the_writes_not_the_whole_heap() {
+        let mut heap = Heap::new();
+        for _ in 0..10_000 {
+            heap.alloc(instance());
+        }
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        heap.alloc(instance());
+        assert!(!heap.refs_into(mark));
+        assert_eq!(
+            heap.refs_scanned(),
+            0,
+            "the scan looked at {} untouched objects",
+            heap.refs_scanned()
+        );
+
+        // One write into an old object is examined and does reach the scope.
+        let fresh = heap.alloc(instance());
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(7) {
+            fields.insert("kept".into(), super::Value::Object(Some(fresh)));
+        }
+        assert!(heap.refs_into(mark));
+        assert_eq!(
+            heap.refs_scanned(),
+            1,
+            "the scan examined {} objects, not just the write",
+            heap.refs_scanned()
+        );
+        assert!(!heap.end_scope(true));
+    }
+
+    /// A write into an object allocated inside the scope is not scanned: the
+    /// object is freed with the scope anyway, and reaching it from outside
+    /// would mean passing through an older object the scan does see.
+    #[test]
+    fn a_write_into_a_scoped_object_needs_no_scan() {
+        let mut heap = Heap::new();
+        let old = heap.alloc(instance());
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        let fresh = heap.alloc(instance());
+        let also = heap.alloc(instance());
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(fresh) {
+            fields.insert("kept".into(), super::Value::Object(Some(also)));
+        }
+        assert!(!heap.refs_into(mark));
+        assert_eq!(heap.refs_scanned(), 0);
+        assert!(heap.end_scope(false));
+        assert_eq!(heap.object_count(), old + 1);
+    }
+
+    /// The write barrier only applies while a scope is open: outside one there
+    /// is nothing to scan and nothing to remember.
+    #[test]
+    fn a_write_outside_a_scope_is_not_recorded() {
+        let mut heap = Heap::new();
+        let old = heap.alloc(instance());
+        let fresh = heap.alloc(instance());
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(old) {
+            fields.insert("kept".into(), super::Value::Object(Some(fresh)));
+        }
+        assert!(heap.dirty.is_empty());
+        // Nor does a later scope inherit it: the write predates the scope, so
+        // no id it holds was allocated inside it.
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        heap.alloc(instance());
+        assert!(!heap.refs_into(mark));
+        assert_eq!(heap.refs_scanned(), 0);
+    }
+
+    /// A write outside a scope that a *later* scope repeats is seen by that
+    /// scope: the barrier records by generation, so each scope gets its own
+    /// entry for the same object.
+    #[test]
+    fn the_same_object_written_in_a_later_scope_is_scanned_then() {
+        let mut heap = Heap::new();
+        let old = heap.alloc(instance());
+        heap.begin_scope();
+        let first = heap.scope_mark().unwrap();
+        let fresh = heap.alloc(instance());
+        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(old) {
+            fields.insert("kept".into(), super::Value::Object(Some(fresh)));
+        }
+        assert!(heap.refs_into(first));
+        assert_eq!(heap.refs_scanned(), 1);
+        assert!(!heap.end_scope(true));
+
+        heap.begin_scope();
+        let second = heap.scope_mark().unwrap();
+        assert!(
+            !heap.refs_into(second),
+            "a closed scope's writes leaked into the next one"
+        );
+        assert_eq!(heap.refs_scanned(), 0);
+        heap.get_mut(old).unwrap();
+        // The write is old enough to have existed in the earlier scope, but
+        // this scope has to note it again: the answer is per scope.
+        assert!(!heap.refs_into(second));
+        assert_eq!(
+            heap.refs_scanned(),
+            1,
+            "the next scope did not note the write"
+        );
+        heap.end_scope(false);
     }
 }

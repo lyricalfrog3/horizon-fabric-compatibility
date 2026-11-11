@@ -103,7 +103,7 @@ the server applies the harvest.
 | Fabric `ScreenEvents.AFTER_INIT` | dispatched | runs for every initialized mod screen |
 | Fabric `ClientTickEvents` | dispatched | runs once per host tick, before the screen tick |
 | Fabric key mappings | supported | `KeyMapping`, `KeyMappingHelper` and `consumeClick`; the host binds by translation key or physical key |
-| Mixins / access wideners | **partially applied** | menu-widget `@Inject` callbacks run with synthesized screen/layout locals; non-cancellable `@Inject(at = HEAD)` callbacks on `GuiGraphicsExtractor.tooltip` run with the real receiver and arguments (title centring). Cancellable HEAD callbacks and draw-code transforms need the real target body and are ignored |
+| Mixins / access wideners | **partially applied** | `@Inject(at = HEAD\|TAIL)` callbacks whose target resolves to interpreted bytecode run around the real target body, with the target's receiver and parameters and a real `CallbackInfo`/`CallbackInfoReturnable`: `cancel()` and `setReturnValue()` change what the method does. `@Invoke`/MixinExtras points, `@ModifyArg`/`@ModifyVariable`/`@Redirect`/`@WrapOperation` and draw-code transforms are not applied, and are recorded unsupported with a reason. Menu-widget callbacks keep their synthesized-locals seam |
 
 ### Mod Menu
 
@@ -136,7 +136,47 @@ native menu, and Done/Escape returns to it. The pinned tests assert both menus p
 This is **not general Mixin support**. The vanilla layout method itself is not executed, so the
 callback runs with synthesized locals and the widget is host-placed; `@ModifyArg`,
 `@ModifyVariable`, `@Redirect`, `@WrapOperation`, MixinExtras expressions
-and all gameplay/draw-code transforms are not applied. Menu buttons whose sprites are not in the HUD atlas (Mod Menu's own icon) are resolved by
+and all gameplay/draw-code transforms are not applied.
+
+### `@Inject` on an interpreted method
+
+A `@Inject` whose target is a method the interpreter runs is applied by the interpreter, not by
+a class-file rewrite. Every mod and Minecraft method this runtime executes goes through
+`Interpreter::execute_method_inner`, so the interpreter is the one place where "before the
+body" and "after the body" both exist. `mixin::verify_injector` checks each parsed annotation
+against the classpath — the target class loads, the target method resolves to exactly one body
+in its superclass chain, the callback exists and takes the target's parameters followed by the
+matching `CallbackInfo` — and only a verified injector becomes a `WiredInjector`.
+`FabricBridge::init` hands that set to the interpreter (`set_mixin_injectors`), which runs the
+callbacks at the class that declares the target body:
+
+- `HEAD` runs before the body with the receiver, the method's real arguments and a fresh
+  `CallbackInfo`/`CallbackInfoReturnable`. A callback that cancels makes the method return
+  immediately — `void` returns nothing, and a returnable returns `getReturnValue*()` — so the
+  body never runs. This is what Mixin's inserted `if (ci.isCancelled()) return ...;` does.
+- `TAIL` runs after the body with the value it is about to return as the callback info's
+  initial value; a cancel replaces that value.
+
+The callback object is `crate::minecraft::CallbackInfo`, a native object whose builtins answer
+Mixin's contract: `cancel()` (which flags it), `isCancelled`, `isCancellable`, `getId`,
+`getReturnValue`/`getReturnValueI`/`J`/`F`/`D`/`Z`/`B`/`C`/`S` (an unset value reads as the
+type's zero) and `setReturnValue`, which records the value **and cancels**, exactly as Mixin's
+does. A callback that cancels a non-cancellable injection raises `CancellationException`, as
+Mixin's `cancel()` throws.
+
+An annotation that cannot be applied is recorded in `MixinManifest::unsupported` with its reason
+(an unresolvable target, an overloaded target with no descriptor in the annotation, a
+`CallbackInfo`/`CallbackInfoReturnable` mismatch, a callback whose parameters are not the
+target's, an `INVOKE`/MixinExtras point) and is **not** reported as applied. The census's
+`applied` outcome now means "wired and dispatched by the interpreter"; a target whose
+annotations parsed but were never wired is `partial` or `ignored`. `supported()` on a parsed
+`MixinInjector` is only a parse check and must not be read as compatibility.
+
+Mixin passes the callback a *merged* view of the target: `this` is the target receiver, not an
+instance of the mixin class. The runtime passes that receiver, so a callback's `getfield`/
+`putfield` reach the target object's own field table by name — which is what a `@Shadow` field
+compiles to. No separate shadow-field merge happens; the names simply line up because both
+classes refer to the same field name on the same object. Menu buttons whose sprites are not in the HUD atlas (Mod Menu's own icon) are resolved by
 `FabricBridge::gui_texture`: a `namespace:path` sprite is read from
 `assets/<namespace>/textures/gui/sprites/<path>.png` in the loaded mods' jars, decoded by the host
 and placed in the atlas's run-time region, the same way registered icons are. Title/pause widgets

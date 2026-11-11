@@ -143,11 +143,36 @@ pub fn interface_methods_from_class(class: &Class) -> Vec<MixinInterfaceMethod> 
 /// Every injector (applied or unsupported) found in the loaded mods.
 #[derive(Debug, Clone, Default)]
 pub struct MixinManifest {
+    /// Parsed injectors. An entry here has not been checked against the
+    /// classpath yet; [`MixinManifest::wired`] is the set that can run.
     pub injectors: Vec<MixinInjector>,
+    /// Injectors verified against the classes they name. Only these are
+    /// dispatched by the interpreter.
+    pub wired: Vec<WiredInjector>,
     pub accessors: Vec<MixinAccessor>,
     pub interface_methods: Vec<MixinInterfaceMethod>,
-    /// Human-readable notes about annotations this bridge skipped.
+    /// Human-readable notes about annotations this bridge skipped, each with
+    /// the reason it cannot be applied.
     pub unsupported: Vec<String>,
+}
+
+impl MixinManifest {
+    /// The injectors that target `class_name`'s method, ready to run.
+    pub fn injectors_for(&self, class_name: &str, method: &str) -> Vec<&WiredInjector> {
+        self.wired
+            .iter()
+            .filter(|injector| {
+                injector.declaring_class == class_name && injector.target_method == method
+            })
+            .collect()
+    }
+
+    /// Whether any injector for this method can run.
+    pub fn has_injectors(&self, class_name: &str, method: &str) -> bool {
+        self.wired.iter().any(|injector| {
+            injector.declaring_class == class_name && injector.target_method == method
+        })
+    }
 }
 
 /// One entry of a mod's `fabric.mod.json` `mixins` field.
@@ -524,6 +549,268 @@ fn parameter_locals(method: &crate::class::MethodInfo) -> Vec<Option<LocalSpec>>
                 _ => None,
             },
         }));
+    }
+    out
+}
+
+/// One injector that has been checked against the classes it names and can
+/// actually run: the target method resolves to interpreted code, and the
+/// callback's descriptor is the target's parameters plus a `CallbackInfo`.
+///
+/// This is the difference between a parsed annotation and an applied injection.
+/// An injector that fails a check is recorded in
+/// [`MixinManifest::unsupported`] with its reason, never here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WiredInjector {
+    pub mixin_class: String,
+    pub callback_method: String,
+    pub callback_descriptor: String,
+    /// The class whose bytecode declares the target method (`target_class`
+    /// itself, or a superclass it inherits the method from).
+    pub declaring_class: String,
+    pub target_method: String,
+    pub target_descriptor: String,
+    pub point: InjectionPoint,
+    pub cancellable: bool,
+    /// True when the callback declares itself `static`.
+    pub callback_static: bool,
+    /// True when the target method is `static`, so its arguments carry no
+    /// receiver.
+    pub target_static: bool,
+}
+
+impl WiredInjector {
+    /// Whether the target method returns a value, which decides between
+    /// `CallbackInfo` and `CallbackInfoReturnable`.
+    pub fn returns_value(&self) -> bool {
+        return_type(&self.target_descriptor) != "V"
+    }
+
+    /// The callback class the target method's return type requires.
+    pub fn callback_info_class(&self) -> &'static str {
+        if self.returns_value() {
+            "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable"
+        } else {
+            "org/spongepowered/asm/mixin/injection/callback/CallbackInfo"
+        }
+    }
+}
+
+/// The return type of a JVM method descriptor (`V`, `I`, `Lpkg/Name;`).
+pub fn return_type(descriptor: &str) -> String {
+    let Some(end) = descriptor.rfind(')') else {
+        return "V".into();
+    };
+    descriptor[end + 1..].to_string()
+}
+
+/// Why an injector cannot be applied, or the [`WiredInjector`] it becomes.
+///
+/// A check fails when the annotation names something the classpath cannot give
+/// back: a target class that does not load (or that the runtime stands in for
+/// natively, so there is no bytecode to inject into), a target method that does
+/// not resolve to exactly one body, a callback whose parameters are not the
+/// target's plus the `CallbackInfo`, or an injection point this engine does not
+/// place (`INVOKE`, `TAIL`-as-approximation, MixinExtras expressions). Every
+/// failure carries the reason a census reader needs to tell "not applied" from
+/// "applied wrong".
+///
+/// `load` resolves a class by binary name, so the caller decides what
+/// "loadable" means (the bridge's loader and its native stand-ins).
+pub fn verify_injector(
+    injector: &MixinInjector,
+    load: &mut dyn FnMut(&str) -> Option<Class>,
+) -> Result<WiredInjector, String> {
+    if !injector.supported() {
+        return Err(match &injector.point {
+            InjectionPoint::Unsupported(reason) => format!("injection point {reason}"),
+            _ => "injection point is not supported".into(),
+        });
+    }
+    // Only the points this engine places are wired. An approximation or an
+    // `INVOKE` point would need the target's instruction stream; saying so is
+    // honest, quietly running the callback somewhere else is not.
+    match &injector.point {
+        InjectionPoint::Head | InjectionPoint::Tail => {}
+        InjectionPoint::TailApprox => {
+            return Err("MixinExtras expression cannot be located".into());
+        }
+        InjectionPoint::Invoke { .. } => {
+            return Err("INVOKE injection point is not placed".into());
+        }
+        InjectionPoint::Unsupported(reason) => return Err(format!("injection point {reason}")),
+    }
+
+    // The callback must be a real method of the mixin class: a name and
+    // descriptor that do not exist cannot be dispatched.
+    let Some(mixin_class) = load(&injector.mixin_class) else {
+        return Err(format!("mixin class {} did not load", injector.mixin_class));
+    };
+    let Some(callback) = mixin_class.methods.get(&(
+        injector.callback_method.clone(),
+        injector.callback_descriptor.clone(),
+    )) else {
+        return Err(format!(
+            "callback {}.{}{} does not exist",
+            injector.mixin_class, injector.callback_method, injector.callback_descriptor
+        ));
+    };
+    let callback_static = callback.is_static;
+
+    let Some(target_class) = load(&injector.target_class) else {
+        return Err(format!(
+            "target class {} did not load",
+            injector.target_class
+        ));
+    };
+    // A mixin callback is merged into the class that declares the target
+    // method, so the method is looked up through the superclass chain, exactly
+    // as a virtual dispatch from the target class would find it.
+    let candidates = resolve_target(&target_class, &injector.target_method, load);
+    let (declaring_class, method) = match injector.target_descriptor.as_deref() {
+        Some(named) => {
+            let matching: Vec<_> = candidates
+                .into_iter()
+                .filter(|(_, method)| method.descriptor == named)
+                .collect();
+            match matching.as_slice() {
+                [(class, method)] => (class.clone(), method.clone()),
+                [] => {
+                    return Err(format!(
+                        "target method {}.{}{} did not resolve",
+                        injector.target_class, injector.target_method, named
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "target method {}.{}{} resolves to more than one body",
+                        injector.target_class, injector.target_method, named
+                    ));
+                }
+            }
+        }
+        None => match candidates.as_slice() {
+            [(class, method)] => (class.clone(), method.clone()),
+            [] => {
+                return Err(format!(
+                    "target method {}.{} did not resolve",
+                    injector.target_class, injector.target_method
+                ));
+            }
+            many => {
+                return Err(format!(
+                    "target method {}.{} is overloaded ({} bodies) and the                      annotation names no descriptor",
+                    injector.target_class,
+                    injector.target_method,
+                    many.len()
+                ));
+            }
+        },
+    };
+    let target_descriptor = method.descriptor.clone();
+    if method.code.is_none() {
+        return Err(format!(
+            "target method {declaring_class}.{}{} has no body",
+            injector.target_method, target_descriptor
+        ));
+    }
+    if !method.is_static && callback_static {
+        return Err(format!(
+            "callback {}.{}{} is static but the target method is not",
+            injector.mixin_class, injector.callback_method, injector.callback_descriptor
+        ));
+    }
+
+    // Mixin passes the target's parameters in order, then the CallbackInfo.
+    let callback_types = descriptor_parameter_types(&injector.callback_descriptor);
+    let target_types = descriptor_parameter_types(&target_descriptor);
+    let Some((info_type, callback_parameters)) = callback_types.split_last() else {
+        return Err("callback takes no CallbackInfo parameter".into());
+    };
+    let expected_info = if return_type(&target_descriptor) == "V" {
+        "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;"
+    } else {
+        "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;"
+    };
+    if info_type != expected_info {
+        return Err(format!(
+            "callback's last parameter is {info_type}, but a target returning {} needs {expected_info}",
+            return_type(&target_descriptor)
+        ));
+    }
+    if callback_parameters.len() != target_types.len() {
+        return Err(format!(
+            "callback takes {} parameter(s) besides the CallbackInfo, target has {}",
+            callback_parameters.len(),
+            target_types.len()
+        ));
+    }
+    if callback_parameters
+        .iter()
+        .zip(&target_types)
+        .any(|(callback, target)| callback != target)
+    {
+        // A callback capturing locals instead of parameters (`@Local`) or
+        // coercing a type is a different signature contract; wiring it would
+        // pass the wrong values, so it is recorded unsupported.
+        return Err(format!(
+            "callback parameters ({}) do not match the target's ({})",
+            callback_parameters.join(", "),
+            target_types.join(", ")
+        ));
+    }
+
+    Ok(WiredInjector {
+        mixin_class: injector.mixin_class.clone(),
+        callback_method: injector.callback_method.clone(),
+        callback_descriptor: injector.callback_descriptor.clone(),
+        declaring_class,
+        target_method: injector.target_method.clone(),
+        target_descriptor,
+        point: injector.point.clone(),
+        cancellable: injector.cancellable,
+        callback_static,
+        target_static: method.is_static,
+    })
+}
+
+/// Every body in `class`'s superclass chain named `method_name`, as
+/// `(declaring class, method)`. `load` resolves each class in the chain.
+fn resolve_target(
+    class: &Class,
+    method_name: &str,
+    load: &mut dyn FnMut(&str) -> Option<Class>,
+) -> Vec<(String, crate::class::MethodInfo)> {
+    let mut out = Vec::new();
+    let mut queue = vec![class.this_class.clone()];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(name) = queue.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let current = if name == class.this_class {
+            class.clone()
+        } else {
+            let Some(current) = load(&name) else {
+                continue;
+            };
+            current
+        };
+        for method in current
+            .methods
+            .values()
+            .filter(|method| method.name == method_name && method.code.is_some())
+        {
+            out.push((current.this_class.clone(), method.clone()));
+        }
+        // A subclass body shadows a superclass one: the dispatch from the
+        // target class runs the subclass's method, so stop there.
+        if !out.is_empty() {
+            break;
+        }
+        if let Some(super_class) = &current.super_class {
+            queue.push(super_class.clone());
+        }
     }
     out
 }

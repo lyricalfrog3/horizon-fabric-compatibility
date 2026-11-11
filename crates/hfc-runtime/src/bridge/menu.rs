@@ -46,18 +46,34 @@ impl FabricBridge {
                         .interface_methods
                         .extend(mixin::interface_methods_from_class(class));
                     for injector in mixin::injectors_from_class(class) {
-                        if injector.supported() {
-                            manifest.injectors.push(injector);
-                        } else {
-                            manifest.unsupported.push(format!(
-                                "{}.{}{} -> {}.{}: {:?}",
-                                injector.mixin_class,
-                                injector.callback_method,
-                                injector.callback_descriptor,
-                                injector.target_class,
-                                injector.target_method,
-                                injector.point
-                            ));
+                        let described = format!(
+                            "{}.{}{} -> {}.{}",
+                            injector.mixin_class,
+                            injector.callback_method,
+                            injector.callback_descriptor,
+                            injector.target_class,
+                            injector.target_method
+                        );
+                        if !injector.supported() {
+                            manifest
+                                .unsupported
+                                .push(format!("{described}: {:?}", injector.point));
+                            continue;
+                        }
+                        // Record the parsed injector either way, then check it
+                        // against the classpath: only a verified one can run,
+                        // and a failure says why instead of claiming success.
+                        manifest.injectors.push(injector.clone());
+                        let mut load = |name: &str| {
+                            self.interp.loader.get(name).cloned().or_else(|| {
+                                self.interp.loader.get_or_load(name).ok().flatten().cloned()
+                            })
+                        };
+                        match mixin::verify_injector(&injector, &mut load) {
+                            Ok(wired) => manifest.wired.push(wired),
+                            Err(reason) => {
+                                manifest.unsupported.push(format!("{described}: {reason}"))
+                            }
                         }
                     }
                 }

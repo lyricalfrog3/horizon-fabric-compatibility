@@ -382,43 +382,32 @@ impl FabricBridge {
         receiver: Value,
         params: &[Value],
     ) {
-        let injectors: Vec<crate::mixin::MixinInjector> = self
+        // Only verified injectors run here. The host seam synthesizes the
+        // target's arguments rather than executing its body, so a cancellable
+        // callback cannot end a body that is not run; it is applied by the
+        // interpreter instead, where the real body exists.
+        let injectors: Vec<crate::mixin::WiredInjector> = self
             .mixins
-            .injectors
+            .wired
             .iter()
             .filter(|injector| {
-                injector.supported()
-                    && !injector.cancellable
+                !injector.cancellable
                     && injector.point == crate::mixin::InjectionPoint::Head
-                    && injector.target_class == target_class
+                    && injector.declaring_class == target_class
                     && injector.target_method == target_method
-                    && injector
-                        .target_descriptor
-                        .as_deref()
-                        .is_none_or(|descriptor| descriptor == target_descriptor)
+                    && injector.target_descriptor == target_descriptor
             })
             .cloned()
             .collect();
         for injector in injectors {
-            if self.interp.loader.get(&injector.mixin_class).is_none() {
-                let _ = self.interp.loader.get_or_load(&injector.mixin_class);
-            }
-            let is_static = self
-                .interp
-                .loader
-                .get(&injector.mixin_class)
-                .and_then(|class| {
-                    class.methods.get(&(
-                        injector.callback_method.clone(),
-                        injector.callback_descriptor.clone(),
-                    ))
-                })
-                .map(|method| method.is_static)
-                .unwrap_or(false);
+            let is_static = injector.callback_static;
             let info = self
                 .interp
                 .heap
-                .alloc_native(crate::minecraft::CallbackInfo::default());
+                .alloc_native(crate::minecraft::CallbackInfo::new(
+                    target_method,
+                    injector.cancellable,
+                ));
             let mut args = Vec::with_capacity(params.len() + 2);
             if !is_static {
                 args.push(receiver.clone());

@@ -147,14 +147,73 @@ pub struct MenuWidget {
 
 /// The callback object a Mixin injector receives. `cancel` ends the target
 /// method early, as `CallbackInfo.cancel()` does in a real Mixin application.
-#[derive(Debug, Clone, Default)]
+///
+/// A target method that returns `void` is handed a `CallbackInfo`; one that
+/// returns a value is handed a `CallbackInfoReturnable`, which is the same
+/// state plus the value the method answers with when the callback cancels.
+/// `returnable` says which of the two classes this object presents as (Mixin
+/// passes one or the other, and the callback's parameter type has to match).
+#[derive(Debug, Clone)]
 pub struct CallbackInfo {
+    /// Whether the callback called `cancel()` (or `setReturnValue`, which
+    /// cancels too, as Mixin's does).
     pub cancelled: bool,
+    /// Whether the injection was declared `cancellable = true`. Mixin's
+    /// `cancel()` throws `CancellationException` for one that was not, and a
+    /// non-cancellable callback cannot end a non-cancellable injection.
+    pub cancellable: bool,
+    /// The injector's id, as `getId()` reports it (the target method name,
+    /// unless the annotation named one).
+    pub id: String,
+    /// True for a `CallbackInfoReturnable`, false for a plain `CallbackInfo`.
+    pub returnable: bool,
+    /// The value `getReturnValue*` reports. At a `RETURN` injection point it
+    /// starts as the value the target method is about to return; elsewhere it
+    /// starts null (which the getters report as its type's zero).
+    pub return_value: Value,
+}
+
+impl Default for CallbackInfo {
+    fn default() -> Self {
+        Self {
+            cancelled: false,
+            cancellable: false,
+            id: String::new(),
+            returnable: false,
+            return_value: Value::NULL,
+        }
+    }
+}
+
+impl CallbackInfo {
+    /// A plain `CallbackInfo`, for a `void` target method.
+    pub fn new(id: impl Into<String>, cancellable: bool) -> Self {
+        Self {
+            cancellable,
+            id: id.into(),
+            ..Self::default()
+        }
+    }
+
+    /// A `CallbackInfoReturnable`, for a target method that returns a value.
+    pub fn returnable(id: impl Into<String>, cancellable: bool, return_value: Value) -> Self {
+        Self {
+            cancellable,
+            id: id.into(),
+            returnable: true,
+            return_value,
+            cancelled: false,
+        }
+    }
 }
 
 impl NativeObject for CallbackInfo {
     fn class_name(&self) -> &str {
-        "org/spongepowered/asm/mixin/injection/callback/CallbackInfo"
+        if self.returnable {
+            "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable"
+        } else {
+            "org/spongepowered/asm/mixin/injection/callback/CallbackInfo"
+        }
     }
     fn as_any(&self) -> &dyn Any {
         self

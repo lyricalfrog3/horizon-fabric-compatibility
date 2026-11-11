@@ -586,6 +586,17 @@ fn mixin_records(classes: &BTreeSet<String>, bridge: &mut FabricBridge) -> Vec<M
                     .iter()
                     .filter(|injector| injector.target_class.replace('/', ".") == dotted)
                     .collect();
+                // "applied" means the injector was checked against the
+                // classpath and the interpreter dispatches it; a parsed
+                // annotation that was never wired is "partial" at best, however
+                // supported its `@At` looks. `supported()` is a parse check, not
+                // a wiring check, and treating it as one claimed compatibility
+                // the runtime did not have.
+                let wired: Vec<_> = manifest
+                    .wired
+                    .iter()
+                    .filter(|injector| injector.declaring_class.replace('/', ".") == dotted)
+                    .collect();
                 let accessor = manifest
                     .accessors
                     .iter()
@@ -594,17 +605,20 @@ fn mixin_records(classes: &BTreeSet<String>, bridge: &mut FabricBridge) -> Vec<M
                         .interface_methods
                         .iter()
                         .any(|method| method.target_class.replace('/', ".") == dotted);
-                if accessor {
+                if !wired.is_empty() {
+                    // Every injector targeting this class runs => applied;
+                    // some were recorded unsupported => partial. A target
+                    // whose injectors do not run still counts an accessor
+                    // mixin, but only as partial: the injectors are missing.
+                    if wired.len() == injectors.len() {
+                        "applied"
+                    } else {
+                        "partial"
+                    }
+                } else if accessor {
+                    // Only `@Accessor`/`@Invoker` or interface methods, which
+                    // are a separate mechanism; the class is still modified.
                     "applied"
-                } else if injectors.is_empty() {
-                    "ignored"
-                } else if injectors
-                    .iter()
-                    .all(|injector| injector.supported() && !injector.approximated)
-                {
-                    "applied"
-                } else if injectors.iter().any(|injector| injector.supported()) {
-                    "partial"
                 } else {
                     "ignored"
                 }

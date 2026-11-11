@@ -566,7 +566,12 @@ fn mixin_records(classes: &BTreeSet<String>, bridge: &mut FabricBridge) -> Vec<M
     }
     for accessor in &manifest.accessors {
         if normalized.contains(&accessor.interface.replace('/', ".")) {
-            targets.insert(accessor.target_class.replace('/', "."));
+            targets.extend(
+                accessor
+                    .targets
+                    .iter()
+                    .map(|target| target.replace('/', ".")),
+            );
         }
     }
     for method in &manifest.interface_methods {
@@ -601,14 +606,17 @@ fn mixin_records(classes: &BTreeSet<String>, bridge: &mut FabricBridge) -> Vec<M
                     .iter()
                     .filter(|injector| injector.declaring_class.replace('/', ".") == dotted)
                     .collect();
-                let accessor = manifest
-                    .accessors
-                    .iter()
-                    .any(|accessor| accessor.target_class.replace('/', ".") == dotted)
-                    || manifest
-                        .interface_methods
+                // An `@Accessor`/`@Invoker` interface may name several targets,
+                // and the class it names is modified through any of them.
+                let accessor = manifest.accessors.iter().any(|accessor| {
+                    accessor
+                        .targets
                         .iter()
-                        .any(|method| method.target_class.replace('/', ".") == dotted);
+                        .any(|target| target.replace('/', ".") == dotted)
+                }) || manifest
+                    .interface_methods
+                    .iter()
+                    .any(|method| method.target_class.replace('/', ".") == dotted);
                 if !wired.is_empty() {
                     // Every injector targeting this class runs => applied;
                     // some were recorded unsupported => partial. A target

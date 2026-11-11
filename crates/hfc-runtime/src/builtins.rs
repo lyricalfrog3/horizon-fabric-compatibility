@@ -1278,6 +1278,23 @@ fn builtin_registry_kind(heap: &Heap, value: &Value) -> Option<String> {
     heap.get_string(kind).map(str::to_string)
 }
 
+/// A `FeatureFlagSet` holding `flags`: the masks are the runtime's answer for
+/// "every feature is on". `FeatureElement.isEnabled` asks whether an element's
+/// required set is a subset of this one, and `FeatureFlagSet.isSubsetOf`
+/// compares the two masks, so an element requiring nothing (every item and
+/// block here) passes.
+fn feature_flag_set(heap: &mut Heap, flags: &[i64]) -> Value {
+    let mask = flags.iter().fold(0i64, |mask, flag| mask | flag);
+    let id = heap.alloc(JavaObject::Instance {
+        class_name: "net/minecraft/world/flag/FeatureFlagSet".into(),
+        fields: HashMap::from([
+            ("mask".to_string(), Value::Long(mask)),
+            ("universe".to_string(), Value::NULL),
+        ]),
+    });
+    Value::Object(Some(id))
+}
+
 /// A `Holder.Reference` for `value`, with `key` once it is registered. Its
 /// fields are `Holder.Reference`'s own, so its bytecode (`unwrapKey`,
 /// `isBound`, `is(ResourceKey)`) reads them.
@@ -2088,6 +2105,107 @@ fn properties_remove(heap: &mut Heap, table: usize, key: &str) {
     };
     if let Some(JavaObject::Map(entries)) = heap.get_mut(table) {
         entries.retain(|(entry_key, _)| entry_key.as_obj().is_some_and(|id| !keys.contains(&id)));
+    }
+}
+
+/// The item id and count an `ItemStack` holds, whichever representation it is:
+/// the native one the bridge allocates, or the real-bytecode instance vanilla's
+/// own methods construct (`item` a `Holder` and `count` an `int`).
+fn item_stack_facts(heap: &Heap, value: Option<&Value>) -> Option<(String, i32)> {
+    let id = value?.as_obj()?;
+    if let Some(stack) = heap.get_native::<ItemStack>(id) {
+        return Some((stack.item.id.clone(), stack.count));
+    }
+    let JavaObject::Instance { fields, .. } = heap.get(id)? else {
+        return None;
+    };
+    let item = fields
+        .get("item")
+        .and_then(|value| value.as_obj())
+        .and_then(|item| match heap.get(item) {
+            Some(JavaObject::Instance { fields, .. }) => fields
+                .get("id")
+                .and_then(|id| id.as_obj())
+                .and_then(|id| heap.get_string(id))
+                .map(str::to_string)
+                .or_else(|| {
+                    fields
+                        .get("value")
+                        .and_then(|value| value.as_obj())
+                        .and_then(|value| match heap.get(value) {
+                            Some(JavaObject::Instance { fields, .. }) => fields
+                                .get("id")
+                                .and_then(|id| id.as_obj())
+                                .and_then(|id| heap.get_string(id))
+                                .map(str::to_string),
+                            _ => None,
+                        })
+                }),
+            _ => None,
+        });
+    let count = fields.get("count").map(|value| value.as_int()).unwrap_or(0);
+    item.map(|item| (item, count))
+}
+
+/// A stack's `minecraft:max_stack_size`: what the item's own registration set
+/// (a mod's `Properties.stacksTo`), then the host's item data, then vanilla's
+/// default of 64.
+fn item_stack_size(heap: &Heap, value: Option<&Value>) -> i32 {
+    let Some((item, _)) = item_stack_facts(heap, value) else {
+        return 64;
+    };
+    heap.registered_items
+        .iter()
+        .find(|record| record.id == item)
+        .and_then(|record| record.properties.components.get("minecraft:max_stack_size"))
+        .and_then(|value| value.as_i64())
+        .and_then(|size| i32::try_from(size).ok())
+        .filter(|size| *size > 0)
+        .unwrap_or_else(|| heap.registries.item_stack_size(&item))
+}
+
+/// The name a synthesized `DataComponentType` stands for, or the item id a
+/// component's key is spelled as.
+fn component_name(heap: &Heap, value: &Value) -> Option<String> {
+    let id = value.as_obj()?;
+    if let Some(name) = heap.get_string(id) {
+        return Some(name.to_string());
+    }
+    match heap.get(id) {
+        Some(JavaObject::Instance { fields, .. }) => fields
+            .get("name")
+            .and_then(|value| value.as_obj())
+            .and_then(|id| heap.get_string(id))
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// `DataComponentMap.has/get/getOrDefault` for an `ItemStack`: the component's
+/// value from the item's own data. `minecraft:max_stack_size` is the one the
+/// item paths read, and answering it is what makes vanilla's
+/// `ItemInstance.getMaxStackSize` compute the real size instead of its
+/// fallback of 1.
+fn stack_components_builtin(heap: &mut Heap, method_name: &str, args: &[Value]) -> Option<Value> {
+    let stack = args.first()?;
+    let name = component_name(heap, args.get(1)?)?;
+    let fallback = || args.get(2).cloned().unwrap_or(Value::NULL);
+    if name != "minecraft:max_stack_size" {
+        // A component this runtime has no value for: `has` is false and the
+        // reads answer the caller's own default, which is what a JVM does for
+        // a component the item does not carry.
+        return match method_name {
+            "has" => Some(Value::from_bool(false)),
+            "get" => Some(Value::NULL),
+            "getOrDefault" => Some(fallback()),
+            _ => None,
+        };
+    }
+    let size = Value::Int(item_stack_size(heap, Some(stack)));
+    match method_name {
+        "has" => Some(Value::from_bool(true)),
+        "get" | "getOrDefault" => Some(size),
+        _ => None,
     }
 }
 
@@ -6298,16 +6416,27 @@ pub fn dispatch_builtin(
                     .unwrap_or(Value::NULL);
                 // Read the ids first, then write: one object is the client's
                 // and the others are its fields.
-                let (game_mode, gui) = match heap.get_mut(mc) {
+                let (game_mode, gui, player) = match heap.get_mut(mc) {
                     Some(JavaObject::Instance { fields, .. }) => {
                         fields.insert("screen".into(), screen.clone());
                         (
                             fields.get("gameMode").and_then(|v| v.as_obj()),
                             fields.get("gui").and_then(|v| v.as_obj()),
+                            fields.get("player").and_then(|v| v.as_obj()),
                         )
                     }
-                    _ => (None, None),
+                    _ => (None, None, None),
                 };
+                // `Player.containerMenu` is the menu the screen shows: a slot
+                // click runs through `gameMode.handleContainerInput`, which
+                // reads this field and then calls `menu.clicked`. Leaving it
+                // null made every click reach the game mode and stop there,
+                // with the stack never moving.
+                if let (Some(player), Some(menu)) = (player, menu.as_obj()) {
+                    if let Some(native) = heap.get_native_mut::<Player>(player) {
+                        native.container_menu = Some(menu);
+                    }
+                }
                 if let Some(game_mode) = game_mode
                     && let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(game_mode)
                 {
@@ -7645,6 +7774,31 @@ pub fn dispatch_builtin(
     }
 
     // Level / ServerLevel
+    if class_name == "net/minecraft/world/flag/FeatureFlagSet" {
+        // `isSubsetOf`: an element's required features are enabled when its
+        // mask is inside this world's. An element that requires nothing (a
+        // mask of 0) is always enabled.
+        if method_name == "isSubsetOf" && args.len() >= 2 {
+            let mask_of = |heap: &Heap, value: &Value| -> i64 {
+                value
+                    .as_obj()
+                    .and_then(|id| match heap.get(id) {
+                        Some(JavaObject::Instance { fields, .. }) => {
+                            fields.get("mask").map(|mask| match mask {
+                                Value::Long(mask) => *mask,
+                                Value::Int(mask) => i64::from(*mask),
+                                _ => 0,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0)
+            };
+            let (required, enabled) = (mask_of(heap, &args[0]), mask_of(heap, &args[1]));
+            return BuiltinResult::Handled(Value::from_bool(required & !enabled == 0));
+        }
+    }
+
     if class_name == "net/minecraft/world/level/Level"
         || class_name == "net/minecraft/server/level/ServerLevel"
         // The interfaces a level is read through (`LevelHeightAccessor`'s
@@ -7675,6 +7829,13 @@ pub fn dispatch_builtin(
                     return BuiltinResult::Handled(Value::Object(Some(sid)));
                 }
             }
+        } else if method_name == "enabledFeatures" {
+            // The feature flags the world was created with. Nothing here
+            // gates on them, and vanilla's own `FeatureElement.isEnabled`
+            // compares a required set against this one; a null made it throw,
+            // and `ItemStack.isItemEnabled` is on every click's path.
+            let set = feature_flag_set(heap, &[]);
+            return BuiltinResult::Handled(set);
         } else if (method_name == "getMinY"
             || method_name == "getMaxY"
             || method_name == "getHeight")
@@ -7808,6 +7969,24 @@ pub fn dispatch_builtin(
                     Value::Int(count)
                 });
             }
+        } else if method_name == "blockEntityChanged"
+            || method_name == "sendBlockUpdated"
+            || method_name == "blockChanged"
+            || method_name == "markUnsaved"
+        {
+            // `Level.blockEntityChanged(pos)`: the block entity at `pos` marked
+            // itself unsaved. The host learns what it holds from the entity's
+            // own save, and there is no chunk store to dirty here.
+            //
+            // The client-facing half of a block entity's `setChanged`:
+            // `Level.sendBlockUpdated` marks the chunk unsaved and sends the
+            // block to clients (`ServerChunkCache.blockChanged`, then the
+            // chunk's `markUnsaved`). The host already learns what changed from
+            // the block entity's own save, and there is no client to send to.
+            // Answering these is what lets a container's `setChanged` (which
+            // `AbstractContainerMenu.doClick` calls after moving a stack)
+            // complete instead of dying on an unmodelled chunk.
+            return BuiltinResult::Handled(Value::NULL);
         } else if method_name == "setBlock" && args.len() >= 4 {
             // `setBlock(pos, state, flags)`: the state is a native one or a
             // mod block's own object; the bridge reads which when it hands the
@@ -8475,6 +8654,94 @@ pub fn dispatch_builtin(
         }
         return BuiltinResult::NotHandled;
     }
+    // The component an `ItemStack`/`ItemInstance` read asks about: the item's
+    // own components (`ItemProperties.components` for a mod's item, the host's
+    // `items.json` for a vanilla one) or the stack's own override. Answering
+    // these is what makes vanilla's own `ItemStack.getMaxStackSize` (an
+    // `ItemInstance` default method) compute the real size instead of its
+    // fallback: a wrong size makes `ItemStackHandler.extractItem` take a
+    // partial branch and destroy the stack.
+    if matches!(
+        class_name,
+        "net/minecraft/world/item/ItemStack"
+            | "net/minecraft/world/item/ItemInstance"
+            | "net/minecraft/core/component/DataComponentMap"
+            | "net/minecraft/core/component/PatchedDataComponentMap"
+    ) && matches!(method_name, "has" | "get" | "getOrDefault")
+    {
+        if let Some(value) = stack_components_builtin(heap, method_name, args) {
+            return BuiltinResult::Handled(value);
+        }
+    }
+
+    if matches!(
+        class_name,
+        "net/minecraft/world/item/ItemStack" | "net/minecraft/world/item/ItemInstance"
+    ) && method_name == "getMaxStackSize"
+    {
+        let size = item_stack_size(heap, args.first());
+        return BuiltinResult::Handled(Value::Int(size));
+    }
+
+    // `ItemStack.getItem()` is `typeHolder().value()`, so a stack's `item`
+    // field is a `Holder`, not the `Item` itself. A mod's own code
+    // (`new ItemStack(item)`) builds a stack whose `item` is the raw `Item`,
+    // and vanilla's own `Holder.value()` then throws a NullPointerException
+    // on the null holder: `isItemEnabled` and every click path that reads the
+    // item stop there. `typeHolder` answers the item either way.
+    if matches!(
+        class_name,
+        "net/minecraft/world/item/ItemStack" | "net/minecraft/world/item/ItemInstance"
+    ) && method_name == "typeHolder"
+    {
+        if let Some(id) = args.first().and_then(|value| value.as_obj()) {
+            // A native stack (the one the bridge allocates) holds its item
+            // directly; a real-bytecode one holds a holder or a raw item.
+            let item = if let Some(stack) = heap.get_native::<ItemStack>(id).cloned() {
+                Some(Value::Object(Some(heap.alloc_native(stack.item))))
+            } else {
+                match heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => fields.get("item").cloned(),
+                    _ => None,
+                }
+            };
+            // An empty stack (`ItemStack.EMPTY`, or a stack with no item yet)
+            // still has a holder: vanilla's `typeHolder` answers
+            // `Items.AIR.builtInRegistryHolder()` for it, and a null here made
+            // `getItem()` throw on every click's `isItemEnabled`.
+            let item = item.filter(|item| !item.is_null()).unwrap_or_else(|| {
+                Value::Object(Some(heap.alloc_native(Item {
+                    id: "minecraft:air".into(),
+                })))
+            });
+            {
+                let already_holder =
+                    item.as_obj()
+                        .and_then(|id| heap.get(id))
+                        .is_some_and(|object| match object {
+                            JavaObject::Instance { class_name, .. } => {
+                                class_name.contains("Holder")
+                            }
+                            _ => false,
+                        });
+                if already_holder {
+                    return BuiltinResult::Handled(item);
+                }
+                // Wrap the raw `Item` in the `Holder` interface it is
+                // registered through: `value()` answers it, and `unwrapKey`
+                // has the item's id.
+                let mut fields = HashMap::new();
+                fields.insert("value".to_string(), item);
+                let holder = heap.alloc(JavaObject::Instance {
+                    class_name: "net/minecraft/core/Holder$Reference".into(),
+                    fields,
+                });
+                return BuiltinResult::Handled(Value::Object(Some(holder)));
+            }
+        }
+        return BuiltinResult::Handled(Value::NULL);
+    }
+
     if class_name == "net/minecraft/world/item/ItemStack" {
         if method_name == "getItem" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {

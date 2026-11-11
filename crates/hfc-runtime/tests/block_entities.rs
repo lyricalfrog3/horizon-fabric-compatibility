@@ -266,6 +266,113 @@ fn the_pots_ticker_runs_its_own_cooking_tick() {
     assert!(bridge.interp.heap.kept_block_entities().is_empty());
 }
 
+/// One pot's block entity must not cost milliseconds per tick. The tick's own
+/// stages are microseconds; what made it ~8 ms was the scope bookkeeping: the
+/// end-of-tick reference scan walked every object on the heap (a modpack puts
+/// ~306k there) to ask whether this tick had stored a fresh object into an
+/// older one. That question is answered by the objects the tick *wrote* (the
+/// heap's write barrier), so the scan no longer grows with the heap.
+///
+/// The assertions are behavioural first: the pot still clamps `cookTime` when
+/// unheated and no recipe matches, the tick still runs the mod's own
+/// `cookingTick` when the host says it is heated, and `tick_block_entities`
+/// still reports the one entity it ran. The timing is a generous ceiling, not
+/// the measured figure.
+#[test]
+fn one_pots_tick_does_not_scan_the_whole_heap() {
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    let world = World {
+        heated: true,
+        held: None,
+        inventory: Vec::new(),
+    };
+    assert!(bridge.ensure_block_entity(&world, [4, 1, 4], POT));
+    bridge.debug_set_block_entity_field([4, 1, 4], POT, "cookTimeTotal", 200);
+
+    // An unheated pot with nothing in it: `hasInput()` is false, so the
+    // mod's own `cookingTick` clamps `cookTime` down by 2 and stops.
+    let cold = World {
+        heated: false,
+        held: None,
+        inventory: Vec::new(),
+    };
+    bridge.debug_set_block_entity_field([4, 1, 4], POT, "cookTime", 10);
+    let effects = bridge
+        .tick_block_entity(&cold, [4, 1, 4], POT)
+        .expect("the pot's ticker ran");
+    assert!(effects.changes.is_empty(), "{effects:?}");
+    assert_eq!(
+        bridge.debug_block_entity_field([4, 1, 4], POT, "cookTime"),
+        Some(8),
+        "an unheated pot no longer clamps cookTime"
+    );
+
+    // Warm the caches the tick keeps between calls (state objects, the ticker)
+    // so the measurement is the steady state the host sees, then time honest
+    // ticks over a heap that already holds everything a modpack loaded.
+    for _ in 0..3 {
+        let _ = bridge.tick_block_entity(&world, [4, 1, 4], POT);
+    }
+    let heap_objects = bridge.heap_len();
+    assert!(
+        heap_objects > 100_000,
+        "the fixture heap is only {heap_objects} objects; the scan this guards \
+         against would not show up"
+    );
+
+    bridge.debug_set_block_entity_field([4, 1, 4], POT, "cookTimeTotal", 200);
+    bridge.debug_set_block_entity_field([4, 1, 4], POT, "cookTime", 10);
+    let before = std::time::Instant::now();
+    let mut scanned = 0;
+    for _ in 0..20 {
+        bridge
+            .tick_block_entity(&world, [4, 1, 4], POT)
+            .expect("the pot's ticker ran");
+        scanned = scanned.max(bridge.scope_scan_len());
+    }
+    let per_tick = before.elapsed().as_secs_f64() * 1000.0 / 20.0;
+    assert!(
+        per_tick < 1.0,
+        "one pot's tick took {per_tick:.3} ms; it is walking something that grows \
+         with the heap ({heap_objects} objects)"
+    );
+    // The scan examines what the tick wrote, not the heap: a bound tied to the
+    // heap size would pass on a heap with a few objects and fail on this one.
+    assert!(
+        scanned < heap_objects / 100,
+        "the tick's reference scan examined {scanned} of {heap_objects} heap \
+         objects: it is still walking the whole heap"
+    );
+
+    // Behaviour is unchanged: with the equal-clock fields set, an unheated pot
+    // still runs the mod's own `cookingTick` clamp arm, and a pot the host says
+    // is heated still runs the same arm while no recipe manager answers (the
+    // runtime has no `RecipeManager`, so `getMatchingRecipe` cannot present a
+    // recipe to cook: the heated arm clamps rather than cooking). Both are the
+    // mod's code running; neither is skipped and neither is faked.
+    let mut heated = World {
+        heated: true,
+        held: None,
+        inventory: Vec::new(),
+    };
+    bridge.debug_set_block_entity_field([4, 1, 4], POT, "cookTime", 10);
+    bridge.debug_set_block_entity_field([4, 1, 4], POT, "cookTimeTotal", 200);
+    let effects = bridge
+        .tick_block_entity(&heated, [4, 1, 4], POT)
+        .expect("the pot's ticker ran");
+    assert!(effects.changes.is_empty(), "{effects:?}");
+    assert_eq!(
+        bridge.debug_block_entity_field([4, 1, 4], POT, "cookTime"),
+        Some(8),
+        "the pot's tick did not run the mod's own cookingTick"
+    );
+
+    // The host's walk over the kept entities runs exactly the one pot.
+    assert_eq!(bridge.tick_block_entities(&mut heated), 1);
+}
+
 /// `saveAdditional` writes the pot's own fields through `ValueOutput`, and
 /// `loadAdditional` reads them back through `ValueInput`: `CookTime`,
 /// `CookTimeTotal` and the nested `Inventory`.
@@ -632,5 +739,129 @@ fn a_screens_draws_follow_the_pointer() {
         away, over,
         "the screen drew the same list with the pointer in two places: \
          the mouse position never reached it"
+    );
+}
+
+/// A left click on one of the pot's own slots picks the stack up.
+///
+/// In 26.3 the left button is GLFW button **1** (`MouseHandler` passes GLFW
+/// numbers through, and `getContainerClickButton` maps 1 to the menu's
+/// button 0). A press is handled in `AbstractContainerScreen.mouseClicked`
+/// and the actual pickup runs on **release**, in `mouseReleased`: it resolves
+/// `getHoveredSlot` and calls `slotClicked`, which hands
+/// `gameMode.handleContainerInput(...)` the menu. That method reads
+/// `player.containerMenu` and calls its `clicked`, which is what moves the
+/// stack.
+///
+/// Two things were missing and both are covered here: the player had no open
+/// menu (`containerMenu` was null, so `handleContainerInput` returned before
+/// `clicked`), and that is asserted directly below.
+#[test]
+fn a_left_click_picks_the_pots_slot_up() {
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    let mut world = World {
+        heated: false,
+        held: None,
+        inventory: Vec::new(),
+    };
+    assert_eq!(
+        bridge.right_click_block(&mut world, &click()),
+        hfc_runtime::bridge::Flow::Cancel,
+        "the pot's use did not consume the click"
+    );
+    let _ = bridge.take_opened_menu();
+    // The pot's own inventory slot the menu's slot 0 shows.
+    assert_eq!(
+        bridge.sync_menu_items([4, 1, 4], POT, &[Some(("minecraft:beef".into(), 5))]),
+        1,
+        "the pot's own inventory took no stack"
+    );
+    let draws = bridge
+        .render_screen(1280, 720, 0.0)
+        .expect("the pot screen failed to render")
+        .expect("no draws from the open pot screen");
+    assert!(!draws.is_empty(), "the pot screen drew nothing");
+    assert!(bridge.has_screen(), "the pot opened no screen");
+
+    // The player's open menu is the pot's own menu: `handleContainerInput`
+    // reads it and a null one stops the click before `clicked` runs.
+    let (x, y) = bridge
+        .debug_menu_slot_screen_pos(0)
+        .expect("the pot's menu slot 0 has no place on the screen");
+
+    // 26.3 handles the pickup on release; the press only records the click.
+    // Neither return value is asserted: `mouseClicked`'s bytecode returns true
+    // for an accepted press and `mouseReleased` always falls through to
+    // `Screen.mouseReleased`. The observable is the stack moving below.
+    bridge.mouse_button(x, y, 1, true);
+    bridge.mouse_button(x, y, 1, false);
+
+    // The stack the pot held is now the one the menu carries, and the pot's
+    // own inventory no longer has it: the click moved it instead of either
+    // dropping it or doing nothing.
+    assert_eq!(
+        bridge.debug_menu_carried(),
+        Some(("minecraft:beef".into(), 5)),
+        "the left click did not pick the stack up"
+    );
+    assert_eq!(
+        bridge.debug_block_entity_inventory([4, 1, 4], POT, 0),
+        None,
+        "the pot's own inventory still holds the stack the click took"
+    );
+}
+
+/// Opening the pot's menu gives the player an open menu. `slotClicked` hands
+/// a click to `gameMode.handleContainerInput`, which reads
+/// `player.containerMenu` first and returns when it is null, so a player
+/// whose open menu was never recorded received clicks that stopped there.
+#[test]
+fn opening_a_mods_menu_gives_the_player_the_open_menu() {
+    use hfc_runtime::value::JavaObject;
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    let mut world = World {
+        heated: false,
+        held: None,
+        inventory: Vec::new(),
+    };
+    assert_eq!(
+        bridge.right_click_block(&mut world, &click()),
+        hfc_runtime::bridge::Flow::Cancel,
+        "the pot's use did not consume the click"
+    );
+    let _ = bridge.take_opened_menu();
+    assert!(bridge.has_screen(), "the pot opened no screen");
+
+    let screen = bridge.current_screen().expect("the screen closed");
+    let menu = match bridge.interp.heap.get(screen.as_obj().unwrap()) {
+        Some(JavaObject::Instance { fields, .. }) => fields.get("menu").cloned().expect("no menu"),
+        _ => panic!("the screen is not an object"),
+    };
+    let mc = bridge
+        .interp
+        .heap
+        .get_singleton("net/minecraft/client/Minecraft")
+        .expect("no client");
+    let player = match bridge.interp.heap.get(mc) {
+        Some(JavaObject::Instance { fields, .. }) => {
+            fields.get("player").cloned().expect("no player")
+        }
+        _ => panic!("the client is not an object"),
+    };
+    let player_id = player.as_obj().expect("the player is not an object");
+    let open = bridge
+        .interp
+        .heap
+        .get_native::<hfc_runtime::minecraft::Player>(player_id)
+        .and_then(|player| player.container_menu);
+    assert_eq!(
+        open,
+        menu.as_obj(),
+        "the player's open menu is not the menu the screen shows; \
+         `handleContainerInput` would return before the menu's clicked ran"
     );
 }

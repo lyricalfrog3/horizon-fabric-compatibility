@@ -16,6 +16,11 @@ pub struct Registries {
     /// Raw tag definitions by `namespace:path`: plain ids and `#tag` references.
     block_tags: HashMap<String, Vec<String>>,
     item_tags: HashMap<String, Vec<String>>,
+    /// Each item's `minecraft:max_stack_size` from the host's `items.json`,
+    /// by item id. Vanilla's own data carries it, and it is what
+    /// `ItemStack.getMaxStackSize` reads: a wrong answer changes what a slot
+    /// click does with a stack.
+    item_stack_sizes: HashMap<String, i32>,
 }
 
 fn tag_values(value: &serde_json::Value) -> Vec<String> {
@@ -80,6 +85,22 @@ impl Registries {
                 };
                 out.blocks = keys("minecraft:block");
                 out.items = keys("minecraft:item");
+            }
+        }
+        // `items.json` is the host's snapshot of every item's components:
+        // `minecraft:max_stack_size` is the one the item paths need.
+        if let Ok(text) = std::fs::read_to_string(dir.join("items.json")) {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&text) {
+                for (id, components) in map {
+                    let size = components
+                        .get("minecraft:max_stack_size")
+                        .and_then(|value| value.as_i64())
+                        .and_then(|size| i32::try_from(size).ok())
+                        .filter(|size| *size > 0);
+                    if let Some(size) = size {
+                        out.item_stack_sizes.insert(id, size);
+                    }
+                }
             }
         }
         if let Ok(text) = std::fs::read_to_string(dir.join("block-tags.json")) {
@@ -196,6 +217,13 @@ impl Registries {
                 visit(collect(&mut inner));
             }
         }
+    }
+
+    /// An item's `minecraft:max_stack_size` from the host's `items.json`: 64
+    /// for a normal item when the file does not name it, which is what
+    /// vanilla's own data says for an item that stacks.
+    pub fn item_stack_size(&self, id: &str) -> i32 {
+        self.item_stack_sizes.get(id).copied().unwrap_or(64)
     }
 
     pub fn contains(&self, kind: &str, id: &str) -> bool {

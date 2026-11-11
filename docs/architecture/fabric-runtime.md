@@ -884,6 +884,15 @@ as `tick(level, pos, state, entity)` once per game tick for every kept entity wh
 there (`FabricBridge::tick_block_entities`, from `Game::tick_fabric_block_entities`). A tick's
 effects go through the host exactly as a block tick's do.
 
+Each tick runs inside a heap scope, and closing it asks whether the mod's code stored a fresh
+object into one the heap keeps across calls. A scoped id did not exist when the scope opened, so
+only a write this scope made can have put one into an older object: the heap's write barrier
+notes every `get_mut` into a pre-scope object and the scan walks those, not the heap. Before that,
+the scan walked every object on the heap: a Farmers Delight cooking pot's tick measured ~8 ms
+(7.0–12.7 ms of it in the scan alone) on a 306k-object heap, and ~0.10 ms after (measured with
+`tests/block_entities.rs`, which fails if the scan grows back with the heap). `TICK_BUDGET` (2M
+instructions) still bounds each tick.
+
 Saving runs the entity's own `saveAdditional` into a `ValueOutput`, and loading runs
 `loadAdditional` from a `ValueInput` (`value_io_builtins.rs`). The storage interface is modelled
 as a value tree (`putInt`, `getIntOr`, `putString`, `putBoolean`, `putIntArray`, `child`,
@@ -932,6 +941,30 @@ a click's stack reaches the pot's `ItemStackHandler` (slot 0 read back as `minec
 In the game the pot opens its own screen (background, bowl slot, recipe-book button, title)
 instead of a double-chest grid, and reopens with the pot's contents, before and after a save
 and reload.
+
+A slot click moves a stack. The click reaches the menu through the client's own path:
+`AbstractContainerScreen.mouseClicked`/`mouseReleased` resolve the slot and call
+`gameMode.handleContainerInput(containerId, slot, button, input, player)`, which reads
+`player.containerMenu` and runs that menu's `clicked` (so the menu's own slot rules apply and the
+block entity's inventory changes, which `saveAdditional` then persists). Three host boundaries had
+to answer for that path, and each is general rather than pot-specific:
+
+- `Player.containerMenu` is the menu the open screen shows; `Minecraft.setScreen` records it, and a
+  native `Player` answers it through `Interpreter::native_field`.
+- `ItemInstance.getMaxStackSize` (vanilla's default method) reads
+  `DataComponents.MAX_STACK_SIZE` from the item's components. `DataComponents` is synthesized from
+  the host's `items.json` (`Registries::item_stack_size`, a mod's own `stacksTo` first), so vanilla's
+  own item code computes the real size. Answering the fallback of 1 made
+  `ItemStackHandler.extractItem` take its partial branch, which *destroyed* the stack instead of
+  returning it.
+- `ItemStack.typeHolder` answers a real `Holder` for the stack's item (and `Items.AIR` for an empty
+  stack), and `Level.blockEntityChanged`/`sendBlockUpdated`/`blockChanged`/`markUnsaved` complete:
+  a container's `setChanged`, run after the click moves a stack, otherwise died on an unmodelled
+  chunk.
+
+Tested with the cooking pot (`tests/block_entities.rs`, real jar): a press and release on the pot's
+own slot 0 leaves the menu carrying `minecraft:beef` x5 and the pot's own inventory empty — the
+stack moved, rather than being dropped or silently destroyed.
 
 Not run: `preRemoveSideEffects` (a pot dropping its meal on break); codec-based save data
 (`ValueOutput.store`/`storeNullable`/`read`/`list` take a `com.mojang.serialization.Codec`, which

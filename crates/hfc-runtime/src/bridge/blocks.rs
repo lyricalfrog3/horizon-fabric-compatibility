@@ -830,6 +830,13 @@ impl super::FabricBridge {
         self.interp.heap.object_count()
     }
 
+    /// How many objects the last [`crate::heap::Heap::refs_into`] examined: the
+    /// objects written since the current scope opened, not the whole heap.
+    #[doc(hidden)]
+    pub fn scope_scan_len(&self) -> usize {
+        self.interp.heap.refs_scanned()
+    }
+
     /// The changes, block ticks and particles a level a mod's code wrote is
     /// holding, drained.
     fn effects_of(&mut self, level: usize) -> hfc_core::Result<BlockEffects> {

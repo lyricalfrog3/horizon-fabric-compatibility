@@ -11,18 +11,21 @@ gate does not get advertised as compatible. Dates are deliberately absent.
 - Conversion through Horizon's existing `horizon-port-pack` check/carry pipeline.
 - Content-addressed cache, atomic install, markers, cleanup, `horizon-mods.txt`.
 - JSON + Markdown reports; launcher hook; CLI (`install`, `bootstrap`, `scan`, `status`).
-- 56 HFC tests (including the experimental runtime) + 3 launcher hook tests; generated
-  folders are read by Horizon's own `horizon-mods` loader; full workspace tests and
-  formatting pass.
+- 156 HFC tests (112 of them the runtime: 32 unit + 80 integration) + 3 launcher hook tests;
+  generated folders are read by Horizon's own `horizon-mods` loader; every tracked Rust file is
+  rustfmt-clean, but the suite does not pass: `modmenu_screen` has two deterministic failures
+  (a missing button label and wheel scrolling) and `veinminer` is flaky at the default thread
+  count.
 - Research notes, ADRs, architecture, compatibility matrix, this roadmap.
 
 **Known limits**
 
 - HFC's conversion pipeline has no Java/Mixin/entrypoint behaviour, no Fabric API and no
   generated native mods.
-- An experimental in-client interpreter (`crates/hfc-runtime`) runs selected entrypoints;
-  it is outside this v1 gate and does not provide screens, Mixins or general gameplay
-  compatibility. See [fabric-runtime.md](architecture/fabric-runtime.md).
+- An experimental in-client interpreter (`crates/hfc-runtime`) runs selected entrypoints and
+  replays the screens a mod installs, but it has no general Mixin support and no general
+  gameplay compatibility; it is outside this v1 gate. See
+  [fabric-runtime.md](architecture/fabric-runtime.md).
 - No real-game launch test for carried content, no real-mod fixture, no parity measurements.
 - No lock file; launcher hook is synchronous.
 

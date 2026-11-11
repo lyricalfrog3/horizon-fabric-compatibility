@@ -69,11 +69,21 @@ is skipped:
 - `net/minecraft/tags/BlockTags`
 - `net/minecraft/core/component/DataComponents`
 - `net/minecraft/core/registries/Registries`
+- `net/minecraft/core/registries/BuiltInRegistries`
+- `net/minecraft/core/particles/ParticleTypes`
 - `net/minecraft/stats/Stats`
 
 Cheap enums and singletons (`InteractionHand`, `InteractionResult`, `Direction`,
-`EquipmentSlot`, `SoundEvents`) still run their real initializers, so code that relies on
-their `$VALUES` or other static state keeps working.
+`EquipmentSlot`) still run their real initializers, so code that relies on their `$VALUES` or
+other static state keeps working. `SoundEvents` is **not** in that group: it is not in
+`has_synthetic_statics`, so the first read of one of its fields runs the real initializer and
+registers Minecraft's whole sound registry. `crates/hfc-runtime/src/builtins.rs` records that path
+at ~30 s on a widget click, which is why `AbstractWidget.playDownSound`/
+`playButtonClickSound` are hand-written no-ops.
+
+Every class in `has_synthetic_statics` has a matching branch in `create_static_field_val`; a
+class in one list and not the other silently answers the `TagKey` fallback. `Stats` was in that
+state until `ad2b274` gave it a synthesizer that builds a real `net/minecraft/stats/Stat`.
 
 Measured effect with the real Minecraft/JDK classpath and Right Click Harvest loaded:
 
@@ -101,9 +111,10 @@ the server applies the harvest.
 | Iceberg `RenderTooltipEvents.GATHER` | dispatched | the mod receives the raw text elements and can add image components (Legendary adds its item model and padding) |
 | Iceberg/Prism `RenderTickEvents.START` | dispatched with each tooltip render | a `DeltaTracker` carries the real time since the previous tooltip frame, so shine and model timers animate |
 | Fabric `ScreenEvents.AFTER_INIT` | dispatched | runs for every initialized mod screen |
-| Fabric `ClientTickEvents` | dispatched | runs once per host tick, before the screen tick |
+| Fabric `ClientTickEvents` | dispatched | `END_CLIENT_TICK` runs once per host tick, after `Screen.tick()` (`FabricBridge::client_tick` in `bridge/screen.rs`) |
 | Fabric key mappings | supported | `KeyMapping`, `KeyMappingHelper` and `consumeClick`; the host binds by translation key or physical key |
-| Mixins / access wideners | **partially applied** | `@Inject(at = HEAD\|TAIL)` callbacks whose target resolves to interpreted bytecode run around the real target body, with the target's receiver and parameters and a real `CallbackInfo`/`CallbackInfoReturnable`: `cancel()` and `setReturnValue()` change what the method does. `@Invoke`/MixinExtras points, `@ModifyArg`/`@ModifyVariable`/`@Redirect`/`@WrapOperation` and draw-code transforms are not applied, and are recorded unsupported with a reason. Menu-widget callbacks keep their synthesized-locals seam |
+| Mixins | **applied only to interpreted methods and two host seams** | `@Inject` at `HEAD`/`TAIL` whose target resolves to interpreted bytecode is run by the interpreter around the real body, cancellable or not: `cancel()`/`setReturnValue()` end the method. Separately, menu-widget callbacks get synthesized layout locals, and non-cancellable `HEAD` callbacks on `GuiGraphicsExtractor.tooltip` get the real receiver and arguments. `@Redirect`, `@ModifyArg`, `@ModifyVariable`, `@WrapOperation`, `@At(INVOKE)` and MixinExtras local capture are **not** applied; they are recorded unsupported with a reason. `@Accessor`/`@Invoker` is under repair (see the note below) |
+| Access wideners | **not applied** | Nothing in `crates/hfc-runtime` reads an access-widener file; the install side only detects and existence-checks it (`hfc-fabric` `metadata.rs`/`archive.rs`) |
 
 ### Mod Menu
 
@@ -112,16 +123,25 @@ listener. Pressing that mapping through the host opens `ModsScreen`; the host in
 and replays its `GuiGraphicsExtractor` display list. The list itself is real: it builds an
 `AbstractSelectionList`, filters all loaded mods and renders their names. A pinned test
 (`tests/modmenu_screen.rs`) opens the screen from the key mapping, asserts the list and its
-widgets, checks that `Minecraft`, `Java`, `Mod Menu` and the other root mods are present, and
-closes it with Escape. Two more tests drive the widgets: click the search field, type, see the
-filtered count and the typed character, press Backspace to clear it, and click Done; and
-scroll the list with both the wheel and a scrollbar drag at a height where it overflows.
+widgets, checks that `Minecraft`, `Mod Menu` and the other non-library entries are present (the
+list renders "Showing 2 mods"), and closes it with Escape. One companion test drives the search
+field: click it, type, see the filtered count and the typed character, press Backspace to clear
+it, and click Done.
+
+Two tests in that file fail at this commit and must not be read as coverage: the key-mapping test
+above fails because the list's Website button draws no label (the text list holds an empty `_`
+entry where it belongs), and `the_mod_list_scrolls_with_the_wheel_and_the_scrollbar` fails because
+the wheel does not move the list. Both are runtime defects, not fixture skips — a skip prints
+`skipping:` instead.
 
 Fabric API's nested modules are libraries, and Mod Menu hides them by default. That depends on
 Fabric Loader's custom metadata (`fabric-api:module-lifecycle` under `custom` in
 `fabric.mod.json`) and on `ModMenuConfig.SHOW_LIBRARIES` defaulting to `WITH_CONFIG`; both are
-answered from the real mod metadata, so the list shows the root mods (11 with the pinned test
-set) rather than every Fabric API module.
+answered from the real mod metadata, so the list shows the two outer jars (`modmenu` and
+`fabric-api`) rather than Fabric API's 44 nested modules. `FabricLoader.getAllMods` itself still
+returns every container it was given — the loader's own `fabricloader`, `minecraft` and `java`
+entries plus each jar root and nested module — so the filtering to 2 happens in Mod Menu's screen,
+not in the runtime.
 
 Mod Menu's title and pause buttons come from its `MixinTitleScreen`/`MixinPauseScreen` mixins,
 not from a Fabric API event. The runtime reads the mods' mixin configs and annotations and
@@ -183,11 +203,17 @@ and placed in the atlas's run-time region, the same way registered icons are. Ti
 and Fabric screens share that upload. Nine-slice `.mcmeta` scaling is not read; such a sprite is
 stretched. An identifier no jar provides still renders as a labelled placeholder tile.
 
-`@Accessor` and `@Invoker` interfaces are the one other mixin form applied. The runtime reads
-them from every mixin class (`mixin::accessors_from_class`, name inference as Mixin does) and
-registers them with the interpreter: a call naming the interface runs the target class's method
-(invoker) or reads/writes its field (accessor). Right Click Harvest's `CropBlockAccessor` works
-this way.
+`@Accessor` and `@Invoker` interfaces are being repaired and are **not** a working path right
+now. The runtime does read them from every mixin class (`mixin::accessors_from_class`, name
+inference as Mixin does) and registers them with the interpreter, and a call naming the interface
+is redirected to the target's method or field (`Interpreter::redirect_mixin_accessor`). The
+current registration is narrow: `MixinAccessor` carries one `target_class` and takes it from
+`targets.first()`, so an `@Accessor` interface mixed into several targets is registered for only
+the first; a getter reads the receiver's own field map and answers null when the field is absent;
+and the invoker path forwards the accessor's own descriptor as the target method's.
+`tests/rch_test.rs` asserts that Right Click Harvest's `CropBlockAccessor` is *parsed and
+registered*; no test calls one of its methods, so nothing here proves an accessor runs. Treat a
+mod that depends on one as unsupported until that work lands.
 
 Reflection that constructs objects (`Class.getConstructor`/`getDeclaredConstructor` and
 `Constructor.newInstance`) runs the class's real constructor. That is how JamLib's
@@ -343,10 +369,12 @@ components, that Legendary's HEAD injector padded (centred) the title, that the 
 separator fills were drawn, that the model component recorded a `GuiDraw::Item`, and that
 the shine timer advances with real time.
 
-Still partial: the model is drawn through the GUI item renderer, so its recorded Y rotation
-is not applied (the HUD has no 3D model transform), and `model_rotation_speed = 0` (the
-current config) keeps it still. The shine is recorded with the pose applied but has not
-been checked live. A component type other than text or an image
+Still partial: the model's recorded Y rotation is handed to the host, which draws it turned
+through `draw_item_model_rotated` (submodule commit `015d7684c`), but no test asserts the rotation
+field — `tests/legendary_tooltips.rs` has no `rotation` hit — so only the placement and the
+component list are pinned. The default config's `model_rotation_speed` is 12, not 0. The shine is
+recorded with the pose applied but has not been checked live. A component type other than text or
+an image
 component is only drawn if it implements `extractText`/`extractImage`.
 
 ## GUI replay

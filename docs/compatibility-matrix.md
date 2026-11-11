@@ -7,11 +7,13 @@ own end-to-end tests do not cover every content type.
 
 The matrix covers the HFC installer and its carried content. It does **not** cover the
 experimental in-client interpreter in `crates/hfc-runtime`; that runtime has its own
-[design note](architecture/fabric-runtime.md) and its own limits (no general Mixin support,
-only widget-adding menu `@Inject` callbacks; no general Fabric API; and a partial replayed GUI:
-Mod Menu's list opens, hides Fabric API libraries, filters, scrolls by wheel or scrollbar drag,
-and shows real mod icons when the jar provides one. Title/pause menu buttons from screen mixins
-are partial: layout/draw transforms and description text remain missing).
+[design note](architecture/fabric-runtime.md) and its own limits (no general Mixin support —
+only `@Inject` on methods the interpreter runs, the menu-widget callbacks, and one tooltip
+seam; no general Fabric API; and a partial replayed GUI:
+Mod Menu's list opens, hides Fabric API libraries, filters, and shows real mod icons when the jar
+provides one, but wheel/scrollbar scrolling and one button label fail their tests at this
+commit. Title/pause menu buttons from screen mixins are partial: layout/draw transforms and
+description text remain missing).
 
 ## Player-facing result
 
@@ -48,9 +50,9 @@ says why.
 | Files outside the mod namespace | not installed | Pipeline keeps them in `outside/` for review |
 
 "Delegated" is not a weaker claim about HFC's plumbing, but it is a weaker **test** claim: the
-port pipeline has its own large test suite (`horizon-port-pack`: 107 unit + 37 integration
-tests in this checkout) and HFC reuses it unchanged. HFC's job is to hand it the jar and
-install the result safely.
+port pipeline has its own large test suite (`horizon-port-pack`: 154 unit tests in its `src/`
+plus 15 in its `tests/` folder in this checkout, and the shader API crate beside it adds 57) and
+HFC reuses it unchanged. HFC's job is to hand it the jar and install the result safely.
 
 ## Metadata and dependency analysis
 

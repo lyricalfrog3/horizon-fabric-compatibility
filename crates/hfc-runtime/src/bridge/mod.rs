@@ -184,6 +184,10 @@ pub struct EntrypointRun {
     pub missing: Vec<String>,
     /// Event listeners the entrypoint added, as `(owner.FIELD, listeners)`.
     pub events: Vec<(String, usize)>,
+    /// Work the entrypoint left undone because the runtime lacked a symbol. It
+    /// kept its lenient result (the gap is the runtime's, not the mod's), so
+    /// `ok` can be true while entries here say what never ran.
+    pub abandoned: Vec<String>,
 }
 
 /// What the runtime saw while `init` ran, for the compatibility census
@@ -1084,12 +1088,16 @@ impl FabricBridge {
             let events_before: std::collections::BTreeMap<String, usize> =
                 self.census_events().into_iter().collect();
             let started = std::time::Instant::now();
+            let abandoned_before = self.interp.abandoned_entrypoints.len();
             let res = self.interp.execute_method(
                 &entry.class_name,
                 &entry.method_name,
                 &entry.descriptor,
                 &[],
             );
+            let abandoned: Vec<String> =
+                self.interp.abandoned_entrypoints[abandoned_before..].to_vec();
+            let res_is_ok = res.is_ok();
             let used = ENTRYPOINT_BUDGET - self.interp.step_budget.unwrap_or(0);
             let events: Vec<(String, usize)> = self
                 .census_events()
@@ -1101,7 +1109,17 @@ impl FabricBridge {
                     class_name: entry.class_name.clone(),
                     method_name: entry.method_name.clone(),
                     ok: res.is_ok(),
-                    error: res.as_ref().err().map(ToString::to_string),
+                    // An entrypoint that stopped part-way kept a lenient
+                    // result, so `ok` alone would call it a success. That is
+                    // the whole difference between "registered nothing" and
+                    // "failed": name the symbol it stopped on.
+                    error: res
+                        .as_ref()
+                        .err()
+                        .map(ToString::to_string)
+                        .or_else(|| abandoned.last().cloned())
+                        .filter(|_| abandoned.is_empty() || !res_is_ok),
+                    abandoned: abandoned.clone(),
                     instructions: used,
                     elapsed_ms: started.elapsed().as_millis() as u64,
                     budget_exhausted: used >= ENTRYPOINT_BUDGET,

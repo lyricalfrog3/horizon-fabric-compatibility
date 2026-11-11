@@ -37,31 +37,55 @@ mod's id or class name is not coverage and must not be added.
 | `hfc-cache` (keying, commit, recovery, prune, stats) | 6 |
 | `hfc-bootstrap` unit (config, state, report, install, ids, carry verification) | 12 |
 | `hfc-bootstrap` end to end | 5 |
-| `hfc-runtime` (bridge, RCH, real classpath, JImage, diagnostics, mixin menu widgets, Mod Menu screen, Legendary tooltip) | 20 |
-| **HFC total** | **64** |
+| `hfc-runtime` unit (`src/`: vfs, census, heap, use_builtins, registry, builtins, bridge/blocks, mixin, interp) | 32 |
+| `hfc-runtime` integration (20 test binaries: block entities, registered blocks/items, Mod Menu screen, Legendary tooltip, classpath, JImage, JVM diff, …) | 80 |
+| **HFC total** | **156** |
 | Launcher `fabric_compat` (`cargo test --lib fabric_compat`) | 3 |
+
+The `hfc-runtime` rows are 112 tests (32 unit + 80 integration across 20 binaries), counted at
+`ad2b274` with `--list` on the built test binaries. The other rows were checked against their own
+built binaries and match: `hfc-core` 3, `hfc-fabric` 18, `hfc-cache` 6, `hfc-bootstrap` 12 + 5.
+One uncommitted test in the working tree (`a_mod_formatting_a_date_reaches_no_tzdata_native` in
+`tests/block_entities.rs`) brings the on-disk count to 113/157; it is not part of `HEAD`.
+
+Status at `ad2b274`, from `cargo test --release -j2 -p hfc-runtime --test modmenu_screen`:
+9 passed, 2 failed. Both failures are Mod Menu's
+`a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it` (the Website button draws no
+label) and `the_mod_list_scrolls_with_the_wheel_and_the_scrollbar` (the wheel does not move the
+list). `tests/veinminer.rs` is also reported flaky at the default thread count: both of its tests
+build a bridge in one `hfc-veinminer-<pid>` game directory (`started_bridge`), so they contend for
+the same config files. Neither failure is a skip: a missing fixture prints `skipping:` and
+returns.
 
 `cargo test --workspace` also runs the tests of the path-dependency crates under
 `workspace/horizon`; those are Horizon's own suites, not HFC tests.
 
 The runtime suite also opens Mod Menu's own `ModsScreen` through its registered Fabric key
 mapping, replays its `GuiGraphicsExtractor` draws, checks the rendered labels and a registered
-mod icon's PNG bytes, and closes the screen with Escape. Companion tests click the search box,
-type a query, verify the list filters down and the character is drawn, clear it with Backspace,
-click Done, and scroll an overflowing list with both the wheel and a scrollbar drag. Two
+mod icon's PNG bytes, and closes the screen with Escape. A companion test clicks the search box,
+types a query, verifies the list filters down and the character is drawn, clears it with
+Backspace and clicks Done. Two tests in this group fail at `ad2b274` and are therefore **not**
+coverage: the key-mapping test above (the Website button renders no label) and
+`the_mod_list_scrolls_with_the_wheel_and_the_scrollbar` (the wheel does not move the list). Two
 further tests run the widget-adding mixin callbacks for the title and pause menus, assert each
 produces a `Mods` widget, that the widget renders, and that clicking it installs `ModsScreen`.
-Those tests skip when the pinned jars or a Minecraft install are absent.
+Tests skip when the pinned jars or a Minecraft install are absent.
 
 `tests/legendary_tooltips.rs` loads Fabric API, Iceberg, Prism and Legendary Tooltips, lets
 the mod write and load its default config, then drives the tooltip calls the client makes.
-It asserts that an epic item returns the frame's corner blits sampling
+Five tests. They assert that an epic item returns the frame's corner blits sampling
 `legendarytooltips:textures/gui/tooltip_borders.png`, that GATHER added the item-model and
 padding components, that the title component was padded by Legendary's HEAD injector, that
 the name separator and `GuiDraw::Item` model request were recorded, and that a common item
-selects no frame but still returns non-transparent background and border colours. A third
-test dispatches two tooltip frames with real time between them and checks that the shine
-timer advanced.
+selects no frame but still returns non-transparent background and border colours. Two more
+dispatch tooltip frames with real time between them and check that the shine timer advances
+(`render_ticks_advance_the_shine_timer`) and restarts on a newly hovered stack
+(`hovering_another_item_restarts_and_draws_the_shine`); `rotated_gradients_land_inside_the_tooltip`
+checks the rotated gradients' placement.
+
+Not covered by any test: the item model's recorded Y rotation. The host applies it
+(`draw_item_model_rotated`, submodule commit `015d7684c`), but no assertion in the suite reads
+the field, so treat the turn as implemented-and-unverified rather than proven.
 
 The end-to-end tests cover:
 
@@ -162,8 +186,12 @@ under test.
 
 `crates/hfc-runtime/examples/census.rs` measures the experimental Fabric runtime over a folder of
 real mods: missing Java/Minecraft symbols, Fabric events mods listen to that the host never
-dispatches, mixin targets and whether they apply, entrypoint failures, and calls to classes the
-runtime replaces with native stand-ins. It writes `census.json` and `census.md` and, with
+dispatches, mixin targets and whether their injectors were **wired** into the interpreter (not
+merely declared — a parsed `@At` is a parse check, and the verifier must also resolve the target
+body and the callback before an injector can run), entrypoint failures, and calls to classes the
+runtime replaces with native stand-ins. A wired callback on a method the host never calls is
+still wired and still never runs, which is why the report's legend says so. It writes
+`census.json` and `census.md` and, with
 `--compare old.json`, a before/after section, so a fix can be chosen by how many mods it unblocks
 and its effect can be quoted.
 

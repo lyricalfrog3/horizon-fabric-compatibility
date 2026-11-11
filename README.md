@@ -33,13 +33,14 @@ closes the gap in two ways:
 ## What works
 
 Everything below is checked by a test that runs the mod's own bytecode, and in the live
-client where noted. A mod not listed here should be treated as unsupported.
+client where noted, except the two Mod Menu tests named as failing. A mod not listed here
+should be treated as unsupported.
 
 | Mod | What is verified | Live client |
 |---|---|:---:|
 | **Right Click Harvest** | Right-click harvesting and replanting; `rightclickharvest.json5` written with comments, matching the real game's file | ✅ |
 | **Veinminer** | Breaking one ore breaks the connected vein (Kotlin coroutines, `PlayerBlockBreakEvents.BEFORE`) | ✅ |
-| **Mod Menu** | Title and pause menu buttons, the mod list with icons, search and scrolling; link dialogs that open the browser or copy to the clipboard; `modmenu.json` byte-identical to the real game's | ✅ |
+| **Mod Menu** | **Partial at this commit.** Title and pause menu buttons, the mod list with icons, a working search field and `modmenu.json` byte-identical to the real game's; link dialogs that open the browser or copy to the clipboard. Two `modmenu_screen` tests fail deterministically: `a_fabric_key_mapping_opens_its_screen_and_the_host_replays_it` (the Website button draws no label) and `the_mod_list_scrolls_with_the_wheel_and_the_scrollbar` (the wheel does not move the list) | ✅ |
 | **Legendary Tooltips** (Iceberg, Prism) | Its textured nine-slice tooltip frame, rarity-matched colors and shadow; the tooltip body from the mod's real component list (centred title, name separator, the item model rotating in 3D); the shine that restarts per hovered stack; `legendarytooltips.toml` written with comments, allowed values and ranges, and read back | ✅ |
 | **Emerald Tools** | Its five tools, registered in code, become Horizon items with vanilla-formula tool stats, textures, names and recipes; `/give`, creative search and the tabs the mod chose (Fabric `CreativeModeTabEvents`) find them | ✅ (in vanilla's Tools and Combat tabs) |
 | **Emerald Armor** | Its four armor pieces, registered in code with `Item.Properties.humanoidArmor`, become Horizon items with vanilla-formula durability, armor and toughness, a single stack, and an equippable slot; its worn-armor model and textures (under `assets/minecraft`) are carried | ✅ (worn and rendered) |

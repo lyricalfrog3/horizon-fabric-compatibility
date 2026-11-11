@@ -4416,6 +4416,40 @@ pub fn dispatch_builtin(
     // -------------------------------------------------------------
     // 5. java/util/Objects
     // -------------------------------------------------------------
+    // The runtime has no system clock, no user locale and no tzdata: a mod that
+    // formats a date, writes a `Properties` file (whose header carries the time)
+    // or reads a time zone reaches JDK internals that parse a binary database
+    // this host does not ship. `TimeZone.getDefault` therefore answers a fixed,
+    // documented zone rather than reaching `ZoneInfoFile`, whose initializer
+    // fails and takes the caller down with it.
+    if class_name == "java/util/TimeZone" {
+        // `setDefaultZone` is the private initializer `getDefault` delegates to
+        // when the cache is cold: it reads `user.timezone`, then asks the JVM's
+        // native `getSystemTimeZoneID` for the host zone and parses the binary
+        // tzdata behind it. Answering only the public entry points is not
+        // enough when the JDK calls its own private one.
+        if method_name == "setDefaultZone" || method_name == "getSystemTimeZoneID" {
+            if method_name == "getSystemTimeZoneID" {
+                return BuiltinResult::Handled(Value::Object(Some(
+                    heap.alloc_string("UTC".to_string()),
+                )));
+            }
+            return BuiltinResult::Handled(Value::NULL);
+        }
+        match method_name {
+            "getDefault" | "getTimeZone" | "getID" => {
+                return BuiltinResult::Handled(Value::Object(Some(
+                    heap.alloc_string("UTC".to_string()),
+                )));
+            }
+            "getOffset" | "getRawOffset" => return BuiltinResult::Handled(Value::Int(0)),
+            "useDaylightTime" | "inDaylightTime" => {
+                return BuiltinResult::Handled(Value::from_bool(false));
+            }
+            _ => {}
+        }
+    }
+
     if class_name == "java/util/Objects" {
         if method_name == "requireNonNull" && !args.is_empty() {
             return BuiltinResult::Handled(args[0].clone());

@@ -122,6 +122,10 @@ pub struct Interpreter {
     /// initializer that fails with one of these in flight failed because the
     /// runtime lacks a symbol, not because the mod is broken.
     pub(crate) unresolved_calls: u64,
+    /// Calls the runtime abandoned part-way because it lacked a symbol: the
+    /// entrypoint kept its lenient result, but the work it had left did not
+    /// happen. A host reports these instead of calling the entrypoint a success.
+    pub abandoned_entrypoints: Vec<String>,
     pub(crate) last_unresolved: Option<String>,
     /// The Java exception in flight: a method returned by throwing and the
     /// caller has not handled it yet. The first frame whose handler covers the
@@ -221,6 +225,7 @@ impl Interpreter {
             initializing: Vec::new(),
             vanilla_block_classes: HashMap::new(),
             unresolved_calls: 0,
+            abandoned_entrypoints: Vec::new(),
             last_unresolved: None,
             failed_initializers: HashMap::new(),
             building_exception: false,
@@ -259,6 +264,7 @@ impl Interpreter {
             initializing: Vec::new(),
             vanilla_block_classes: HashMap::new(),
             unresolved_calls: 0,
+            abandoned_entrypoints: Vec::new(),
             last_unresolved: None,
             failed_initializers: HashMap::new(),
             building_exception: false,
@@ -914,11 +920,18 @@ impl Interpreter {
                         .last_unresolved
                         .clone()
                         .unwrap_or_else(|| "an unresolved call".into());
+                    // The call is left with a default rather than being failed,
+                    // because the runtime caused this, not the mod. That is not
+                    // the same as the call succeeding: it stopped part-way, and
+                    // whatever it had not done yet did not happen. Keep the
+                    // lenient answer, but say so where a host reads results.
                     log::warn!(
-                        "{class_name}.{method_name} failed on {what}, which the runtime lacks: \
-                         {}",
+                        "{class_name}.{method_name} stopped on {what}, which the runtime lacks, \
+                         and returned early: {}",
                         self.describe_exception(&exception)
                     );
+                    self.abandoned_entrypoints
+                        .push(format!("{class_name}.{method_name}: {what}"));
                 } else {
                     let described = self.describe_exception(&exception);
                     return match res {

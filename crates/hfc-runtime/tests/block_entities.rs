@@ -919,3 +919,58 @@ fn a_class_the_loader_cannot_find_is_not_interpreted() {
         "a class that is not on the classpath is reported as interpreted"
     );
 }
+
+/// A mod that formats a date — `Properties.store` writes a timestamped header —
+/// must not be taken down by the JDK's time-zone machinery. `TimeZone.getDefault`
+/// reaches the private `setDefaultZone`, which asks the JVM's native
+/// `getSystemTimeZoneID` for the host zone and then parses binary tzdata this
+/// runtime has no host boundary for. The failure surfaced as a `RuntimeException`
+/// ("Invalid binary time-zone data") inside `AnimatedDoorsConfig.save`, and the
+/// entrypoint's remaining work silently did not run.
+#[test]
+fn a_mod_formatting_a_date_reaches_no_tzdata_native() {
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    let timezone = bridge
+        .interp
+        .execute_method(
+            "java/util/TimeZone",
+            "getDefault",
+            "()Ljava/util/TimeZone;",
+            &[],
+        )
+        .expect("TimeZone.getDefault threw");
+    assert!(
+        !timezone.is_null(),
+        "TimeZone.getDefault answered null, so a date format throws"
+    );
+    // A date formats in the zone the boundary answers, rather than throwing.
+    let id = timezone.as_obj().expect("the zone is not an object");
+    let zone_name = bridge
+        .interp
+        .execute_method(
+            "java/util/TimeZone",
+            "getID",
+            "()Ljava/lang/String;",
+            &[timezone.clone()],
+        )
+        .expect("TimeZone.getID threw");
+    assert!(
+        zone_name.as_obj().is_some(),
+        "the zone boundary answers no id"
+    );
+    // Nothing the time-zone path needs is reported missing.
+    let _ = id;
+    let missing: Vec<String> = bridge
+        .interp
+        .missing
+        .iter()
+        .filter(|symbol| symbol.contains("getSystemTimeZoneID") || symbol.contains("ZoneInfoFile"))
+        .cloned()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the time-zone path still reaches a symbol the runtime lacks: {missing:?}"
+    );
+}

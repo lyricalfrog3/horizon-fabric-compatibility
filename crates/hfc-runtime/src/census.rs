@@ -4,7 +4,9 @@
 //! by how many mods it affects, so a fix can be chosen for breadth instead of
 //! by the mod in front of us. **It measures, it does not claim:** a mod with
 //! zero missing symbols is not "working"; its init simply hit nothing the
-//! runtime lacks.
+//! runtime lacks. The mixin outcome is a wiring verdict too, not a behaviour
+//! one: `MixinRecord::outcome` says the callback reached the interpreter, not
+//! that anything called the target method.
 //!
 //! # `census.json` (version 1)
 //!
@@ -94,7 +96,9 @@ pub struct EventRecord {
 pub struct MixinRecord {
     /// The target class, dotted.
     pub target: String,
-    /// `applied`, `partial`, `ignored` or `native` (see the docs).
+    /// `applied`, `partial`, `ignored` or `native` (see the docs). `applied`
+    /// means every injector on the target was verified and handed to the
+    /// interpreter; it does not mean the target method is ever called.
     pub outcome: String,
 }
 

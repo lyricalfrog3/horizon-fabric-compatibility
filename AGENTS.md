@@ -69,16 +69,20 @@ fabricated classes.
 
 - Prefer executing the mod's real bytecode. Add a builtin only at a host boundary (I/O,
   registry data, rendering) or for a class the runtime deliberately replaces.
-- `ENTRYPOINT_BUDGET` in `crates/hfc-runtime/src/bridge/mod.rs` is 10M. It exists to stop a
-  mis-decoded branch, not to police legitimate initialization. If you change it, record the
-  measured entrypoint costs in `docs/architecture/fabric-runtime.md`.
+- `ENTRYPOINT_BUDGET` in `crates/hfc-runtime/src/bridge/mod.rs` is 100_000_000 (100M). It exists
+  to stop a mis-decoded branch, not to police legitimate initialization. If you change it, record
+  the measured entrypoint costs in `docs/architecture/fabric-runtime.md`.
 - Classes whose static fields are synthesized must be in both
   `Interpreter::has_synthetic_statics` and `create_static_field_val`. Otherwise the first
   `Getstatic` rebuilds Minecraft's real registry and stalls the render thread (measured at
   ~34 s before the fix).
-- Tooltip and screen coverage is partial. `COLOREXT` is dispatched; `GATHER`, `POSTEXT`,
-  `ScreenEvents` and `ClientTickEvents` are not. Do not describe Mod Menu or Legendary
-  Tooltips as working until their UI/frame paths are actually rendered.
+- Tooltip and screen coverage is partial. `COLOREXT`, `GATHER`, `POSTEXT`, `ScreenEvents` and
+  `ClientTickEvents` are dispatched (see `DISPATCHED_EVENTS` in
+  `crates/hfc-runtime/src/bridge/mod.rs`), so do not repeat the old claim that they are not. What
+  is still missing: at this commit two `modmenu_screen` tests fail deterministically (the Website
+  button label renders empty, and the mouse wheel does not move the list), and no test asserts the
+  tooltip item model's recorded Y rotation (the host draws it turned, but nothing pins that).
+  Do not describe either mod as fully working; state which paths a test or a live run verifies.
 - The interpreter is not a sandbox. Treat every jar as untrusted code running in-process.
 
 ## Repository layout

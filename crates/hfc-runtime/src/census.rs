@@ -562,7 +562,12 @@ fn mixin_records(classes: &BTreeSet<String>, bridge: &mut FabricBridge) -> Vec<M
     }
     for accessor in &manifest.accessors {
         if normalized.contains(&accessor.interface.replace('/', ".")) {
-            targets.insert(accessor.target_class.replace('/', "."));
+            targets.extend(
+                accessor
+                    .targets
+                    .iter()
+                    .map(|target| target.replace('/', ".")),
+            );
         }
     }
     for method in &manifest.interface_methods {
@@ -586,14 +591,15 @@ fn mixin_records(classes: &BTreeSet<String>, bridge: &mut FabricBridge) -> Vec<M
                     .iter()
                     .filter(|injector| injector.target_class.replace('/', ".") == dotted)
                     .collect();
-                let accessor = manifest
-                    .accessors
-                    .iter()
-                    .any(|accessor| accessor.target_class.replace('/', ".") == dotted)
-                    || manifest
-                        .interface_methods
+                let accessor = manifest.accessors.iter().any(|accessor| {
+                    accessor
+                        .targets
                         .iter()
-                        .any(|method| method.target_class.replace('/', ".") == dotted);
+                        .any(|target| target.replace('/', ".") == dotted)
+                }) || manifest
+                    .interface_methods
+                    .iter()
+                    .any(|method| method.target_class.replace('/', ".") == dotted);
                 if accessor {
                     "applied"
                 } else if injectors.is_empty() {

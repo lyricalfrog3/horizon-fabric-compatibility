@@ -1058,6 +1058,14 @@ impl Interpreter {
     /// A call on an `@Accessor` / `@Invoker` mixin interface is a call on the
     /// class Mixin merges the interface into: an invoker calls the named target
     /// method, an accessor reads or writes the named field.
+    ///
+    /// Mixin resolves each accessor against its target class and generates a
+    /// bridge whose invocation has the same parameters and return type as the
+    /// accessor (`AccessorGeneratorMethodProxy`), so the redirect resolves the
+    /// same way: the member may be private or protected, may be declared by a
+    /// superclass, and either the accessor or its target may be static. A
+    /// target that does not exist is Mixin's `InvalidAccessorException` at load
+    /// time; here it is an error the call fails with, never a default.
     #[inline(never)]
     fn redirect_mixin_accessor(
         &mut self,
@@ -1066,7 +1074,6 @@ impl Interpreter {
         descriptor: &str,
         args: &[Value],
     ) -> Option<Result<Value>> {
-        use crate::mixin::AccessorKind;
         if self.mixin_accessors.is_empty() {
             return None;
         }
@@ -1078,26 +1085,320 @@ impl Interpreter {
                 descriptor.to_string(),
             ))?
             .clone();
-        let receiver = args.first()?.as_obj();
-        Some(match accessor.kind {
+        Some(self.perform_mixin_accessor(&accessor, args))
+    }
+
+    /// Perform one registered accessor method. `args` are the accessor's
+    /// arguments as its caller passed them: `[receiver, ...]` for an instance
+    /// accessor, the plain arguments for a static one.
+    fn perform_mixin_accessor(
+        &mut self,
+        accessor: &crate::mixin::MixinAccessor,
+        args: &[Value],
+    ) -> Result<Value> {
+        use crate::mixin::AccessorKind;
+        match &accessor.kind {
             AccessorKind::Invoker { method } => {
-                self.execute_method(&accessor.target_class, &method, descriptor, args)
+                // Mixin generates the bridge with the accessor's own
+                // descriptor, so the target is that name and descriptor.
+                let target = self.mixin_accessor_target(accessor, args);
+                let found = self.mixin_target_method(&target, method, &accessor.descriptor);
+                let Some((declaring, is_static)) = found else {
+                    return Err(self.mixin_accessor_missing(method, &target));
+                };
+                // Mixin requires the accessor's static-ness to match its
+                // target's. Carrying on with either would call the wrong thing:
+                // a static target handed a receiver takes it as its first
+                // argument, an instance target without one reads a local that
+                // was never set.
+                if is_static != accessor.is_static {
+                    return Err(self.mixin_accessor_mismatch(
+                        method,
+                        is_static,
+                        accessor.is_static,
+                    ));
+                }
+                // A static target takes exactly the accessor's arguments; an
+                // instance target takes the receiver in front of them.
+                let call_args: Vec<Value> = if is_static {
+                    args.to_vec()
+                } else {
+                    let receiver = args.first().cloned().unwrap_or(Value::NULL);
+                    let mut all = Vec::with_capacity(args.len());
+                    all.push(receiver);
+                    all.extend(args.iter().skip(1).cloned());
+                    all
+                };
+                // `Bytecode.invokeMethod`: `invokestatic` for a static target,
+                // `invokespecial` for a private one, `invokeinterface` when the
+                // declaring class is an interface, else `invokevirtual`. The
+                // declaring class is what the call names, so a private or
+                // protected superclass member is reached there rather than on
+                // a subclass that overrides it.
+                let interface = self
+                    .loader
+                    .get(&declaring)
+                    .is_some_and(|class| class.is_interface);
+                let private =
+                    self.mixin_method_is_private(&declaring, method, &accessor.descriptor);
+                if is_static || private || interface {
+                    self.execute_special_method(
+                        &declaring,
+                        method,
+                        &accessor.descriptor,
+                        &call_args,
+                    )
+                } else {
+                    self.execute_method(&declaring, method, &accessor.descriptor, &call_args)
+                }
             }
-            AccessorKind::Getter { field } => Ok(receiver
-                .and_then(|id| match self.heap.get(id) {
-                    Some(JavaObject::Instance { fields, .. }) => fields.get(&field).cloned(),
-                    _ => None,
-                })
-                .unwrap_or(Value::NULL)),
-            AccessorKind::Setter { field } => {
-                if let (Some(id), Some(value)) = (receiver, args.get(1)) {
-                    if let Some(JavaObject::Instance { fields, .. }) = self.heap.get_mut(id) {
-                        fields.insert(field, value.clone());
+            AccessorKind::Getter { field } => {
+                let target = self.mixin_accessor_target(accessor, args);
+                let Some((owner, field_descriptor, is_static)) =
+                    self.mixin_target_field(&target, field)
+                else {
+                    return Err(self.mixin_accessor_missing(field, &target));
+                };
+                if accessor.is_static != is_static {
+                    return Err(self.mixin_accessor_mismatch(field, is_static, accessor.is_static));
+                }
+                if is_static {
+                    // Reading a static field is an active use of the class that
+                    // declares it: a JVM runs its initializer first, and that
+                    // initializer is what assigns the field. This is `getstatic`
+                    // without the instruction, so it initializes the same classes
+                    // a `getstatic` would (the target as named, and the owner that
+                    // declares the field) and skips the same synthetic ones.
+                    for subject in [&target, &owner] {
+                        if self.initializing.iter().any(|name| name == subject) {
+                            continue;
+                        }
+                        if has_synthetic_statics(subject) || runtime_supplied_state(subject) {
+                            continue;
+                        }
+                        self.ensure_initialized(subject)?;
                     }
+                    return Ok(self.resolve_static_field(&owner, field));
+                }
+                // Mixin's field bridge starts with `aload 0`; an instance
+                // accessor always has a receiver.
+                let Some(id) = args.first().and_then(Value::as_obj) else {
+                    return Err(self.mixin_accessor_null_receiver(field));
+                };
+                match self.heap.get(id) {
+                    Some(JavaObject::Instance { fields, .. }) => Ok(fields
+                        .get(field)
+                        .cloned()
+                        // A field nothing has written reads as its type's
+                        // zero, as `getfield` does.
+                        .unwrap_or_else(|| default_for_descriptor(&field_descriptor))),
+                    // A host stand-in keeps its fields outside the heap map;
+                    // ask the same reader `getfield` uses.
+                    Some(_) => Ok(self.native_field(id, field)),
+                    None => Err(self.mixin_accessor_missing(field, &target)),
+                }
+            }
+            AccessorKind::Setter { field } => {
+                let target = self.mixin_accessor_target(accessor, args);
+                let Some((owner, _, is_static)) = self.mixin_target_field(&target, field) else {
+                    return Err(self.mixin_accessor_missing(field, &target));
+                };
+                if accessor.is_static != is_static {
+                    return Err(self.mixin_accessor_mismatch(field, is_static, accessor.is_static));
+                }
+                if is_static {
+                    if !has_synthetic_statics(&owner) && !runtime_supplied_state(&owner) {
+                        self.ensure_initialized(&owner)?;
+                    }
+                    // The value is the accessor's only argument: a static
+                    // setter has no receiver in front of it.
+                    let value = args.first().cloned().unwrap_or(Value::NULL);
+                    // `putstatic` writes the declaring class's own slot (an
+                    // inherited field belongs to the class that declares it),
+                    // and a placeholder handed out before the write must not
+                    // survive it.
+                    if let Some(class) = self.loader.get_mut(&owner) {
+                        class.static_fields.insert(field.clone(), value);
+                    }
+                    self.static_singletons
+                        .remove(&(owner.clone(), field.clone()));
+                    return Ok(Value::NULL);
+                }
+                // The receiver is `args[0]` and the value `args[1]`; Mixin's
+                // setter bridge is `aload 0; ...; putfield`.
+                let Some(id) = args.first().and_then(Value::as_obj) else {
+                    return Err(self.mixin_accessor_null_receiver(field));
+                };
+                let value = args.get(1).cloned().unwrap_or(Value::NULL);
+                if let Some(JavaObject::Instance { fields, .. }) = self.heap.get_mut(id) {
+                    fields.insert(field.clone(), value);
+                } else {
+                    // A host stand-in keeps its state in the host object, not
+                    // in a heap field map, and `putfield` on one is equally a
+                    // no-op: say so rather than report a write that did not
+                    // happen (`putfield`'s `native_field` reader has no setter
+                    // counterpart to call).
+                    let class = self
+                        .heap
+                        .get(id)
+                        .map(|object| object.class_name().to_string())
+                        .unwrap_or_default();
+                    log::debug!(
+                        "the mixin setter for {field} on {class} writes a host object's state, \
+                         which the runtime stores outside the heap; the write was not applied"
+                    );
                 }
                 Ok(Value::NULL)
             }
+        }
+    }
+
+    /// The target class of an accessor for a given call: the first class the
+    /// mixin names that the receiver is an instance of, else the first named.
+    /// A static accessor has no receiver, but an explicit multi-target mixin
+    /// still resolves against each class it names.
+    fn mixin_accessor_target(
+        &mut self,
+        accessor: &crate::mixin::MixinAccessor,
+        args: &[Value],
+    ) -> String {
+        let actual = if accessor.is_static {
+            None
+        } else {
+            args.first()
+                .and_then(Value::as_obj)
+                .and_then(|id| match self.heap.get(id) {
+                    Some(JavaObject::Instance { class_name, .. }) => Some(class_name.clone()),
+                    _ => None,
+                })
+        };
+        if let Some(actual) = actual {
+            if let Some(target) = accessor
+                .targets
+                .iter()
+                .find(|target| self.class_is_assignable_to(&actual, target))
+            {
+                return target.clone();
+            }
+        }
+        accessor.target_class.clone()
+    }
+
+    /// The class declaring `method` in `target`'s hierarchy and whether it is
+    /// static, or `None` when no class declares it. Mixin resolves an accessor
+    /// target through the target class's superclasses, which is how an
+    /// accessor reaches a member the target class only inherits.
+    fn mixin_target_method(
+        &mut self,
+        target: &str,
+        method: &str,
+        descriptor: &str,
+    ) -> Option<(String, bool)> {
+        let mut queue = std::collections::VecDeque::from([target.to_string()]);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let _ = self.loader.get_or_load(&current);
+            let Some(class) = self.loader.get(&current) else {
+                continue;
+            };
+            if let Some(found) = class
+                .methods
+                .get(&(method.to_string(), descriptor.to_string()))
+            {
+                return Some((current, found.is_static));
+            }
+            if let Some(super_class) = &class.super_class {
+                queue.push_back(super_class.clone());
+            }
+            for interface in &class.interfaces {
+                queue.push_back(interface.clone());
+            }
+        }
+        None
+    }
+
+    /// The class declaring `field` in `target`'s hierarchy, its descriptor and
+    /// whether it is static, or `None` when no class declares it.
+    fn mixin_target_field(&mut self, target: &str, field: &str) -> Option<(String, String, bool)> {
+        let mut queue = std::collections::VecDeque::from([target.to_string()]);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let _ = self.loader.get_or_load(&current);
+            let Some(class) = self.loader.get(&current) else {
+                continue;
+            };
+            if let Some(found) = class.fields.get(field) {
+                return Some((current, found.descriptor.clone(), found.is_static));
+            }
+            if let Some(super_class) = &class.super_class {
+                queue.push_back(super_class.clone());
+            }
+            for interface in &class.interfaces {
+                queue.push_back(interface.clone());
+            }
+        }
+        None
+    }
+
+    /// Whether the method `declaring` exposes is private: Mixin's bridge then
+    /// uses `invokespecial` rather than `invokevirtual`.
+    fn mixin_method_is_private(&self, declaring: &str, method: &str, descriptor: &str) -> bool {
+        const ACC_PRIVATE: u16 = 0x0002;
+        self.loader.get(declaring).is_some_and(|class| {
+            class
+                .methods
+                .get(&(method.to_string(), descriptor.to_string()))
+                .is_some_and(|found| found.access & ACC_PRIVATE != 0)
         })
+    }
+
+    /// An accessor whose target member does not exist. Mixin rejects such a
+    /// mixin at load time (`InvalidAccessorException`); the runtime applied it,
+    /// so the call fails here instead of answering a default.
+    fn mixin_accessor_missing(&self, member: &str, target: &str) -> Error {
+        Error::new(
+            "interpreter",
+            format!(
+                "the mixin accessor's target {}.{member} does not exist (Mixin rejects this \
+                 mixin at load time)",
+                target.replace('/', ".")
+            ),
+        )
+    }
+
+    /// An accessor whose static-ness differs from its target member's. Mixin
+    /// rejects this too (`AccessorGenerator.checkModifiers`), and calling it
+    /// either way passes the receiver as an argument or drops it.
+    fn mixin_accessor_mismatch(&self, member: &str, target: bool, accessor: bool) -> Error {
+        Error::new(
+            "interpreter",
+            format!(
+                "the mixin accessor for {member} is {} but its target is {} (Mixin rejects this \
+                 mixin at load time)",
+                if accessor {
+                    "static"
+                } else {
+                    "an instance member"
+                },
+                if target { "static" } else { "not static" }
+            ),
+        )
+    }
+
+    /// An instance accessor called with no receiver object.
+    fn mixin_accessor_null_receiver(&self, member: &str) -> Error {
+        Error::new(
+            "interpreter",
+            format!(
+                "java.lang.NullPointerException: the mixin accessor for {member} has no receiver"
+            ),
+        )
     }
 
     /// A call to an interface method a mixin added to the receiver's class runs

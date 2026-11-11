@@ -149,6 +149,19 @@ registers them with the interpreter: a call naming the interface runs the target
 (invoker) or reads/writes its field (accessor). Right Click Harvest's `CropBlockAccessor` works
 this way.
 
+The redirect reproduces Mixin's generated bridge, not just the name lookup. The member is
+resolved against the target class *and its superclasses*, so an accessor reaches a member the
+target only inherits; the call then names the class that declares it, so a subclass method of
+the same signature cannot capture it. Dispatch follows `Bytecode.invokeMethod`: `invokestatic`
+for a static target, `invokespecial` for a private one (how a private or protected superclass
+member is reached at all), `invokeinterface` when the declaring class is an interface, else
+`invokevirtual`. Static members are read and written through the declaring class's own static
+storage, with that class's initializer run first — the same active use a `getstatic`/`putstatic`
+is — so a `@Accessor("staticField")` works and writes are visible to the mod's own code. A
+target that does not exist, or whose static-ness differs from the accessor's, is an error the
+call fails with: Mixin rejects both at load time (`InvalidAccessorException`), and answering a
+default would let a mod run on a value the real game never produces.
+
 Reflection that constructs objects (`Class.getConstructor`/`getDeclaredConstructor` and
 `Constructor.newInstance`) runs the class's real constructor. That is how JamLib's
 `ConfigManager` builds a mod's config class, so Right Click Harvest's `Config` and its enums come

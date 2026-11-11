@@ -1033,13 +1033,15 @@ impl FabricBridge {
         // to the accessor interface must succeed (Fabric's own lookup API casts
         // a `BlockEntityType` to `BlockEntityTypeAccessor`).
         for accessor in &self.mixins.accessors {
-            let interfaces = self
-                .interp
-                .mixin_interfaces
-                .entry(accessor.target_class.clone())
-                .or_default();
-            if !interfaces.contains(&accessor.interface) {
-                interfaces.push(accessor.interface.clone());
+            for target in &accessor.targets {
+                let interfaces = self
+                    .interp
+                    .mixin_interfaces
+                    .entry(target.clone())
+                    .or_default();
+                if !interfaces.contains(&accessor.interface) {
+                    interfaces.push(accessor.interface.clone());
+                }
             }
         }
         self.interp.mixin_accessors = self

@@ -84,9 +84,20 @@ pub struct MixinAccessor {
     /// The mixin interface and the method as callers name it.
     pub interface: String,
     pub method: String,
+    /// The accessor method's own descriptor. Mixin generates the bridge with
+    /// this descriptor's parameter and return types, so it is also the
+    /// descriptor of the target member an invoker calls.
     pub descriptor: String,
-    /// The class the interface is mixed into.
+    /// The first class the interface is mixed into.
     pub target_class: String,
+    /// Every class the interface is mixed into: a mixin may name several
+    /// targets, and Mixin generates the bridge on all of them. The interpreter
+    /// picks the one the receiver belongs to.
+    pub targets: Vec<String>,
+    /// Whether the accessor method itself is static. Mixin requires this to
+    /// match the target member's static-ness, so it also says whether a call
+    /// passes a receiver at all.
+    pub is_static: bool,
     pub kind: AccessorKind,
 }
 
@@ -286,6 +297,16 @@ pub fn injectors_from_class(class: &Class) -> Vec<MixinInjector> {
 }
 
 /// The `@Accessor` / `@Invoker` methods a mixin class declares.
+///
+/// Mixin generates a bridge for every annotated method: `@Invoker` calls the
+/// target class's method, `@Accessor` reads or writes its field. The target
+/// member is named by the annotation's `value`, or, when that is absent,
+/// inferred from the accessor's own name the way `AccessorInfo.AccessorName`
+/// does it: `get`/`is` for a field getter, `set` for a field setter, `call`/
+/// `invoke` for a method proxy, each with the prefix removed and the first
+/// letter lower-cased (`getHoveredSlot` -> `hoveredSlot`). A field accessor's
+/// kind comes from its return type, as `AccessorInfo.initType` decides it:
+/// `void` is a setter and everything else a getter.
 pub fn accessors_from_class(class: &Class) -> Vec<MixinAccessor> {
     let mut out = Vec::new();
     let Some(targets) = mixin_targets(class) else {
@@ -296,7 +317,14 @@ pub fn accessors_from_class(class: &Class) -> Vec<MixinAccessor> {
     };
     for (_, method) in class.methods.iter() {
         for annotation in &method.annotations {
-            let explicit = annotation.string("value").filter(|name| !name.is_empty());
+            // Mixin accepts a full member reference (`name(descriptor)return`)
+            // and keeps only the name; the generated bridge uses the
+            // accessor's own descriptor either way.
+            let explicit = annotation
+                .string("value")
+                .filter(|name| !name.is_empty())
+                .map(accessor_member_name)
+                .filter(|name| !name.is_empty());
             let kind = match annotation.type_name.as_str() {
                 "org/spongepowered/asm/mixin/gen/Invoker" => {
                     let name = explicit
@@ -305,9 +333,10 @@ pub fn accessors_from_class(class: &Class) -> Vec<MixinAccessor> {
                     AccessorKind::Invoker { method: name }
                 }
                 "org/spongepowered/asm/mixin/gen/Accessor" => {
-                    let setter = descriptor_parameter_types(&method.descriptor).len() == 1;
+                    let setter = method.descriptor.ends_with(")V");
                     let name = explicit.map(str::to_string).unwrap_or_else(|| {
-                        accessor_target_name(&method.name, &["get", "set", "is"])
+                        let prefixes: &[&str] = if setter { &["set"] } else { &["get", "is"] };
+                        accessor_target_name(&method.name, prefixes)
                     });
                     if setter {
                         AccessorKind::Setter { field: name }
@@ -322,11 +351,22 @@ pub fn accessors_from_class(class: &Class) -> Vec<MixinAccessor> {
                 method: method.name.clone(),
                 descriptor: method.descriptor.clone(),
                 target_class: target_class.clone(),
+                targets: targets.clone(),
+                is_static: method.is_static,
                 kind,
             });
         }
     }
     out
+}
+
+/// The name of a Mixin member reference: `name`, `name(descriptor)return` and a
+/// lone `(descriptor)return` all yield the name part (empty for the last).
+fn accessor_member_name(value: &str) -> &str {
+    match value.find('(') {
+        Some(index) => &value[..index],
+        None => value,
+    }
 }
 
 /// Mixin's rule for an unnamed accessor: drop the `get`/`set`/`invoke` prefix and

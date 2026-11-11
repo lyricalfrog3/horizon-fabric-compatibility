@@ -1007,6 +1007,10 @@ impl FabricBridge {
 
         let prev_budget = self.interp.step_budget;
         self.mixins = self.load_mixin_manifest();
+        // Only the injectors checked against the classpath go to the
+        // interpreter; the rest are in `unsupported` with their reason rather
+        // than silently doing nothing.
+        self.interp.set_mixin_injectors(&self.mixins.wired);
         self.interp.mixin_interfaces.clear();
         self.interp.mixin_interface_methods.clear();
         for added in &self.mixins.interface_methods {

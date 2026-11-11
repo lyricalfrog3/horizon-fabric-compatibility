@@ -2519,28 +2519,86 @@ pub fn dispatch_builtin(
         }
     }
 
-    // Mixin callback objects. Only the menu-widget bridge creates these, but
-    // a callback may also call `isCancellable`/`cancel`.
+    // Mixin callback objects. A `@Inject` callback receives one of these; the
+    // injection driver creates it. A method this block does not answer
+    // (`hashCode`, `equals`) falls through to the `Object` answers below.
     if class_name.ends_with("/injection/callback/CallbackInfo")
         || class_name.ends_with("/injection/callback/CallbackInfoReturnable")
     {
         let info = args.first().and_then(Value::as_obj);
-        if method_name == "cancel" {
-            if let Some(id) = info {
-                if let Some(callback) = heap.get_native_mut::<CallbackInfo>(id) {
-                    callback.cancelled = true;
+        let read = |heap: &Heap| {
+            info.and_then(|id| heap.get_native::<CallbackInfo>(id))
+                .cloned()
+                .unwrap_or_default()
+        };
+        match method_name {
+            "<init>" => return BuiltinResult::Handled(Value::NULL),
+            // `cancel()` throws for an injector that was not declared
+            // cancellable. A heap builtin cannot throw, so the flag is set and
+            // the injection driver raises that `CancellationException` when it
+            // reads it; a flag without a cancellable injection changes nothing.
+            "cancel" => {
+                if let Some(id) = info {
+                    if let Some(callback) = heap.get_native_mut::<CallbackInfo>(id) {
+                        callback.cancelled = true;
+                    }
                 }
+                return BuiltinResult::Handled(Value::NULL);
             }
-        } else if method_name == "isCancelled" {
-            return BuiltinResult::Handled(Value::from_bool(
-                info.and_then(|id| heap.get_native::<CallbackInfo>(id))
-                    .map(|callback| callback.cancelled)
-                    .unwrap_or(false),
-            ));
-        } else if method_name == "isCancellable" {
-            return BuiltinResult::Handled(Value::from_bool(true));
+            "isCancelled" => return BuiltinResult::Handled(Value::from_bool(read(heap).cancelled)),
+            "isCancellable" => {
+                return BuiltinResult::Handled(Value::from_bool(read(heap).cancellable));
+            }
+            "getId" => {
+                let text = heap.alloc_string(read(heap).id);
+                return BuiltinResult::Handled(Value::Object(Some(text)));
+            }
+            "toString" => {
+                let callback = read(heap);
+                let text = heap.alloc_string(format!(
+                    "CallbackInfo[TYPE={},NAME={},CANCELLABLE={}]",
+                    if callback.returnable {
+                        "CallbackInfoReturnable"
+                    } else {
+                        "CallbackInfo"
+                    },
+                    callback.id,
+                    callback.cancellable
+                ));
+                return BuiltinResult::Handled(Value::Object(Some(text)));
+            }
+            // `CallbackInfoReturnable`'s accessors: the object form, and the
+            // type-suffixed ones that unbox for a primitive target method. An
+            // unset value reads as the type's zero, as Mixin's do.
+            "getReturnValue" => return BuiltinResult::Handled(read(heap).return_value),
+            "getReturnValueI" | "getReturnValueB" | "getReturnValueC" | "getReturnValueS" => {
+                return BuiltinResult::Handled(Value::Int(read(heap).return_value.as_int()));
+            }
+            "getReturnValueJ" => {
+                return BuiltinResult::Handled(Value::Long(read(heap).return_value.as_long()));
+            }
+            "getReturnValueF" => {
+                return BuiltinResult::Handled(Value::Float(read(heap).return_value.as_float()));
+            }
+            "getReturnValueD" => {
+                return BuiltinResult::Handled(Value::Double(read(heap).return_value.as_double()));
+            }
+            "getReturnValueZ" => {
+                return BuiltinResult::Handled(Value::from_bool(read(heap).return_value.as_bool()));
+            }
+            // `setReturnValue` records the value *and cancels*, which is what
+            // makes the target method answer with it.
+            "setReturnValue" => {
+                if let Some(id) = info {
+                    if let Some(callback) = heap.get_native_mut::<CallbackInfo>(id) {
+                        callback.cancelled = true;
+                        callback.return_value = args.get(1).cloned().unwrap_or(Value::NULL);
+                    }
+                }
+                return BuiltinResult::Handled(Value::NULL);
+            }
+            _ => {}
         }
-        return BuiltinResult::Handled(Value::NULL);
     }
 
     // -------------------------------------------------------------

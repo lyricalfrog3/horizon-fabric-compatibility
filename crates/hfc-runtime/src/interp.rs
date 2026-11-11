@@ -183,6 +183,17 @@ pub struct Interpreter {
     /// The class declaring each static field reached through a subclass,
     /// by (named class, field); a class hierarchy never changes once loaded.
     static_field_owners: HashMap<(String, String), Option<String>>,
+    /// Injectors that can run, by the class whose bytecode declares the target
+    /// method and the method's name. A `@Inject` at `HEAD` runs before the
+    /// body and a cancellable one can replace it, exactly as Mixin's injected
+    /// bytecode would; see [`Interpreter::run_injectors`].
+    pub mixin_injectors: HashMap<(String, String), Vec<crate::mixin::WiredInjector>>,
+    /// The call depth at which a `@Inject` callback is running. While it is
+    /// non-zero, an injector for the callback's own target must not fire
+    /// again: a callback that calls the injected method would otherwise
+    /// recurse forever, which Mixin avoids because its handler bytecode is
+    /// inserted into the target, not into the callback.
+    injector_depth: usize,
 }
 
 impl Default for Interpreter {
@@ -225,6 +236,8 @@ impl Interpreter {
             mixin_interfaces: HashMap::new(),
             mixin_interface_methods: HashMap::new(),
             static_field_owners: HashMap::new(),
+            mixin_injectors: HashMap::new(),
+            injector_depth: 0,
         }
     }
 
@@ -261,6 +274,8 @@ impl Interpreter {
             mixin_interfaces: HashMap::new(),
             mixin_interface_methods: HashMap::new(),
             static_field_owners: HashMap::new(),
+            mixin_injectors: HashMap::new(),
+            injector_depth: 0,
         }
     }
 
@@ -2261,7 +2276,7 @@ impl Interpreter {
         }
 
         let mut visited = std::collections::HashSet::new();
-        let (this_class, bsm, code) = 'lookup: loop {
+        let (this_class, declared_descriptor, bsm, code) = 'lookup: loop {
             let Some(curr) = queue.pop_front() else {
                 if let Some(fallback) = declared_fallback.take() {
                     queue.push_back(fallback);
@@ -2296,6 +2311,7 @@ impl Interpreter {
                 if let Some(code) = &m.code {
                     break 'lookup (
                         c.this_class.clone(),
+                        m.descriptor.clone(),
                         c.bootstrap_methods.clone(),
                         std::sync::Arc::clone(code),
                     );
@@ -2310,7 +2326,62 @@ impl Interpreter {
             }
         };
 
-        self.interpret_code(&this_class, method_name, descriptor, &bsm, &code, args)
+        // A mixin `@Inject` at HEAD whose callback cancels replaces the method
+        // body, and a TAIL one can replace the value it returns. The injectors
+        // are keyed by the class that declares the body, which is where Mixin
+        // would have inserted its call.
+        if self.injector_depth == 0
+            && self
+                .mixin_injectors
+                .contains_key(&(this_class.clone(), method_name.to_string()))
+        {
+            if let Some(value) = self.run_injectors(
+                &this_class,
+                method_name,
+                &declared_descriptor,
+                &crate::mixin::InjectionPoint::Head,
+                args,
+                None,
+            )? {
+                return Ok(value);
+            }
+            if self.pending_exception.is_some() {
+                return Ok(Value::NULL);
+            }
+            let value = self.interpret_code(
+                &this_class,
+                method_name,
+                &declared_descriptor,
+                &bsm,
+                &code,
+                args,
+            )?;
+            if self.pending_exception.is_some() {
+                return Ok(value);
+            }
+            // A TAIL callback sees the value the method is about to return and
+            // can replace it; a cancelled `void` one changes nothing.
+            if let Some(replacement) = self.run_injectors(
+                &this_class,
+                method_name,
+                &declared_descriptor,
+                &crate::mixin::InjectionPoint::Tail,
+                args,
+                Some(&value),
+            )? {
+                return Ok(replacement);
+            }
+            return Ok(value);
+        }
+
+        self.interpret_code(
+            &this_class,
+            method_name,
+            &declared_descriptor,
+            &bsm,
+            &code,
+            args,
+        )
     }
 
     /// Record a widget a mixin callback added to a layout or screen.
@@ -2433,6 +2504,141 @@ impl Interpreter {
         };
         let class = self.frame_classes[index].clone();
         Value::Object(Some(self.heap.alloc_class(class)))
+    }
+
+    /// Register the injectors that can run, keyed by the class whose bytecode
+    /// declares the target method and that method's name.
+    pub fn set_mixin_injectors(&mut self, wired: &[crate::mixin::WiredInjector]) {
+        self.mixin_injectors.clear();
+        for injector in wired {
+            self.mixin_injectors
+                .entry((
+                    injector.declaring_class.clone(),
+                    injector.target_method.clone(),
+                ))
+                .or_default()
+                .push(injector.clone());
+        }
+    }
+
+    /// Run the `@Inject` callbacks at `point` for `this_class`'s method, and
+    /// return the value the method must answer with when one cancelled.
+    ///
+    /// At `HEAD` the callbacks run with the method's real receiver and
+    /// parameters before its body; a callback that cancels makes the method
+    /// return `Some(value)` instead of running the body, which is exactly what
+    /// Mixin's injected `if (ci.isCancelled()) return ...;` does. At `TAIL`
+    /// they run after the body with the value it is about to return, and a
+    /// cancel replaces that value.
+    ///
+    /// `None` from a cancelled `void` method and the cancelled value of a
+    /// returnable one both mean "the method returns this"; [`Cancel::default`]
+    /// is the zero of the method's return type.
+    fn run_injectors(
+        &mut self,
+        this_class: &str,
+        method_name: &str,
+        descriptor: &str,
+        point: &crate::mixin::InjectionPoint,
+        args: &[Value],
+        returned: Option<&Value>,
+    ) -> Result<Option<Value>> {
+        let Some(injectors) = self
+            .mixin_injectors
+            .get(&(this_class.to_string(), method_name.to_string()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut cancel_value = None;
+        for injector in injectors {
+            if &injector.point != point || injector.target_descriptor != descriptor {
+                continue;
+            }
+            // A mixin callback is merged into its target class, so `this` is
+            // the receiver, not an instance of the mixin class. A static
+            // target has no receiver: every argument is a parameter.
+            let receiver = if injector.target_static {
+                None
+            } else {
+                args.first().cloned()
+            };
+            let target_params: Vec<Value> = if injector.target_static {
+                args.to_vec()
+            } else {
+                args.iter().skip(1).cloned().collect()
+            };
+            let info = self.heap.alloc_native(crate::minecraft::CallbackInfo {
+                cancellable: injector.cancellable,
+                id: method_name.to_string(),
+                returnable: injector.returns_value(),
+                return_value: returned.cloned().unwrap_or(Value::NULL),
+                ..Default::default()
+            });
+            let mut call_args = Vec::with_capacity(target_params.len() + 2);
+            if let Some(receiver) = &receiver {
+                call_args.push(receiver.clone());
+            } else if !injector.callback_static {
+                // A virtual target always has a receiver; a static one has
+                // none and a non-static callback would be invalid.
+                call_args.push(Value::NULL);
+            }
+            call_args.extend(target_params);
+            call_args.push(Value::Object(Some(info)));
+            self.injector_depth += 1;
+            let result = self.execute_method(
+                &injector.mixin_class,
+                &injector.callback_method,
+                &injector.callback_descriptor,
+                &call_args,
+            );
+            self.injector_depth -= 1;
+            if let Err(error) = result {
+                log::warn!(
+                    "@Inject callback {}.{}{} for {this_class}.{method_name} failed: {error}",
+                    injector.mixin_class,
+                    injector.callback_method,
+                    injector.callback_descriptor
+                );
+                continue;
+            }
+            if self.pending_exception.is_some() {
+                // The callback threw: its exception belongs to the target
+                // method's caller, so it must not be swallowed into a return
+                // value.
+                return Ok(None);
+            }
+            let Some(callback) = self.heap.get_native::<crate::minecraft::CallbackInfo>(info)
+            else {
+                continue;
+            };
+            if !callback.cancelled {
+                continue;
+            }
+            if !callback.cancellable {
+                // `cancel()` on a non-cancellable injection throws
+                // `CancellationException` in Mixin. The callback already ran,
+                // so the honest thing the engine can do is raise it here.
+                let message = format!(
+                    "The call {method_name} is not cancellable ({} {}.{})",
+                    injector.mixin_class, injector.callback_method, injector.callback_descriptor
+                );
+                let exception = self.new_exception(
+                    "org/spongepowered/asm/mixin/injection/callback/CancellationException",
+                    &message,
+                );
+                self.pending_exception = Some(exception);
+                return Ok(None);
+            }
+            cancel_value = Some(callback.return_value.clone());
+            // Mixin applies each cancelled injection in turn; one cancellation
+            // already decides the method's result, but a later callback still
+            // sees the value the earlier one set.
+            if returned.is_none() {
+                break;
+            }
+        }
+        Ok(cancel_value)
     }
 
     /// Interpret a code block with the given arguments as initial locals.

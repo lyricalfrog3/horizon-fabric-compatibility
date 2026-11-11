@@ -417,10 +417,16 @@ impl FabricBridge {
     /// Whether the loader can load `class` (dotted or binary), for the census's
     /// "applied or ignored" mixin column.
     pub fn census_interprets(&mut self, class: &str) -> bool {
+        // `get_or_load` answers `Ok(None)` for a class it could not find, so
+        // asking `is_ok()` said yes for every name: a target this runtime
+        // never loads still counted as interpreted, and the census's "native"
+        // verdict could not fire for a class outside `native_classes()`.
         self.interp
             .loader
             .get_or_load(&class.replace('.', "/"))
-            .is_ok()
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// The entrypoints the census recorded.

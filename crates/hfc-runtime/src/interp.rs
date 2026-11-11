@@ -4741,6 +4741,20 @@ impl Interpreter {
             return Value::Object(Some(id));
         }
 
+        // `Stats` is in `has_synthetic_statics`, so its own `<clinit>` never runs.
+        // Without a branch here every `Stats.*` field fell through to the
+        // `TagKey` fallback: `Stats.WALK_ONE_CM` answered a tag, not the `Stat`
+        // the same class's `StatType.get` builtin returns. Both lists must name
+        // the class, or the first `Getstatic` reaches for the real registry.
+        if class_name == "net/minecraft/stats/Stats" {
+            let name = self.heap.alloc_string(field_name);
+            let id = self.heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/stats/Stat".into(),
+                fields: HashMap::from([("name".to_string(), Value::Object(Some(name)))]),
+            });
+            return Value::Object(Some(id));
+        }
+
         if class_name == "net/minecraft/world/item/Items" {
             let item_id = format!("minecraft:{}", field_name.to_lowercase());
             let id = self.heap.alloc_native(Item { id: item_id });

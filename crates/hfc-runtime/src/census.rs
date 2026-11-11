@@ -929,7 +929,19 @@ pub fn markdown_of(report: &Report, old: Option<&Report>) -> String {
             .entry((mixin.target.clone(), mixin.outcome.clone()))
             .or_default();
     }
-    out.push_str("\n## Mixin targets\n\n| Target | Outcome | Mods |\n|---|---|---:|\n");
+    // "applied" says the callback is wired into the interpreter, which is not
+    // the same as the mod working: a callback on a method nothing ever calls
+    // (a renderer body the host does not run) is wired and still never runs.
+    // The legend states both halves so the table cannot be read as "works".
+    out.push_str(
+        "\n## Mixin targets\n\n\
+         `applied`: the callback is verified against the classpath and the interpreter \n\
+         dispatches it. That is not the same as the mod working: a callback on a method the \n\
+         host never calls is wired and still never runs. `partial`: some of the target's \n\
+         injectors could not be wired. `ignored`: nothing runs. `native`: the target is one \n\
+         of the runtime's own stand-ins.\n\n\
+         | Target | Outcome | Mods |\n|---|---|---:|\n",
+    );
     let mut mixins: Vec<_> = mixins.into_iter().collect();
     mixins.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
     for ((target, outcome), mods) in mixins {

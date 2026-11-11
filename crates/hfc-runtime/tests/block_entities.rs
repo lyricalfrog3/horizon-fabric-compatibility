@@ -865,3 +865,57 @@ fn opening_a_mods_menu_gives_the_player_the_open_menu() {
          `handleContainerInput` would return before the menu's clicked ran"
     );
 }
+
+/// A class whose statics the runtime synthesizes must be in both
+/// `has_synthetic_statics` and `create_static_field_val`. `Stats` was in the
+/// first only, so its `<clinit>` was skipped and every `Stats.*` field fell
+/// through to the `TagKey` fallback: `Stats.WALK_ONE_CM` answered a tag rather
+/// than the `Stat` that `StatType.get` builds.
+#[test]
+fn a_synthesized_static_is_the_type_its_own_code_builds() {
+    use hfc_runtime::value::JavaObject;
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    let value = bridge
+        .interp
+        .resolve_static_field("net/minecraft/stats/Stats", "WALK_ONE_CM");
+    let id = value.as_obj().expect("Stats.WALK_ONE_CM is not an object");
+    let class = match bridge.interp.heap.get(id) {
+        Some(JavaObject::Instance { class_name, .. }) => class_name.clone(),
+        other => panic!("Stats.WALK_ONE_CM is not an instance: {other:?}"),
+    };
+    assert_eq!(
+        class, "net/minecraft/stats/Stat",
+        "Stats.WALK_ONE_CM is a {class}, not the Stat its StatType.get builds"
+    );
+    // The name is the field's own, so two fields are not the same stat.
+    let other = bridge
+        .interp
+        .resolve_static_field("net/minecraft/stats/Stats", "DAMAGE_DEALT");
+    assert_ne!(
+        value.as_obj(),
+        other.as_obj(),
+        "two Stats fields answered the same object"
+    );
+}
+
+/// A class the loader cannot find is not one the runtime interprets.
+/// `census_interprets` asked `get_or_load(..).is_ok()`, and `get_or_load`
+/// answers `Ok(None)` for a name it cannot resolve, so every class — including
+/// a mixin target that is not on the classpath at all — counted as interpreted
+/// and the census could report it as applied.
+#[test]
+fn a_class_the_loader_cannot_find_is_not_interpreted() {
+    let Some(mut bridge) = farmers_delight() else {
+        return;
+    };
+    assert!(
+        bridge.census_interprets("net/minecraft/world/level/Level"),
+        "a class the runtime loads is not reported as interpreted"
+    );
+    assert!(
+        !bridge.census_interprets("com/example/ThisClassDoesNotExist"),
+        "a class that is not on the classpath is reported as interpreted"
+    );
+}

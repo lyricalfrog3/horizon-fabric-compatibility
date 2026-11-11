@@ -6243,6 +6243,19 @@ pub fn dispatch_builtin(
             });
             let level = heap.alloc_level(Level::new(true));
             let player = heap.alloc_player(Player::new(0));
+            // `AbstractContainerScreen.slotClicked` hands every slot click to
+            // `minecraft.gameMode.handleContainerInput`, and that is what runs
+            // the menu's own `clicked` (which moves the stack). Without this
+            // object the call went to null and a mod screen received clicks
+            // that did nothing.
+            let game_mode = heap.alloc(JavaObject::Instance {
+                class_name: "net/minecraft/client/multiplayer/MultiPlayerGameMode".into(),
+                fields: [
+                    ("player".to_string(), Value::Object(Some(player))),
+                    ("menu".to_string(), Value::NULL),
+                ]
+                .into(),
+            });
             let id = heap.alloc(JavaObject::Instance {
                 class_name: "net/minecraft/client/Minecraft".into(),
                 fields: [
@@ -6252,6 +6265,7 @@ pub fn dispatch_builtin(
                     ("window".to_string(), Value::Object(Some(window))),
                     ("level".to_string(), Value::Object(Some(level))),
                     ("player".to_string(), Value::Object(Some(player))),
+                    ("gameMode".to_string(), Value::Object(Some(game_mode))),
                     ("screen".to_string(), Value::NULL),
                 ]
                 .into(),
@@ -6272,13 +6286,37 @@ pub fn dispatch_builtin(
         } else if method_name == "setScreen" && args.len() >= 2 {
             let screen = args[1].clone();
             if let Some(mc) = heap.get_singleton("net/minecraft/client/Minecraft") {
-                if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(mc) {
-                    fields.insert("screen".into(), screen.clone());
-                    if let Some(gui) = fields.get("gui").and_then(|v| v.as_obj()) {
-                        if let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(gui) {
-                            fields.insert("screen".into(), screen);
-                        }
+                // The menu the screen is showing, so a slot click reaches it
+                // through `gameMode.handleContainerInput`.
+                let menu = screen
+                    .as_obj()
+                    .and_then(|id| heap.get(id))
+                    .and_then(|object| match object {
+                        JavaObject::Instance { fields, .. } => fields.get("menu").cloned(),
+                        _ => None,
+                    })
+                    .unwrap_or(Value::NULL);
+                // Read the ids first, then write: one object is the client's
+                // and the others are its fields.
+                let (game_mode, gui) = match heap.get_mut(mc) {
+                    Some(JavaObject::Instance { fields, .. }) => {
+                        fields.insert("screen".into(), screen.clone());
+                        (
+                            fields.get("gameMode").and_then(|v| v.as_obj()),
+                            fields.get("gui").and_then(|v| v.as_obj()),
+                        )
                     }
+                    _ => (None, None),
+                };
+                if let Some(game_mode) = game_mode
+                    && let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(game_mode)
+                {
+                    fields.insert("menu".into(), menu);
+                }
+                if let Some(gui) = gui
+                    && let Some(JavaObject::Instance { fields, .. }) = heap.get_mut(gui)
+                {
+                    fields.insert("screen".into(), screen);
                 }
             }
             return BuiltinResult::Handled(Value::NULL);

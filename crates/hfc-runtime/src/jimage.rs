@@ -21,6 +21,10 @@ const MAGIC: i32 = 0xCAFE_DADA_u32 as i32;
 const HEADER_SLOTS: usize = 7;
 const HEADER_SIZE: usize = HEADER_SLOTS * 4;
 
+/// The most one class resource may decompress to. A class file is never this
+/// large; the cap bounds what a hostile local image can ask for.
+const MAX_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A class file inside a JDK image.
 #[derive(Debug, Clone, Copy)]
 struct Resource {
@@ -72,13 +76,40 @@ impl JImage {
         let locations_size = read_u32(&header, 20) as usize;
         let strings_size = read_u32(&header, 24) as usize;
 
-        let redirect_size = table_length * 4;
-        let offsets_size = table_length * 4;
-        let index_size = HEADER_SIZE + redirect_size + offsets_size + locations_size + strings_size;
+        let redirect_size = (table_length as u64) * 4;
+        let offsets_size = (table_length as u64) * 4;
+        // Every length below comes from the file's own header, so it is
+        // attacker-controlled when the image is not the JDK's. Bound the index
+        // against what the file actually holds before allocating: a header
+        // claiming gigabytes must fail here, not by asking for gigabytes.
+        let index_size = (HEADER_SIZE as u64)
+            .checked_add(redirect_size)
+            .and_then(|n| n.checked_add(offsets_size))
+            .and_then(|n| n.checked_add(locations_size as u64))
+            .and_then(|n| n.checked_add(strings_size as u64))
+            .ok_or_else(|| {
+                Error::new(
+                    path.display().to_string(),
+                    "index size overflows: not a valid jimage",
+                )
+            })?;
+        let file_len = file.metadata().map_err(|e| Error::io(path, e))?.len();
+        if index_size > file_len {
+            return Err(Error::new(
+                path.display().to_string(),
+                format!(
+                    "index size {index_size} exceeds the {file_len} byte file; refusing to allocate"
+                ),
+            ));
+        }
+        let index_size = index_size as usize;
 
         let mut index = vec![0u8; index_size - HEADER_SIZE];
         file.read_exact(&mut index)
             .map_err(|e| Error::io(path, e))?;
+
+        let redirect_size = redirect_size as usize;
+        let offsets_size = offsets_size as usize;
 
         let offsets_start = redirect_size;
         let locations_start = offsets_start + offsets_size;
@@ -155,16 +186,28 @@ impl JImage {
         } else {
             resource.compressed_size
         };
-        if size > 64 * 1024 * 1024 {
+        if size > MAX_RESOURCE_BYTES {
             return Err(Error::new("jimage", format!("class too large: {name}")));
         }
+        // The offset and size come from the location table, so they are only as
+        // trustworthy as the file. Require the whole resource to be inside it
+        // before allocating for it.
+        let file_len = file.metadata().map_err(|e| Error::io(&self.path, e))?.len();
+        let start = self
+            .index_size
+            .checked_add(resource.content_offset)
+            .ok_or_else(|| Error::new("jimage", format!("resource offset overflows: {name}")))?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| Error::new("jimage", format!("resource size overflows: {name}")))?;
+        if end > file_len {
+            return Err(Error::new(
+                "jimage",
+                format!("resource {name} extends past the end of the image"),
+            ));
+        }
         let mut bytes = vec![0u8; size as usize];
-        read_at(
-            &mut file,
-            &mut bytes,
-            self.index_size + resource.content_offset,
-        )
-        .map_err(|e| Error::io(&self.path, e))?;
+        read_at(&mut file, &mut bytes, start).map_err(|e| Error::io(&self.path, e))?;
 
         let mut bytes = if resource.compressed_size == 0 {
             bytes
@@ -200,7 +243,15 @@ impl JImage {
         }
 
         match plugin.as_str() {
-            "zip" => inflate(body, uncompressed_size as usize),
+            "zip" => {
+                if uncompressed_size > MAX_RESOURCE_BYTES {
+                    return Err(Error::new(
+                        "jimage",
+                        format!("compressed resource expands past {MAX_RESOURCE_BYTES} bytes"),
+                    ));
+                }
+                inflate(body, uncompressed_size as usize)
+            }
             "compact-cp" => Ok(normalize_constant_pool(&self.strings, body)),
             other => Err(Error::new(
                 "jimage",
@@ -268,18 +319,37 @@ fn string_at(strings: &[u8], offset: usize) -> String {
 }
 
 fn inflate(body: &[u8], expected: usize) -> Result<Vec<u8>> {
+    // `expected` is the declared uncompressed size, which the stream does not
+    // have to honour: read one byte past it and fail if the stream really is
+    // larger, so a lying declaration cannot expand without bound.
+    let limit = expected as u64;
+    let too_large = || {
+        Error::new(
+            "jimage",
+            format!("compressed resource expands past its declared {limit} bytes"),
+        )
+    };
     let mut out = Vec::with_capacity(expected);
     let mut decoder = flate2::read::ZlibDecoder::new(body);
     // jimage's "zip" plugin uses raw DEFLATE through `Inflater`; accept either
     // framing by retrying raw input when the zlib header is not present.
-    match decoder.read_to_end(&mut out) {
+    match decoder
+        .by_ref()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut out)
+    {
+        Ok(_) if out.len() as u64 > limit => Err(too_large()),
         Ok(_) => Ok(out),
         Err(_) => {
             let mut out = Vec::with_capacity(expected);
             let mut decoder = flate2::read::DeflateDecoder::new(body);
             decoder
+                .take(limit.saturating_add(1))
                 .read_to_end(&mut out)
                 .map_err(|e| Error::new("jimage", format!("inflate failed: {e}")))?;
+            if out.len() as u64 > limit {
+                return Err(too_large());
+            }
             Ok(out)
         }
     }
@@ -476,4 +546,56 @@ fn reconstruct_descriptor(strings: &[u8], descriptor: &str, indexes: &[usize]) -
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header claiming a huge index must fail against the file length instead
+    /// of asking the allocator for it.
+    #[test]
+    fn a_header_that_claims_a_huge_index_is_refused() {
+        let dir = std::env::temp_dir().join(format!("hfc-jimage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("modules");
+        // The 28-byte header: magic, version, a reserved word, the resource
+        // count, and the three index lengths. The table length is the lie.
+        let mut header = Vec::new();
+        header.extend_from_slice(&(MAGIC as u32).to_le_bytes());
+        header.extend_from_slice(&(1u32 << 16).to_le_bytes()); // version 1
+        header.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        header.extend_from_slice(&0u32.to_le_bytes()); // resource count
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // table length: huge
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // locations
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // strings
+        assert_eq!(header.len(), HEADER_SIZE);
+        std::fs::write(&path, &header).unwrap();
+
+        let error = match JImage::open(&path) {
+            Ok(_) => panic!("a bogus index size is refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("index size"),
+            "the error names the index: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `inflate` stops at the declared size, so a stream that expands past it
+    /// fails rather than running to its own end.
+    #[test]
+    fn inflate_refuses_a_stream_past_its_declared_size() {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut encoder, &vec![0u8; 4096]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let error = inflate(&compressed, 16).expect_err("the stream is larger than declared");
+        assert!(error.to_string().contains("expands past"), "{error}");
+        // The same stream with an honest size inflates.
+        let ok = inflate(&compressed, 4096).expect("an honest size works");
+        assert_eq!(ok.len(), 4096);
+    }
 }

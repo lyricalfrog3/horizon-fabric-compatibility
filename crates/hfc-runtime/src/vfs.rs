@@ -6,13 +6,104 @@
 //! path outside the root is never opened: the mod sees it as missing.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+/// How many symlinks one resolution follows before giving up. The kernel's own
+/// limit is 40; a chain deeper than that is a loop, not a path.
+const MAX_SYMLINK_HOPS: usize = 40;
 
 #[derive(Debug, Default)]
 pub struct Vfs {
+    /// The sandbox root, always canonical (absolute, symlinks resolved) once a
+    /// host sets it, so a game directory reached through a symlink still
+    /// contains what it contains. See [`canonical_root`].
     root: Option<PathBuf>,
     files: BTreeMap<String, Vec<u8>>,
     dirs: BTreeSet<String>,
+}
+
+/// One step of a path, owned so a symlink target can be spliced into the queue
+/// without borrowing the [`Path`] it was read from.
+enum Step {
+    Root,
+    Parent,
+    Normal(std::ffi::OsString),
+}
+
+fn steps(path: &Path) -> std::collections::VecDeque<Step> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Prefix(prefix) => Some(Step::Normal(prefix.as_os_str().to_os_string())),
+            Component::RootDir => Some(Step::Root),
+            Component::ParentDir => Some(Step::Parent),
+            Component::CurDir => None,
+            Component::Normal(name) => Some(Step::Normal(name.to_os_string())),
+        })
+        .collect()
+}
+
+/// Resolve every symlink in `path` the way the file system would, leaving the
+/// components that do not exist yet in place: a write to a new file resolves
+/// the directories above it and appends the name. `..` is applied *after* the
+/// symlink it follows (physical, not lexical, navigation).
+///
+/// `None` means the path cannot be resolved — a symlink loop, or a component
+/// that exists but cannot be read. A caller must refuse such a path rather
+/// than guess: this is a containment check, so it fails closed.
+fn resolve_symlinks(path: &Path) -> Option<PathBuf> {
+    let mut resolved = PathBuf::new();
+    let mut pending = steps(path);
+    let mut hops = 0usize;
+    while let Some(step) = pending.pop_front() {
+        match step {
+            Step::Root => resolved.push(Component::RootDir.as_os_str()),
+            Step::Parent => {
+                resolved.pop();
+            }
+            Step::Normal(name) => {
+                let candidate = resolved.join(&name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return None;
+                        }
+                        let target = std::fs::read_link(&candidate).ok()?;
+                        // An absolute target restarts from the file system
+                        // root; a relative one continues from the directory
+                        // holding the link, which is the `resolved` prefix.
+                        if target.is_absolute() {
+                            resolved = PathBuf::new();
+                        }
+                        let mut front = steps(&target);
+                        while let Some(part) = front.pop_back() {
+                            pending.push_front(part);
+                        }
+                    }
+                    // A missing component stays as written; the entries above
+                    // it are resolved, which is what a create-a-new-file write
+                    // needs.
+                    _ => resolved = candidate,
+                }
+            }
+        }
+    }
+    Some(resolved)
+}
+
+/// The root as the file system sees it. A root that does not exist yet is
+/// resolved as far as it does exist, so the check still compares physical
+/// paths.
+fn canonical_root(root: PathBuf) -> PathBuf {
+    let absolute = if root.is_absolute() {
+        root
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(&root),
+            Err(_) => root,
+        }
+    };
+    resolve_symlinks(&absolute).unwrap_or(absolute)
 }
 
 /// Join and normalize `.`/`..` segments; the result uses `/` and no trailing slash.
@@ -51,8 +142,12 @@ pub fn file_name(path: &str) -> &str {
 }
 
 impl Vfs {
+    /// Set the sandbox root. It is canonicalized here, once: a game directory
+    /// reached through a symlink is then compared by where it really is, so the
+    /// normal case keeps working while a link *inside* it that points out
+    /// cannot be walked through.
     pub fn set_root(&mut self, root: Option<PathBuf>) {
-        self.root = root;
+        self.root = root.map(canonical_root);
     }
 
     /// Every in-memory file, for tests and diagnostics.
@@ -64,9 +159,20 @@ impl Vfs {
         self.root.as_deref()
     }
 
-    /// The real location of `path`, when the disk is in play and `path` is inside
-    /// the root. A relative path is the mod's working directory's, and that is
-    /// the game folder (the root), as it is for a JVM process started there.
+    /// The real location of `path`, when the disk is in play and `path` is
+    /// physically inside the root. A relative path is the mod's working
+    /// directory's, and that is the game folder (the root), as it is for a JVM
+    /// process started there.
+    ///
+    /// Resolving first is what makes this a containment check rather than a
+    /// spelling check: a symlink inside the root points wherever it was made
+    /// to, so the path that is compared has to be the one the file system will
+    /// open. The root is stored canonical ([`Vfs::set_root`]), and every
+    /// existing component of the candidate is resolved here; components that do
+    /// not exist yet are appended unchanged, so a write to a new file resolves
+    /// its parent. A path that cannot be resolved, or whose resolution leaves
+    /// the root, is `None`. A path spelled through a symlinked *root* is
+    /// accepted because it resolves to a place inside the root.
     fn real(&self, path: &str) -> Option<PathBuf> {
         let root = self.root.as_ref()?;
         let normalized = join("", path);
@@ -75,7 +181,8 @@ impl Vfs {
         } else {
             root.join(&normalized)
         };
-        candidate.starts_with(root).then_some(candidate)
+        let resolved = resolve_symlinks(&candidate)?;
+        resolved.starts_with(root).then_some(resolved)
     }
 
     fn disk(&self) -> bool {
@@ -251,7 +358,7 @@ impl Vfs {
         let Some(real) = self.real(&normalized) else {
             return normalized;
         };
-        let mut probe = real.clone();
+        let mut probe = real;
         let mut tail: Vec<std::ffi::OsString> = Vec::new();
         let resolved = loop {
             match probe.canonicalize() {
@@ -265,14 +372,16 @@ impl Vfs {
                 },
             }
         };
-        let root = self.root.as_ref().and_then(|r| r.canonicalize().ok());
-        let (Some(mut resolved), Some(root)) = (resolved, root) else {
+        let Some(root) = self.root.as_ref() else {
+            return normalized;
+        };
+        let Some(mut resolved) = resolved else {
             return normalized;
         };
         for name in tail.iter().rev() {
             resolved.push(name);
         }
-        if resolved.starts_with(&root) {
+        if resolved.starts_with(root) {
             resolved.to_string_lossy().to_string()
         } else {
             normalized
@@ -641,5 +750,193 @@ mod tests {
         assert!(!fs.write("/tmp/hfc-escape.txt", b"no", false));
         assert!(!fs.exists("/etc/passwd"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fixture root with an `outside/` sibling a symlink must not reach.
+    struct SymlinkFixture {
+        dir: PathBuf,
+        game: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl SymlinkFixture {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("hfc-vfs-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let game = dir.join("game");
+            let outside = dir.join("outside");
+            std::fs::create_dir_all(game.join("config")).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+            Self { dir, game, outside }
+        }
+
+        fn path(&self, path: &Path) -> String {
+            path.to_string_lossy().to_string()
+        }
+    }
+
+    impl Drop for SymlinkFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_root_is_not_followed() {
+        let fixture = SymlinkFixture::new("symlink-out");
+        let mut fs = Vfs::default();
+        fs.set_root(Some(fixture.game.clone()));
+
+        // The link points at the sibling folder outside the game directory,
+        // which is the shape of a saved-games or resource-pack link.
+        let escape = fixture.game.join("escape");
+        std::os::unix::fs::symlink(&fixture.outside, &escape).unwrap();
+        let secret = fixture.path(&escape.join("secret.txt"));
+        let escape_dir = fixture.path(&escape);
+
+        // Reading through the link would read outside the root.
+        std::fs::write(fixture.outside.join("planted.txt"), b"planted").unwrap();
+        assert_eq!(
+            fs.read(&secret),
+            None,
+            "a symlink to a file outside the root must not be read"
+        );
+        assert!(!fs.is_file(&secret), "and it must not report as a file");
+
+        // Writing through the link would write outside the root.
+        let planted = fixture.path(&escape.join("planted.txt"));
+        assert!(
+            !fs.write(&planted, b"overwritten", false),
+            "a symlink out of the root must not be written through"
+        );
+        assert_eq!(
+            std::fs::read(fixture.outside.join("planted.txt")).unwrap(),
+            b"planted",
+            "the file outside the root is untouched"
+        );
+        assert!(
+            !fs.create_file_exclusive(&fixture.path(&escape.join("fresh.txt"))),
+            "a new file must not be created through the link either"
+        );
+        assert!(!fixture.outside.join("fresh.txt").exists());
+
+        // And listing through it would list outside the root.
+        assert!(
+            fs.list(&escape_dir).is_empty(),
+            "a symlinked directory outside the root is never listed"
+        );
+
+        // The root itself is where the sandbox ends: a path built by walking up
+        // out of it gains nothing.
+        let traversal = fixture.path(&fixture.game.join("config/../../outside/secret.txt"));
+        assert_eq!(fs.read(&traversal), None);
+        assert!(!fs.exists(&traversal));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_root_still_works() {
+        let fixture = SymlinkFixture::new("symlink-in");
+        let mut fs = Vfs::default();
+        fs.set_root(Some(fixture.game.clone()));
+
+        // Resource packs and saved-game folders are commonly linked *within*
+        // the game directory; that is a normal path and must keep working.
+        std::fs::create_dir_all(fixture.game.join("real/config")).unwrap();
+        std::fs::write(fixture.game.join("real/config/a.json"), b"{}").unwrap();
+        let link = fixture.game.join("config-link");
+        std::os::unix::fs::symlink(fixture.game.join("real/config"), &link).unwrap();
+        let through = fixture.path(&link.join("a.json"));
+        assert_eq!(fs.read(&through), Some(b"{}".to_vec()));
+        assert!(fs.is_file(&through) && fs.exists(&through));
+        assert!(fs.write(&through, b"{\"x\":1}", false));
+        assert_eq!(
+            std::fs::read(fixture.game.join("real/config/a.json")).unwrap(),
+            b"{\"x\":1}",
+            "the write landed in the real file inside the root"
+        );
+        assert_eq!(fs.list(&fixture.path(&link)), vec!["a.json".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_game_directory_still_works() {
+        let fixture = SymlinkFixture::new("symlink-root");
+        // The game directory a host reports is itself reached through a link,
+        // as a launcher's data folder may be.
+        let linked_root = fixture.dir.join("game-link");
+        std::os::unix::fs::symlink(&fixture.game, &linked_root).unwrap();
+        let mut fs = Vfs::default();
+        fs.set_root(Some(linked_root.clone()));
+
+        let inside = fixture.path(&linked_root.join("config/a.json"));
+        assert!(
+            fs.write(&inside, b"{}", false),
+            "the normal case still works"
+        );
+        assert_eq!(fs.read(&inside), Some(b"{}".to_vec()));
+        assert!(
+            fixture.game.join("config/a.json").is_file(),
+            "the write landed in the real game directory"
+        );
+        // The root's own canonical name is the same sandbox, not a different
+        // one, so a path spelled with it resolves too.
+        let spelled = fixture.path(&fixture.game.join("config/a.json"));
+        assert_eq!(fs.read(&spelled), Some(b"{}".to_vec()));
+        // And the sibling outside is still out of reach.
+        assert!(!fs.exists(&fixture.path(&fixture.outside.join("secret.txt"))));
+    }
+
+    #[test]
+    fn dot_dot_traversal_is_refused() {
+        let fixture = SymlinkFixture::new("traversal");
+        let mut fs = Vfs::default();
+        fs.set_root(Some(fixture.game.clone()));
+        let outside = fixture.path(&fixture.outside.join("secret.txt"));
+        for spelling in [
+            fixture.path(&fixture.game.join("../outside/secret.txt")),
+            fixture.path(&fixture.game.join("config/../../outside/secret.txt")),
+            "../outside/secret.txt".to_string(),
+        ] {
+            assert_eq!(fs.read(&spelling), None, "{spelling}");
+            assert!(!fs.exists(&spelling), "{spelling}");
+        }
+        assert_eq!(
+            fs.read(&outside),
+            None,
+            "an absolute path outside is refused"
+        );
+        assert!(
+            !fs.write(&outside, b"no", false),
+            "an absolute path outside is not written"
+        );
+    }
+
+    /// The ancestors of the root exist as far as `java.io.File` is concerned (a
+    /// walk up `getParent()` has to terminate), but none of them is listed or
+    /// read: the sandbox's guarantee is about access, not about the walk.
+    #[test]
+    fn nothing_above_the_root_is_listed_or_read() {
+        let fixture = SymlinkFixture::new("above");
+        let fs = Vfs {
+            root: Some(fixture.game.clone()),
+            ..Default::default()
+        };
+        let parent = fixture.path(&fixture.dir);
+        assert!(
+            fs.is_dir(&parent) && fs.exists(&parent),
+            "the game folder's parent exists, so a walk up ends"
+        );
+        assert!(
+            fs.list(&parent).is_empty(),
+            "but its contents are never listed"
+        );
+        assert!(fs.is_root_ancestor("/"));
+        assert!(fs.exists("/"), "a JVM reports the file system root");
+        assert!(!fs.exists("/etc"), "a folder beside the root is invisible");
+        let outside = fixture.path(&fixture.outside.join("secret.txt"));
+        assert!(!fs.is_file(&outside) && fs.read(&outside).is_none());
     }
 }

@@ -25,6 +25,31 @@ enum ClassLocation {
     Nested(usize),
 }
 
+/// Read `reader` through a limit instead of trusting a declared size.
+///
+/// The declared size of a zip entry is attacker-controlled: an entry can claim
+/// a kilobyte and expand to a gigabyte. Reading at most `limit + 1` bytes
+/// bounds the allocation no matter what the entry says, and the extra byte is
+/// how an over-limit entry is told apart from one that exactly fits. This is
+/// the same shape as `hfc_fabric::archive`'s entry reader.
+fn read_limited(reader: impl Read, limit: u64, context: impl Into<String>) -> Result<Vec<u8>> {
+    let context = context.into();
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::new(&context, format!("read error: {e}")))?;
+    if bytes.len() as u64 > limit {
+        return Err(Error::new(
+            &context,
+            format!(
+                "entry expands past the {limit} byte limit (a declared size cannot bound this)"
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// An open JAR, kept open so a walk over thousands of classes does not reopen
 /// and re-parse the archive's central directory for every class.
 struct JarSource {
@@ -142,6 +167,9 @@ impl ClassLoader {
         })?;
 
         let mut nested_to_read = Vec::new();
+        // The uncompressed bytes of nested jars read for this archive, so the
+        // total stays inside `max_uncompressed_bytes` and not just each entry.
+        let mut nested_bytes_read: u64 = 0;
 
         for i in 0..archive.len() {
             if let Ok(entry) = archive.by_index(i) {
@@ -162,28 +190,45 @@ impl ClassLoader {
         for (nested_name, size) in nested_to_read {
             if size <= self.limits.max_jar_bytes {
                 if let Ok(mut entry) = archive.by_name(&nested_name) {
-                    let mut bytes = Vec::with_capacity(size as usize);
-                    if entry.read_to_end(&mut bytes).is_ok() {
-                        let nested_idx = self.nested_archives.len();
-                        if let Ok(mut sub_archive) = ZipArchive::new(Cursor::new(bytes)) {
-                            for j in 0..sub_archive.len() {
-                                if let Ok(sub_entry) = sub_archive.by_index(j) {
-                                    if let Ok(sub_cow) = sub_entry.name() {
-                                        if sub_cow.ends_with(".class") {
-                                            let class_name =
-                                                sub_cow.trim_end_matches(".class").to_string();
-                                            self.class_index
-                                                .entry(class_name)
-                                                .or_insert(ClassLocation::Nested(nested_idx));
-                                        }
+                    // The declared size is only a hint: the read is bounded by
+                    // the per-jar limit *and* by what is left of the total
+                    // across every nested jar, so a jar full of entries that
+                    // each claim to fit cannot expand without bound.
+                    let remaining = self
+                        .limits
+                        .max_uncompressed_bytes
+                        .saturating_sub(nested_bytes_read);
+                    let limit = self.limits.max_jar_bytes.min(remaining);
+                    if limit == 0 {
+                        break;
+                    }
+                    let Ok(bytes) = read_limited(
+                        &mut entry,
+                        limit,
+                        format!("{}:{nested_name}", path.display()),
+                    ) else {
+                        continue;
+                    };
+                    nested_bytes_read += bytes.len() as u64;
+                    let nested_idx = self.nested_archives.len();
+                    if let Ok(mut sub_archive) = ZipArchive::new(Cursor::new(bytes)) {
+                        for j in 0..sub_archive.len() {
+                            if let Ok(sub_entry) = sub_archive.by_index(j) {
+                                if let Ok(sub_cow) = sub_entry.name() {
+                                    if sub_cow.ends_with(".class") {
+                                        let class_name =
+                                            sub_cow.trim_end_matches(".class").to_string();
+                                        self.class_index
+                                            .entry(class_name)
+                                            .or_insert(ClassLocation::Nested(nested_idx));
                                     }
                                 }
                             }
-                            self.nested_archives.push(NestedSource {
-                                name: nested_name,
-                                archive: sub_archive,
-                            });
                         }
+                        self.nested_archives.push(NestedSource {
+                            name: nested_name,
+                            archive: sub_archive,
+                        });
                     }
                 }
             }
@@ -293,21 +338,32 @@ impl ClassLoader {
             }
         };
         let limit = self.limits.max_metadata_bytes;
-        let entry_bytes = |file: &mut dyn Read| -> Result<Vec<u8>> {
+        let entry_bytes = |file: &mut dyn Read, context: &str| -> Result<Vec<u8>> {
+            // `take(limit + 1)` rather than `take(limit)`: the extra byte is
+            // what lets an over-limit entry fail instead of being silently
+            // truncated into a plausible-looking (but wrong) resource.
             let mut bytes = Vec::new();
-            file.take(limit)
+            file.take(limit.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .map_err(|e| Error::new("loader", e.to_string()))?;
+            if bytes.len() as u64 > limit {
+                return Err(Error::new(
+                    context,
+                    format!("resource expands past the {limit} byte limit"),
+                ));
+            }
             Ok(bytes)
         };
         for jar in &mut self.jars {
+            let context = format!("{}:{path}", jar.path.display());
             if let Ok(mut file) = jar.archive.by_name(path) {
-                read(entry_bytes(&mut file));
+                read(entry_bytes(&mut file, &context));
             }
         }
         for nested in &mut self.nested_archives {
+            let context = format!("{}:{path}", nested.name);
             if let Ok(mut file) = nested.archive.by_name(path) {
-                read(entry_bytes(&mut file));
+                read(entry_bytes(&mut file, &context));
             }
         }
         out
@@ -346,46 +402,86 @@ impl ClassLoader {
         match loc {
             ClassLocation::TopLevel(jar_idx) => {
                 let jar = &mut self.jars[jar_idx];
+                let limit = self.limits.max_metadata_bytes;
+                let context = format!("{}:{filename}", jar.path.display());
                 if let Ok(mut zip_file) = jar.archive.by_name(&filename) {
                     let size = zip_file.size();
-                    if size > self.limits.max_metadata_bytes {
-                        return Err(Error::new(
-                            format!("{}:{filename}", jar.path.display()),
-                            "class file exceeds limit",
-                        ));
+                    if size > limit {
+                        return Err(Error::new(&context, "class file exceeds limit"));
                     }
-                    let mut bytes = Vec::with_capacity(size as usize);
-                    zip_file.read_to_end(&mut bytes).map_err(|e| {
-                        Error::new(
-                            format!("{}:{filename}", jar.path.display()),
-                            format!("read error: {e}"),
-                        )
-                    })?;
-                    return Ok(bytes);
+                    return read_limited(&mut zip_file, limit, context);
                 }
             }
             ClassLocation::Nested(nested_idx) => {
                 let nested = &mut self.nested_archives[nested_idx];
+                let limit = self.limits.max_metadata_bytes;
+                let context = format!("{}:{filename}", nested.name);
                 if let Ok(mut zip_file) = nested.archive.by_name(&filename) {
                     let size = zip_file.size();
-                    if size > self.limits.max_metadata_bytes {
-                        return Err(Error::new(
-                            format!("{}:{filename}", nested.name),
-                            "class file exceeds limit",
-                        ));
+                    if size > limit {
+                        return Err(Error::new(&context, "class file exceeds limit"));
                     }
-                    let mut class_bytes = Vec::with_capacity(size as usize);
-                    zip_file.read_to_end(&mut class_bytes).map_err(|e| {
-                        Error::new(
-                            format!("{}:{filename}", nested.name),
-                            format!("read error: {e}"),
-                        )
-                    })?;
-                    return Ok(class_bytes);
+                    return read_limited(&mut zip_file, limit, context);
                 }
             }
         }
 
         Err(Error::new("loader", format!("class not found: {name}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The declared size of an entry proves nothing: the read is bounded by the
+    /// limit even when the stream holds far more.
+    #[test]
+    fn read_limited_bounds_what_it_allocates() {
+        let data = vec![7u8; 64 * 1024];
+        let bytes = read_limited(data.as_slice(), 1024, "test").expect_err("over the limit");
+        assert!(
+            bytes.to_string().contains("expands past"),
+            "the error names the limit: {bytes}"
+        );
+
+        let exactly = read_limited(&data[..1024], 1024, "test").expect("exactly at the limit");
+        assert_eq!(exactly.len(), 1024, "an entry that fits is read in full");
+
+        let empty = read_limited(&b""[..], 1024, "test").expect("an empty entry is empty");
+        assert!(empty.is_empty());
+    }
+
+    /// A stream that is longer than its declared size still stops at the limit:
+    /// the point is that the reader never sees more than `limit + 1` bytes.
+    #[test]
+    fn read_limited_never_pulls_more_than_the_limit() {
+        use std::io::Read;
+        /// A reader that would report an unbounded length if asked.
+        struct Endless {
+            remaining: usize,
+            served: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(self.remaining);
+                buf[..n].fill(1);
+                self.remaining -= n;
+                self.served.set(self.served.get() + n);
+                Ok(n)
+            }
+        }
+        let served = std::rc::Rc::new(std::cell::Cell::new(0));
+        let endless = Endless {
+            remaining: usize::MAX / 2,
+            served: served.clone(),
+        };
+        let error = read_limited(endless, 512, "test").expect_err("must stop at the limit");
+        assert!(error.to_string().contains("expands past"), "{error}");
+        assert_eq!(
+            served.get(),
+            513,
+            "the reader stops at limit + 1, not at the stream's own end"
+        );
     }
 }

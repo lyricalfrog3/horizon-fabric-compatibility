@@ -5224,10 +5224,7 @@ impl Interpreter {
         // initializers build Minecraft's whole item/block/tag registry, which
         // the runtime answers from its own data instead (AGENTS.md records the
         // measured ~34 s stall this avoids).
-        let platform = ["net/minecraft/", "com/mojang/", "java/", "jdk/", "sun/"]
-            .iter()
-            .any(|prefix| class_name.starts_with(prefix));
-        if platform && !has_synthetic_statics(class_name) && !runtime_supplied_state(class_name) {
+        if !has_synthetic_statics(class_name) && !runtime_supplied_state(class_name) {
             let _ = self.ensure_initialized(class_name);
         }
         if let Some(class) = self.loader.get(class_name) {
@@ -5509,10 +5506,12 @@ impl Interpreter {
         // read back. It is keyed on the *declaring class* being Fabric's event
         // package, never on "the class name contains Event", so a mod's own
         // class with an `EVENT` field is not mistaken for a Fabric event.
-        if field_name == "EVENT"
-            && class_name.starts_with("net/fabricmc/fabric/api/")
-            && !field_name.is_empty()
+        if std::env::var_os("HFC_TRACE_EVENT").is_some()
+            && field_name.contains("EVENT")
         {
+            eprintln!("FABRICATE-EVENT {class_name} {field_name}");
+        }
+        if field_name == "EVENT" && class_name.starts_with("net/fabricmc/fabric/api/") {
             let mut fields = HashMap::new();
             let arr_id = self.heap.alloc(JavaObject::Array {
                 elem_type: "java/lang/Object".into(),
@@ -5569,9 +5568,6 @@ impl Interpreter {
                 id: field_name.to_lowercase(),
             });
             return Value::Object(Some(id));
-        }
-        if std::env::var_os("HFC_TRACE_NULLSTATIC").is_some() {
-            eprintln!("NULLSTATIC {class_name} {field_name}");
         }
         let default = self
             .field_descriptor(class_name, field_name)

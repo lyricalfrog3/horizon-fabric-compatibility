@@ -24,6 +24,10 @@ impl NativeObject for FileSink {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // A file path: no heap ids.
+        Vec::new()
+    }
 }
 
 fn string_of(heap: &Heap, value: &Value) -> Option<String> {

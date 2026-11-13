@@ -99,6 +99,10 @@ impl NativeObject for PngImage {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // A PNG is its own bytes and size: no heap ids.
+        Vec::new()
+    }
 }
 
 /// A host menu a Fabric mixin may add widgets to.
@@ -221,6 +225,11 @@ impl NativeObject for CallbackInfo {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // `return_value` is the heap id of whatever the callback returned (the
+        // value a `TAIL` injection set), which a scope must not truncate.
+        self.return_value.as_obj().into_iter().collect()
+    }
 }
 
 /// The bytes behind `Files.newInputStream` for a path inside a mod jar.
@@ -239,6 +248,10 @@ impl NativeObject for ByteStream {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // A stream over a mod jar's bytes: no heap ids.
+        Vec::new()
     }
 }
 
@@ -263,6 +276,11 @@ impl NativeObject for GuiGraphics {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // The only heap reference is the JOML pose stack; `draws` holds plain
+        // numbers, floats and `String`s.
+        self.pose.into_iter().collect()
+    }
 }
 
 /// A BlockPos (x, y, z).
@@ -282,6 +300,10 @@ impl NativeObject for BlockPos {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // Three integers: no heap ids.
+        Vec::new()
     }
 }
 
@@ -355,6 +377,10 @@ impl NativeObject for Direction {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // A constant name and three integers: no heap ids.
+        Vec::new()
+    }
 }
 
 /// A BlockHitResult representing a raycast hit against a block.
@@ -378,6 +404,10 @@ impl NativeObject for BlockHitResult {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // `location` is the heap id of the real `Vec3` the hit landed at.
+        self.location.into_iter().collect()
     }
 }
 
@@ -410,6 +440,10 @@ impl NativeObject for Block {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // A block id and two scalars: no heap ids.
+        Vec::new()
     }
 }
 
@@ -478,6 +512,11 @@ impl NativeObject for BlockState {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // A block state is plain data (a block id and a property map of
+        // `String`s): no heap ids.
+        Vec::new()
+    }
 }
 
 /// An Item representation.
@@ -495,6 +534,10 @@ impl NativeObject for Item {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // An item id: no heap ids.
+        Vec::new()
     }
 }
 
@@ -559,6 +602,11 @@ impl NativeObject for ItemStack {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // An item stack is plain data: an `Item` by value, counts, damage,
+        // enchantment id/level pairs and rarity as text. No heap ids.
+        Vec::new()
+    }
 }
 
 /// A TagKey (e.g. ItemTags.HOES, BlockTags.CROPS).
@@ -577,6 +625,10 @@ impl NativeObject for TagKey {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // A registry token and a tag id, both text: no heap ids.
+        Vec::new()
     }
 }
 
@@ -598,6 +650,10 @@ impl NativeObject for EnumProperty {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // A name and its allowed values, all `String`s: no heap ids.
+        Vec::new()
+    }
 }
 
 /// An IntegerProperty for block state properties (e.g. AGE).
@@ -617,6 +673,10 @@ impl NativeObject for IntegerProperty {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // A name and two integers: no heap ids.
+        Vec::new()
     }
 }
 
@@ -684,6 +744,10 @@ impl NativeObject for ParticleType {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // A registration id: no heap ids.
+        Vec::new()
     }
 }
 
@@ -791,6 +855,19 @@ impl NativeObject for Level {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // Every heap id the level carries: the mod states, placed/scheduled
+        // states, block entities and menus it holds, plus each mod-state and
+        // block-entity value. `blocks`/`replanted`/`dropped_stacks` are native
+        // `BlockState`s and plain data.
+        let mut ids: Vec<usize> = self.mod_states.values().copied().collect();
+        ids.extend(self.placed.iter().map(|(_, id)| *id));
+        ids.extend(self.scheduled.iter().map(|(_, id, _)| *id));
+        ids.extend(self.block_entities.values().copied());
+        ids.extend(self.made_block_entities.iter().map(|(_, id)| *id));
+        ids.extend(self.menus.iter().copied());
+        ids
+    }
 }
 
 /// A Player interacting with the world.
@@ -875,6 +952,18 @@ impl NativeObject for Player {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // The player's heap references: its level, UUID, equipment, container
+        // menu, the hand stack, the direction constant and the replaced hand.
+        let mut ids: Vec<usize> = vec![self.level_id];
+        ids.extend(self.uuid);
+        ids.extend(self.equipment);
+        ids.extend(self.container_menu);
+        ids.extend(self.hand_stack);
+        ids.extend(self.hand_replaced.flatten());
+        ids.extend(self.direction.as_ref().and_then(Value::as_obj));
+        ids
+    }
 }
 
 /// EventResult from JamLib events.
@@ -909,6 +998,10 @@ impl NativeObject for EventResult {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // `value` is the result object a JamLib listener returned.
+        self.value.as_obj().into_iter().collect()
     }
 }
 

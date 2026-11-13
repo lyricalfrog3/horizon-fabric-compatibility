@@ -52,6 +52,18 @@ impl crate::value::NativeObject for ValueTreeNode {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // A `ValueOutput` child is a heap object (`StoredValue::Child`), so a
+        // nested output a block entity wrote must survive the scope. The
+        // scalars and text hold no ids.
+        self.values
+            .values()
+            .filter_map(|value| match value {
+                StoredValue::Child(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// The values a finished output holds, for the host to store with the block

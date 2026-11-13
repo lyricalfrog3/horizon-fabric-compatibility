@@ -147,6 +147,14 @@ impl NativeObject for ItemProperties {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // No heap ids. `components` is a `serde_json::Map` (already-resolved
+        // component data, not runtime values), `kind` is a plain enum,
+        // `equip_sound_constant` is a sound *id string* and `unsupported` is
+        // text. The item object itself is the `JavaObject::Instance` wrapping
+        // this native, not a field here.
+        Vec::new()
+    }
 }
 
 const MAX_STACK_SIZE: &str = "minecraft:max_stack_size";

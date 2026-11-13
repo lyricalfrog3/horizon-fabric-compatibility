@@ -54,6 +54,10 @@ impl NativeObject for CreativeTabItems {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // Item ids as text: no heap ids.
+        Vec::new()
+    }
 }
 
 const OUTPUT: &str = "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput";
@@ -78,6 +82,10 @@ impl NativeObject for CreativeTabOutput {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn held_ids(&self) -> Vec<usize> {
+        // A tab id as text: no heap ids.
+        Vec::new()
     }
 }
 

@@ -95,6 +95,26 @@ impl NativeObject for PlaceContext {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn held_ids(&self) -> Vec<usize> {
+        // Every `Value` field of the context, in field order, plus the
+        // ordered-by-nearest direction list.
+        let fields = [
+            &self.level,
+            &self.player,
+            &self.stack,
+            &self.hand,
+            &self.pos,
+            &self.hit_pos,
+            &self.face,
+            &self.click_location,
+            &self.hit_result,
+            &self.horizontal,
+            &self.vertical,
+        ];
+        let mut ids: Vec<usize> = fields.into_iter().filter_map(Value::as_obj).collect();
+        ids.extend(self.nearest.iter().filter_map(Value::as_obj));
+        ids
+    }
 }
 
 /// `BlockPlaceContext` / `UseOnContext` getters on a [`PlaceContext`].

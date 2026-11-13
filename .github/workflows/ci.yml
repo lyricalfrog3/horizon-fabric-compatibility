@@ -1,0 +1,106 @@
+# The checks a pull request has to pass.
+#
+# Two tiers, because the runtime suite needs things a fresh checkout does not
+# have (a Minecraft client jar and the pinned mod fixtures in `test-mods/`):
+#
+#   * `check` is always run and must be green. Formatting, lints and every test
+#     that does not need a game installation: the installer crates, plus the
+#     runtime's unit tests and its JVM differential suite (which needs only a
+#     JDK — the image is a stock JDK, not a Minecraft file).
+#   * `runtime` needs a Minecraft installation and pinned fixtures, so it is
+#     skipped unless someone provides them. It is not a required check.
+#
+# Runtime integration tests that lack a fixture print "skipping: ..." and
+# return, so a missing fixture can never read as a pass.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The interpreter runs Java calls on the host stack and the frames of an
+  # unoptimized build are large; the test threads are sized for it.
+  RUST_MIN_STACK: "268435456"
+
+jobs:
+  check:
+    name: Format, lints and tests without a game
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The workspace references the Horizon checkout through path
+          # dependencies, so the crates cannot build without it.
+          submodules: recursive
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Install a JDK for the differential suite
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Installer crates
+        run: cargo test -p hfc-core -p hfc-fabric -p hfc-cache -p hfc-bootstrap -p hfc-cli
+
+      - name: Runtime unit tests
+        run: cargo test -p hfc-runtime --lib
+
+      - name: JVM differential suite
+        # Needs `java` but not a Minecraft installation: the cases run over a
+        # stock JDK image, which this step supplies from the runner's JDK.
+        run: |
+          # `discovery::image` walks for any file named `modules`, so pointing
+          # it at the runner's JDK is enough: the cases run over the JDK's own
+          # jimage, exactly as they do over the game's bundled runtime.
+          if [ ! -f "$JAVA_HOME/lib/modules" ]; then
+            echo "::error::$JAVA_HOME has no lib/modules (jimage); the differential suite needs it"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/minecraft/runtime/jdk"
+          ln -sfn "$JAVA_HOME/lib/modules" "$RUNNER_TEMP/minecraft/runtime/jdk/modules"
+          HORIZON_MINECRAFT_DIR="$RUNNER_TEMP/minecraft" \
+            cargo test -p hfc-runtime --test jvm_diff
+
+  runtime:
+    name: Runtime integration tests (needs a game installation)
+    runs-on: ubuntu-latest
+    # Only runs where the caller has a Minecraft installation and the pinned
+    # fixtures; otherwise the tests would all skip and the job would prove
+    # nothing while looking green.
+    if: vars.HFC_HAS_MINECRAFT_INSTALL == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install --profile minimal
+          rustup default stable
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Runtime integration tests
+        run: cargo test -p hfc-runtime --tests

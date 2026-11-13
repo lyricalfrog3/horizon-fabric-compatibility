@@ -146,7 +146,9 @@ fn existing_toml_config_is_read_back_without_corruption() {
         return;
     }
     let first = std::fs::read_to_string(&path).unwrap();
-    assert!(first.contains("model_rotation_speed = 12\n"), "{first}");
+    // `modelRotationSpeed` is a `Supplier<Double>`, so the file carries
+    // `Double.toString`: `12.0`, never Rust's `12`.
+    assert!(first.contains("model_rotation_speed = 12.0\n"), "{first}");
 
     let mut second_launch = launch_mods(&LEGENDARY_MODS, &dir).unwrap();
     let second = std::fs::read_to_string(&path).unwrap();
@@ -156,7 +158,7 @@ fn existing_toml_config_is_read_back_without_corruption() {
 
     std::fs::write(
         &path,
-        first.replace("model_rotation_speed = 12", "model_rotation_speed = 20"),
+        first.replace("model_rotation_speed = 12.0", "model_rotation_speed = 20.0"),
     )
     .unwrap();
     let mut third_launch = launch_mods(&LEGENDARY_MODS, &dir).unwrap();
@@ -164,7 +166,7 @@ fn existing_toml_config_is_read_back_without_corruption() {
     let third = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(speed, 20.0, "{third}");
-    assert!(third.contains("model_rotation_speed = 20\n"), "{third}");
+    assert!(third.contains("model_rotation_speed = 20.0\n"), "{third}");
     assert_eq!(third.matches("name_separator").count(), 1, "{third}");
 }
 
@@ -201,7 +203,7 @@ fn iceberg_mod_writes_its_toml_config_with_comments() {
         "{written}"
     );
     assert!(
-        written.contains("#Range: 0 ~ 50\nmodel_rotation_speed = 12\n"),
+        written.contains("#Range: 0.0 ~ 50.0\nmodel_rotation_speed = 12.0\n"),
         "{written}"
     );
     assert!(written.contains("level15_entries = []\n"), "{written}");

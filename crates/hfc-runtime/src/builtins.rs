@@ -1351,7 +1351,11 @@ fn round_half_even(value: f64, digits: u32) -> String {
     let remainder = scaled - floor;
     let rounded = if (remainder - 0.5).abs() < f64::EPSILON * scaled.abs().max(1.0) {
         // A tie: pick the even neighbour.
-        if (floor as u64) % 2 == 0 { floor } else { floor + 1.0 }
+        if (floor as u64) % 2 == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
     } else {
         scaled.round()
     };

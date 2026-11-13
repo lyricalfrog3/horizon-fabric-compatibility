@@ -6,7 +6,6 @@
 
 # --- Numeric semantics and Java's float/print formatting -------------------
 "Arith.neg_zero" = "Double.toString uses Rust float formatting: -0.0 prints -0, Infinity prints inf"
-"Arith.round" = "Math.round(-0.5) answers -1; Java rounds -0.5 to 0 (floor(x + 0.5))"
 "Arith.double_str" = "Double.toString does not use Java's shortest form: 1.0E21, 1.0E-7, 2.0"
 
 # --- Exceptions ------------------------------------------------------------

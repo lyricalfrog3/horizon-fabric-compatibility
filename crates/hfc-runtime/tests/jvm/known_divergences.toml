@@ -5,8 +5,6 @@
 # fix goes in the general path, never in the test.
 
 # --- Numeric semantics and Java's float/print formatting -------------------
-"Arith.neg_zero" = "Double.toString uses Rust float formatting: -0.0 prints -0, Infinity prints inf"
-"Arith.double_str" = "Double.toString does not use Java's shortest form: 1.0E21, 1.0E-7, 2.0"
 
 # --- Exceptions ------------------------------------------------------------
 

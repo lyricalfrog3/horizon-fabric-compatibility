@@ -5506,11 +5506,6 @@ impl Interpreter {
         // read back. It is keyed on the *declaring class* being Fabric's event
         // package, never on "the class name contains Event", so a mod's own
         // class with an `EVENT` field is not mistaken for a Fabric event.
-        if std::env::var_os("HFC_TRACE_EVENT").is_some()
-            && field_name.contains("EVENT")
-        {
-            eprintln!("FABRICATE-EVENT {class_name} {field_name}");
-        }
         if field_name == "EVENT" && class_name.starts_with("net/fabricmc/fabric/api/") {
             let mut fields = HashMap::new();
             let arr_id = self.heap.alloc(JavaObject::Array {

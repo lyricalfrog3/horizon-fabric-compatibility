@@ -1225,8 +1225,11 @@ pub(crate) fn value_to_string(heap: &Heap, val: &Value) -> String {
     match val {
         Value::Int(i) => i.to_string(),
         Value::Long(l) => l.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Double(d) => d.to_string(),
+        // `Float.toString`/`Double.toString`, not Rust's rendering: an integral
+        // value keeps its `.0` and a value outside 1e-3..1e7 uses scientific
+        // notation, so `3.0` must not print as `3`.
+        Value::Float(f) => crate::text_io::java_float_to_string(*f),
+        Value::Double(d) => crate::text_io::java_double_to_string(*d),
         Value::Object(Some(id)) => {
             if let Some(s) = heap.get_string(*id) {
                 s.to_string()
@@ -1272,6 +1275,89 @@ pub(crate) fn value_to_string(heap: &Heap, val: &Value) -> String {
         }
         Value::Object(None) => "null".to_string(),
     }
+}
+
+/// A value `NumberFormat.format` accepts.
+enum NumberFormatValue {
+    Integral(i64),
+    Fractional(f64),
+}
+
+/// `NumberFormat.getInstance(Locale.US).format(value)`: grouping every three
+/// digits, up to three fraction digits (trailing zeros dropped), rounded
+/// HALF_EVEN, with the `∞` and `NaN` spellings the JDK uses.
+///
+/// The runtime carries no CLDR bundle, so the symbols are the root locale's
+/// whatever Locale the instance was made with; producing a German or Arabic
+/// rendering would need data this host does not have. The digits, grouping and
+/// rounding are the JDK's own for that locale.
+fn number_format_en_us(value: NumberFormatValue) -> String {
+    let (negative, text) = match value {
+        NumberFormatValue::Integral(v) => {
+            // `Long.toString`, then grouped; no fraction digits.
+            let negative = v < 0;
+            (negative, v.unsigned_abs().to_string())
+        }
+        NumberFormatValue::Fractional(v) => {
+            if v.is_nan() {
+                return "NaN".to_string();
+            }
+            if v.is_infinite() {
+                // The JDK's number pattern uses the infinity sign, not the word.
+                return if v > 0.0 { "∞" } else { "-∞" }.to_string();
+            }
+            let negative = v.is_sign_negative();
+            let magnitude = v.abs();
+            // `Double.toString`'s digits, rounded to three fraction places with
+            // HALF_EVEN, which is `DecimalFormat`'s default rounding mode.
+            let rounded = round_half_even(magnitude, 3);
+            (negative, rounded)
+        }
+    };
+    // Group the integer part in threes.
+    let (integer, fraction) = match text.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (text.as_str(), None),
+    };
+    let mut grouped = String::new();
+    for (i, d) in integer.chars().enumerate() {
+        if i > 0 && (integer.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(d);
+    }
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    out.push_str(&grouped);
+    if let Some(fraction) = fraction {
+        let fraction = fraction.trim_end_matches('0');
+        if !fraction.is_empty() {
+            out.push('.');
+            out.push_str(fraction);
+        }
+    }
+    out
+}
+
+/// Round a non-negative value to `digits` fraction places, ties to even.
+fn round_half_even(value: f64, digits: u32) -> String {
+    // Scale, round, and print; `{:.*}` on the rounded value would re-round, so
+    // the scaled integer is formatted back instead.
+    let scale = 10f64.powi(digits as i32);
+    let scaled = value * scale;
+    let floor = scaled.floor();
+    let remainder = scaled - floor;
+    let rounded = if (remainder - 0.5).abs() < f64::EPSILON * scaled.abs().max(1.0) {
+        // A tie: pick the even neighbour.
+        if (floor as u64) % 2 == 0 { floor } else { floor + 1.0 }
+    } else {
+        scaled.round()
+    };
+    // Format with exactly `digits` places, then let the caller drop trailing
+    // zeros (the JDK's minimum fraction digits are 0).
+    format!("{:.*}", digits as usize, rounded / scale)
 }
 
 fn format_translation(template: &str, args: &[String]) -> String {
@@ -4304,8 +4390,10 @@ fn dispatch_builtin_inner(
     // -------------------------------------------------------------
     // java/text/NumberFormat is reached from `NumberFormat.getInstance()` in mod
     // code that formats counts for translated labels. The JDK implementation
-    // depends on locale providers the runtime does not carry, so answer the two
-    // operations those labels need.
+    // depends on locale providers the runtime does not carry, so the en-US
+    // (`,` grouping, `.` decimal point) result is produced here — the same host
+    // limitation `Formatter` has — rather than a plain `toString`, which would
+    // drop the grouping the caller asked for and answer `""` for null.
     if class_name == "java/text/NumberFormat" || class_name == "java/text/DecimalFormat" {
         if method_name == "getInstance" || method_name == "getNumberInstance" {
             let id = heap.alloc(JavaObject::Instance {
@@ -4314,18 +4402,24 @@ fn dispatch_builtin_inner(
             });
             return BuiltinResult::Handled(Value::Object(Some(id)));
         } else if method_name == "format" && args.len() >= 2 {
-            let value = &args[1];
-            let text = match value {
-                Value::Int(i) => i.to_string(),
-                Value::Long(l) => l.to_string(),
-                Value::Float(f) => f.to_string(),
-                Value::Double(d) => d.to_string(),
-                Value::Object(Some(id)) => {
-                    heap.get_string(*id).map(str::to_string).unwrap_or_default()
-                }
-                Value::Object(None) => String::new(),
+            // `NumberFormat.format(Object)` accepts a Number and rejects
+            // anything else (including null) rather than answering "".
+            let number = match &args[1] {
+                Value::Int(i) => Some(NumberFormatValue::Integral(*i as i64)),
+                Value::Long(l) => Some(NumberFormatValue::Integral(*l)),
+                Value::Float(f) => Some(NumberFormatValue::Fractional(*f as f64)),
+                Value::Double(d) => Some(NumberFormatValue::Fractional(*d)),
+                _ => None,
             };
-            let sid = heap.alloc_string(text);
+            let Some(number) = number else {
+                return BuiltinResult::Threw(crate::num_builtins::exception(
+                    heap,
+                    "java/lang/IllegalArgumentException",
+                    "Cannot format given Object as a Number",
+                ));
+            };
+            let text = number_format_en_us(number);
+            let sid = new_string(heap, text);
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         }
     }
@@ -4416,8 +4510,8 @@ fn dispatch_builtin_inner(
                     match &args[1] {
                         Value::Int(i) => i.to_string(),
                         Value::Long(l) => l.to_string(),
-                        Value::Float(f) => f.to_string(),
-                        Value::Double(d) => d.to_string(),
+                        Value::Float(f) => crate::text_io::java_float_to_string(*f),
+                        Value::Double(d) => crate::text_io::java_double_to_string(*d),
                         Value::Object(Some(_)) => text_of_value(heap, &args[1]),
                         Value::Object(None) => "null".to_string(),
                     }
@@ -4586,16 +4680,23 @@ fn dispatch_builtin_inner(
                     return BuiltinResult::Handled(args[0].clone());
                 }
             }
+            // `String.valueOf` spells each type with that type's own
+            // `toString`: `Float.toString`/`Double.toString` write `1.0` and
+            // `1.0E7`, not Rust's `1` and `10000000`, and a failure to render a
+            // number would be a fabricated string rather than a value.
             let s = match &args[0] {
                 Value::Int(i) if descriptor.starts_with("(Z)") => (*i != 0).to_string(),
                 Value::Int(i) if descriptor.starts_with("(C)") => char::from_u32(*i as u32)
                     .map(String::from)
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| "\u{FFFD}".to_string()),
                 Value::Int(i) => i.to_string(),
                 Value::Long(l) => l.to_string(),
-                Value::Float(f) => f.to_string(),
-                Value::Double(d) => d.to_string(),
-                Value::Object(Some(id)) => heap.get_string(*id).unwrap_or("").to_string(),
+                Value::Float(f) => crate::text_io::java_float_to_string(*f),
+                Value::Double(d) => crate::text_io::java_double_to_string(*d),
+                // `valueOf(String)` answers its argument (handled above); for
+                // any other object `valueOf(Object)` is that object's
+                // `toString`, which the runtime already renders as text.
+                Value::Object(Some(id)) => text_of_value(heap, &Value::Object(Some(*id))),
                 Value::Object(None) => "null".to_string(),
             };
             let sid = new_string(heap, s);
@@ -4903,45 +5004,13 @@ fn dispatch_builtin_inner(
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("");
             return BuiltinResult::Handled(Value::Int(java_string_hash(s)));
-        } else if method_name == "format" && !args.is_empty() {
-            let (fmt_str, varargs_val) = if args.len() >= 3 {
-                (
-                    args[1]
-                        .as_obj()
-                        .and_then(|id| heap.get_string(id))
-                        .unwrap_or(""),
-                    args.get(2),
-                )
-            } else {
-                (
-                    args[0]
-                        .as_obj()
-                        .and_then(|id| heap.get_string(id))
-                        .unwrap_or(""),
-                    args.get(1),
-                )
-            };
-            let mut formatted = fmt_str.to_string();
-            if let Some(Value::Object(Some(arr_id))) = varargs_val {
-                if let Some(JavaObject::Array { elements, .. }) = heap.get(*arr_id) {
-                    if fmt_str == "#%06X" || fmt_str == "#%06x" {
-                        let val = elements.first().map(|v| v.as_int()).unwrap_or(0);
-                        formatted = format!("#{:06X}", val);
-                    } else if fmt_str == "%s" {
-                        let val = elements
-                            .first()
-                            .and_then(|v| v.as_obj())
-                            .and_then(|id| heap.get_string(id))
-                            .unwrap_or("");
-                        formatted = val.to_string();
-                    } else if fmt_str == "%d" {
-                        let val = elements.first().map(|v| v.as_int()).unwrap_or(0);
-                        formatted = format!("{val}");
-                    }
-                }
-            }
-            let sid = new_string(heap, formatted);
-            return BuiltinResult::Handled(Value::Object(Some(sid)));
+        } else if method_name == "format" {
+            // `String.format`/`String.formatted` live in `text_io::text_method`,
+            // which runs before this block and implements the whole JDK
+            // grammar. Answering them here as well (the old narrow special
+            // cases) shadowed that and returned the format string unchanged for
+            // anything else, so this arm deliberately leaves them alone.
+            return BuiltinResult::NotHandled;
         }
     }
 

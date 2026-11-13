@@ -38,7 +38,15 @@ fn content_jar(path: &Path, extra_lang: bool) {
     named_content_jar(path, "ruby", extra_lang);
 }
 
+fn named_content_jar_with_marker(path: &Path, id: &str, marker: &str) {
+    named_content_jar_inner(path, id, false, Some(marker));
+}
+
 fn named_content_jar(path: &Path, id: &str, extra_lang: bool) {
+    named_content_jar_inner(path, id, extra_lang, None);
+}
+
+fn named_content_jar_inner(path: &Path, id: &str, extra_lang: bool, marker: Option<&str>) {
     let metadata = format!(
         r#"{{
   "schemaVersion": 1,
@@ -84,6 +92,14 @@ fn named_content_jar(path: &Path, id: &str, extra_lang: bool) {
         entries.push((
             format!("assets/{id}/lang/en_us.json"),
             format!(r#"{{"block.{id}.{id}_block":"{id} Block"}}"#).into_bytes(),
+        ));
+    }
+    if let Some(marker) = marker {
+        // A per-jar asset: its presence in the installed folder proves which
+        // of two same-id jars was converted.
+        entries.push((
+            format!("assets/{id}/textures/block/from_{marker}.png"),
+            format!("from {marker}").into_bytes(),
         ));
     }
     let refs: Vec<(&str, &[u8])> = entries
@@ -200,6 +216,52 @@ fn installs_content_reuses_cache_and_leaves_originals_alone() {
     assert_eq!(ruby.cache, CacheState::Miss);
     let entries = fs::read_dir(mods.join("ruby")).unwrap().count();
     assert!(entries > 1);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_installed_mod_with_entrypoints_is_content_only_not_runtime_ready() {
+    let root = temp("content-only");
+    let mods = root.join("horizon-mods");
+    fs::write(
+        mods.join("HorizonFabricCompat/hfc.toml"),
+        hfc_bootstrap::Config::template(),
+    )
+    .unwrap();
+    // `content_jar` declares a `main` entrypoint, so its content installs but
+    // its Java code never runs.
+    content_jar(&mods.join("ruby.jar"), false);
+
+    let report = open(&mods).run(RunOptions::default()).unwrap();
+    let ruby = report
+        .mods
+        .iter()
+        .find(|m| m.id.as_deref() == Some("ruby"))
+        .unwrap();
+    assert_eq!(ruby.status, ModStatus::Installed, "data still installs");
+    assert!(
+        !ruby.runtime_ready,
+        "a content-only install must not be marked runtime-ready: {ruby:#?}"
+    );
+    assert_eq!(ruby.runtime_label(), "content-only");
+    // The JSON report carries the same honest flag.
+    let json: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("horizon-mods/HorizonFabricCompat/report.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = json["mods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "ruby")
+        .unwrap();
+    assert_eq!(entry["runtime_ready"], false, "{entry}");
+    let markdown =
+        fs::read_to_string(root.join("horizon-mods/HorizonFabricCompat/report.md")).unwrap();
+    assert!(
+        markdown.contains("| ruby | 1.0.0 | installed | content-only |"),
+        "{markdown}"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -339,5 +401,156 @@ fn cache_prune_reclaims_unreferenced_entries() {
     assert!(prune_report.reclaimed_bytes > 0);
     assert_eq!(cache.stats().unwrap().entries, 1);
 
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn duplicate_id_converts_the_same_jar_the_report_names() {
+    let root = temp("duplicate-winner");
+    let mods = root.join("horizon-mods");
+    fs::write(
+        mods.join("HorizonFabricCompat/hfc.toml"),
+        hfc_bootstrap::Config::template(),
+    )
+    .unwrap();
+    // Two jars, one id. The resolver keeps the lexically first file name
+    // (`a-ruby.jar`); the report and the converted content must both describe
+    // that same jar, not `zzz-ruby.jar`.
+    named_content_jar_with_marker(&mods.join("zzz-ruby.jar"), "ruby", "zzz");
+    named_content_jar_with_marker(&mods.join("a-ruby.jar"), "ruby", "a");
+
+    let report = open(&mods).run(RunOptions::default()).unwrap();
+
+    let ruby = report
+        .mods
+        .iter()
+        .find(|m| m.id.as_deref() == Some("ruby"))
+        .expect("one report row for the shared id");
+    assert_eq!(
+        ruby.file_name, "a-ruby.jar",
+        "the report must name the resolver's winner: {:#?}",
+        report.mods
+    );
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|j| j.file_name == "zzz-ruby.jar" && j.reason.contains("duplicate mod id")),
+        "{:#?}",
+        report.skipped
+    );
+    assert_eq!(report.summary.installed, 1, "{:#?}", report);
+
+    // The carried data must come from a-ruby.jar: its unique asset is present
+    // and the loser's is not.
+    assert!(
+        mods.join("ruby/assets/ruby/textures/block/from_a.png")
+            .is_file(),
+        "the winner's content was not converted"
+    );
+    assert!(
+        !mods
+            .join("ruby/assets/ruby/textures/block/from_zzz.png")
+            .exists(),
+        "the duplicate jar's content was converted instead of the winner's"
+    );
+    let marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(mods.join("ruby/.hfc-generated.json")).unwrap()).unwrap();
+    assert_eq!(marker["source_file"], "a-ruby.jar");
+    assert_horizon_loads(&mods, "ruby");
+
+    // The report must not claim content-only Java behaviour is satisfied, and
+    // the markdown must not print the old blanket phrase.
+    assert!(!ruby.runtime_ready, "{:#?}", ruby);
+    let markdown =
+        fs::read_to_string(root.join("horizon-mods/HorizonFabricCompat/report.md")).unwrap();
+    assert!(
+        !markdown.contains("satisfied as far as HFC can tell"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("never executed"), "{markdown}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_interrupted_install_is_repaired_at_the_start_of_the_next_run() {
+    let root = temp("recover-run");
+    let mods = root.join("horizon-mods");
+    fs::write(
+        mods.join("HorizonFabricCompat/hfc.toml"),
+        hfc_bootstrap::Config::template(),
+    )
+    .unwrap();
+    named_content_jar(&mods.join("ruby.jar"), "ruby", false);
+
+    let first = open(&mods).run(RunOptions::default()).unwrap();
+    assert_eq!(first.summary.installed, 1);
+    let installed_marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(mods.join("ruby/.hfc-generated.json")).unwrap()).unwrap();
+
+    // Simulate a crash inside the swap: the generated folder moved aside to the
+    // hidden backup, and a half-written staging folder left behind.
+    fs::rename(mods.join("ruby"), mods.join(".hfc-replace-4242-1")).unwrap();
+    fs::create_dir_all(mods.join(".hfc-install-4242-1/assets")).unwrap();
+    fs::write(
+        mods.join(".hfc-install-4242-1/.hfc-generated.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"format": 1, "mod_id": "ruby", "source_file": "ruby.jar",
+                                 "source_sha256": "stale", "hfc_version": "0",
+                                 "compat_api": "0", "installed_unix": 0}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    // A dry run must not repair anything, only report the pending work.
+    let dry = open(&mods)
+        .run(RunOptions {
+            dry_run: true,
+            ..RunOptions::default()
+        })
+        .unwrap();
+    assert!(
+        dry.notes.iter().any(|n| n.contains("interrupted install")),
+        "{:#?}",
+        dry.notes
+    );
+    assert!(
+        !mods.join("ruby").exists(),
+        "a dry run must not touch the mods folder"
+    );
+    assert!(mods.join(".hfc-replace-4242-1").exists());
+
+    // The real run restores the previous folder, sweeps the stale staging, and
+    // then reuses the restored install (the jar did not change).
+    let report = open(&mods).run(RunOptions::default()).unwrap();
+    assert!(
+        report.notes.iter().any(|n| n.contains("rolled back")),
+        "{:#?}",
+        report.notes
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("stale install staging")),
+        "{:#?}",
+        report.notes
+    );
+    assert!(mods.join("ruby/horizon-mod.toml").is_file());
+    assert!(!mods.join(".hfc-replace-4242-1").exists());
+    assert!(!mods.join(".hfc-install-4242-1").exists());
+    let restored_marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(mods.join("ruby/.hfc-generated.json")).unwrap()).unwrap();
+    assert_eq!(restored_marker, installed_marker);
+    // Only the real folder is a mod, never the hidden swap folders.
+    assert_eq!(
+        report.summary.installed + report.summary.reused,
+        1,
+        "{:#?}",
+        report
+    );
+    let list = fs::read_to_string(root.join("horizon-mods.txt")).unwrap();
+    assert_eq!(list.matches("mod.ruby:").count(), 1, "{list}");
     let _ = fs::remove_dir_all(&root);
 }

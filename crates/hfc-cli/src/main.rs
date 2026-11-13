@@ -29,12 +29,16 @@ Options:
   --force-install  Overwrite an existing hfc.toml on `install`
   --json           Machine-readable output for `scan`
   --strict         Exit non-zero when any finding is an error
+
+Every switch above also takes an explicit value (`--dry-run=false`,
+`--json=true`); an invalid value is an error, not a silent enable.
   -h, --help       This help
   -V, --version    hfc's version
 
 Nothing is written outside the mods folder, the compatibility folder and
 horizon-mods.txt. Original jars are never modified.";
 
+#[derive(Debug)]
 struct Args {
     command: String,
     mods: PathBuf,
@@ -77,16 +81,22 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
         println!("{HELP}");
         return Ok(None);
     };
-    if matches!(command.as_str(), "-h" | "--help" | "help") {
+    parse_command(&command, args.collect())
+}
+
+/// Parse everything after the command word. Split out of [`parse_args`] so the
+/// flag rules are testable without spawning the binary.
+fn parse_command(command: &str, rest: Vec<String>) -> std::result::Result<Option<Args>, String> {
+    if matches!(command, "-h" | "--help" | "help") {
         println!("{HELP}");
         return Ok(None);
     }
-    if matches!(command.as_str(), "-V" | "--version") {
+    if matches!(command, "-V" | "--version") {
         println!("hfc {}", hfc_core::HFC_VERSION);
         return Ok(None);
     }
     let mut parsed = Args {
-        command,
+        command: command.to_owned(),
         mods: PathBuf::from("horizon-mods"),
         list: None,
         dry_run: false,
@@ -95,25 +105,27 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
         json: false,
         strict: false,
     };
+    let mut args = rest.into_iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) => (flag, Some(value.to_owned())),
             None => (arg.as_str(), None),
         };
-        let mut value = |name: &str| -> std::result::Result<String, String> {
-            if let Some(value) = inline.clone() {
-                return Ok(value);
-            }
-            args.next().ok_or_else(|| format!("{name} needs a value"))
-        };
         match flag {
-            "--mods" => parsed.mods = PathBuf::from(value("--mods")?),
-            "--list" => parsed.list = Some(PathBuf::from(value("--list")?)),
-            "--dry-run" => parsed.dry_run = true,
-            "--force" => parsed.force = true,
-            "--force-install" => parsed.force_install = true,
-            "--json" => parsed.json = true,
-            "--strict" => parsed.strict = true,
+            "--mods" => {
+                parsed.mods = PathBuf::from(flag_value("--mods", inline, &mut args)?);
+            }
+            "--list" => {
+                parsed.list = Some(PathBuf::from(flag_value("--list", inline, &mut args)?));
+            }
+            // A plain switch is true; `--flag=true`/`--flag=false` is honoured
+            // rather than ignored. Anything else is an error, never a silent
+            // enable.
+            "--dry-run" => parsed.dry_run = bool_value(flag, inline)?,
+            "--force" => parsed.force = bool_value(flag, inline)?,
+            "--force-install" => parsed.force_install = bool_value(flag, inline)?,
+            "--json" => parsed.json = bool_value(flag, inline)?,
+            "--strict" => parsed.strict = bool_value(flag, inline)?,
             "-h" | "--help" => {
                 println!("{HELP}");
                 return Ok(None);
@@ -122,6 +134,34 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
         }
     }
     Ok(Some(parsed))
+}
+
+/// The value of an option that always needs one, inline (`--mods=dir`) or as
+/// the next argument.
+fn flag_value(
+    name: &str,
+    inline: Option<String>,
+    args: &mut impl Iterator<Item = String>,
+) -> std::result::Result<String, String> {
+    if let Some(value) = inline {
+        return Ok(value);
+    }
+    args.next().ok_or_else(|| format!("{name} needs a value"))
+}
+
+/// The value of a boolean switch. Absent means enabled; an explicit value must
+/// parse as a boolean, so `--dry-run=maybe` is an error instead of an enable.
+fn bool_value(name: &str, inline: Option<String>) -> std::result::Result<bool, String> {
+    match inline {
+        None => Ok(true),
+        Some(value) => match value.as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            other => Err(format!(
+                "{name} takes true or false, not {other:?}; write {name}=false to disable it"
+            )),
+        },
+    }
 }
 
 fn install(args: &Args) -> std::result::Result<ExitCode, String> {
@@ -360,5 +400,85 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> std::result::Result<Args, String> {
+        let mut all = arguments.iter().map(|a| (*a).to_owned());
+        let command = all.next().expect("a command");
+        match parse_command(&command, all.collect()) {
+            Ok(Some(args)) => Ok(args),
+            Ok(None) => Err("help or version was printed".into()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn a_bare_boolean_flag_enables_it() {
+        let args = parse(&["scan", "--json", "--strict"]).unwrap();
+        assert!(args.json);
+        assert!(args.strict);
+        assert!(!args.dry_run);
+        assert!(!args.force);
+    }
+
+    #[test]
+    fn an_inline_false_disables_a_boolean_flag() {
+        let args = parse(&["bootstrap", "--dry-run=false", "--json=false"]).unwrap();
+        assert!(!args.dry_run, "--dry-run=false must not enable the flag");
+        assert!(!args.json, "--json=false must not enable the flag");
+
+        let args = parse(&[
+            "bootstrap",
+            "--dry-run=true",
+            "--force=yes",
+            "--json=off",
+            "--strict=1",
+        ])
+        .unwrap();
+        assert!(args.dry_run);
+        assert!(args.force);
+        assert!(!args.json);
+        assert!(args.strict);
+
+        let args = parse(&["bootstrap", "--dry-run=true", "--dry-run=false"]).unwrap();
+        assert!(!args.dry_run, "the last value of a repeated flag wins");
+    }
+
+    #[test]
+    fn an_invalid_boolean_value_is_an_error() {
+        for (flag, value) in [
+            ("--dry-run", "maybe"),
+            ("--json", "2"),
+            ("--force", ""),
+            ("--strict", "False"),
+        ] {
+            let argument = format!("{flag}={value}");
+            let error = parse(&["bootstrap", &argument]).unwrap_err();
+            assert!(
+                error.contains("takes true or false") && error.contains(flag),
+                "{argument}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn options_with_values_still_work() {
+        let args = parse(&["bootstrap", "--mods", "/tmp/mods", "--list=/tmp/list.txt"]).unwrap();
+        assert_eq!(args.mods, PathBuf::from("/tmp/mods"));
+        assert_eq!(args.list, Some(PathBuf::from("/tmp/list.txt")));
+        assert!(parse(&["bootstrap", "--mods"]).is_err());
+        assert!(parse(&["bootstrap", "--mods", "/tmp/mods", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn an_unknown_boolean_notation_is_not_silently_accepted() {
+        // `--dry-run` followed by a value is not the same as `--dry-run=false`:
+        // the bare flag is enabled and the stray word is reported.
+        assert!(parse(&["bootstrap", "--dry-run", "false"]).is_err());
     }
 }

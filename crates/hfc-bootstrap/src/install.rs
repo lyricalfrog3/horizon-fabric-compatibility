@@ -3,19 +3,39 @@
 //!
 //! Every folder HFC writes carries `.hfc-generated.json`. Removal checks that
 //! marker first; a directory without it is treated as the user's and left
-//! alone. Installation copies into a hidden sibling, writes the marker, then
-//! swaps it into place, so a crash leaves either the old folder or the new
-//! one, never half of each.
+//! alone.
+//!
+//! Installation copies into a hidden staging sibling, writes the marker, then
+//! swaps it into place:
+//!
+//! 1. `.hfc-install-<token>` is built completely (content and marker);
+//! 2. an existing generated target is renamed to `.hfc-replace-<token>`;
+//! 3. the staging folder is renamed onto the target path.
+//!
+//! Step 3 is the only moment the target name is free. A crash there is
+//! repaired by [`recover`], which runs at the start of every run that is
+//! allowed to install: an `.hfc-replace-*` folder whose mod id has no target is
+//! renamed back, and one whose target exists and carries HFC's marker (the swap
+//! finished) is deleted. Leftover `.hfc-install-*` staging directories with a
+//! marker are deleted, because the carry cache still holds their content.
+//! Neither prefix is ever treated as a mod folder: [`generated_folders`] skips
+//! dot directories. See [`recover`] for the full rule.
 
 use hfc_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub const MARKER_FILE: &str = hfc_core::GENERATED_MARKER;
 pub const MARKER_FORMAT: u32 = 1;
+
+/// Prefix of a hidden folder being built for an install.
+pub const STAGING_PREFIX: &str = ".hfc-install-";
+/// Prefix of the hidden backup of the folder being replaced.
+pub const BACKUP_PREFIX: &str = ".hfc-replace-";
 
 /// The most files one generated folder may hold (a carried mod is data only).
 const MAX_FILES: usize = 100_000;
@@ -101,15 +121,21 @@ pub fn ensure_installed(
         )
     })?;
     fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    let unique = format!("{}-{}", std::process::id(), wanted.installed_unix);
-    let staging = parent.join(format!(".hfc-install-{unique}"));
+    let token = format!("{}-{}-{}", std::process::id(), wanted.installed_unix, {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    });
+    let staging = parent.join(format!("{STAGING_PREFIX}{token}"));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging).map_err(|e| Error::io(&staging, e))?;
 
     let result = (|| {
+        // The marker goes in first: a folder with it is one HFC created, so a
+        // crash halfway through the copy leaves something [`recover`] may
+        // delete rather than mistaking for a player's folder.
+        hfc_core::atomic_write_json(&staging.join(MARKER_FILE), wanted)?;
         let mut budget = CopyBudget { files: 0, bytes: 0 };
         copy_dir(source, &staging, 0, &mut budget)?;
-        hfc_core::atomic_write_json(&staging.join(MARKER_FILE), wanted)?;
         Ok::<(), Error>(())
     })();
     if let Err(error) = result {
@@ -117,9 +143,13 @@ pub fn ensure_installed(
         return Err(error);
     }
 
-    let backup = parent.join(format!(".hfc-replace-{unique}"));
+    let backup = parent.join(format!("{BACKUP_PREFIX}{token}"));
     let had_old = target.exists();
     if had_old {
+        // A directory rename cannot atomically replace a non-empty directory
+        // on any supported platform, so this window is unavoidable. It is
+        // bounded to a single rename and repaired by [`recover`] if the
+        // process dies inside it.
         fs::rename(target, &backup).map_err(|e| Error::io(target, e))?;
     }
     if let Err(e) = fs::rename(&staging, target) {
@@ -133,6 +163,122 @@ pub fn ensure_installed(
         let _ = fs::remove_dir_all(&backup);
     }
     Ok(InstallResult::Installed)
+}
+
+/// Finish or roll back an install that a crash interrupted, and sweep stale
+/// staging folders. Safe to call on every run; a quiet folder produces no
+/// notes.
+///
+/// The recovery rule for the hidden swap folders, in order:
+///
+/// - `.hfc-replace-<token>` with a readable marker whose mod id has **no**
+///   target folder: the new folder never arrived, so the backup is renamed
+///   back to the target path (roll back), leaving the last good install.
+/// - `.hfc-replace-<token>` whose target folder exists **and carries HFC's
+///   marker**: the swap completed and only the deletion of the backup is
+///   missing, so the backup is deleted.
+/// - `.hfc-replace-<token>` whose target exists without HFC's marker: the
+///   folder at the target is the player's, so the backup is left alone with a
+///   note rather than deleting the last generated folder HFC had.
+/// - `.hfc-replace-<token>` without a marker: not one of HFC's, left alone.
+/// - `.hfc-install-<token>` with a marker: an interrupted copy, deleted (the
+///   carry cache still has its content and the next run rebuilds it).
+/// - `.hfc-install-<token>` without a marker but empty: deleted.
+/// - `.hfc-install-<token>` without a marker and not empty: left alone with a
+///   note, because HFC cannot prove it created it.
+pub fn recover(mods_dir: &Path) -> Result<Vec<String>> {
+    let mut notes = Vec::new();
+    let entries = match fs::read_dir(mods_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(notes),
+        Err(e) => return Err(Error::io(mods_dir, e)),
+    };
+    let mut staging = Vec::new();
+    let mut backups = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::io(mods_dir, e))?;
+        let path = entry.path();
+        if !entry.file_type().map_err(|e| Error::io(&path, e))?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(BACKUP_PREFIX) {
+            backups.push(path);
+        } else if name.starts_with(STAGING_PREFIX) {
+            staging.push(path);
+        }
+    }
+    // Backups first: restoring a target must happen before a stale staging
+    // folder is swept, so a note below names the folder that survived.
+    for path in backups {
+        let Some(marker) = read_marker(&path) else {
+            notes.push(format!(
+                "left {} in place: it is hidden and has no HFC marker",
+                path.display()
+            ));
+            continue;
+        };
+        let target = mods_dir.join(&marker.mod_id);
+        if !target.exists() {
+            fs::rename(&path, &target).map_err(|e| Error::io(&path, e))?;
+            notes.push(format!(
+                "rolled back an interrupted install of {}; its previous folder was restored",
+                marker.mod_id
+            ));
+        } else if read_marker(&target).is_some() {
+            fs::remove_dir_all(&path).map_err(|e| Error::io(&path, e))?;
+            notes.push(format!(
+                "removed an interrupted install's backup of {}; {} is in place",
+                marker.mod_id, marker.mod_id
+            ));
+        } else {
+            notes.push(format!(
+                "left {} in place: {} exists but was not created by HFC, so the backup may \
+                 still be the only generated copy",
+                path.display(),
+                target.display()
+            ));
+        }
+    }
+    for path in staging {
+        match read_marker(&path) {
+            Some(marker) => {
+                fs::remove_dir_all(&path).map_err(|e| Error::io(&path, e))?;
+                notes.push(format!(
+                    "removed stale install staging for {} left by an interrupted run",
+                    marker.mod_id
+                ));
+            }
+            None if is_empty_dir(&path) => {
+                fs::remove_dir_all(&path).map_err(|e| Error::io(&path, e))?;
+                notes.push(format!(
+                    "removed an empty install staging folder {}",
+                    path.display()
+                ));
+            }
+            None => notes.push(format!(
+                "left {} in place: it is hidden and has no HFC marker",
+                path.display()
+            )),
+        }
+    }
+    Ok(notes)
+}
+
+fn is_empty_dir(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// Whether [`recover`] would touch anything in `mods_dir`. Used by a dry run to
+/// say that a real run has repair work, without doing it.
+pub fn pending_recovery(mods_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(mods_dir) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        name.starts_with(BACKUP_PREFIX) || name.starts_with(STAGING_PREFIX)
+    })
 }
 
 /// Remove a generated folder. Returns false when the folder is missing or was
@@ -151,6 +297,11 @@ pub fn remove_generated(target: &Path, id: &str) -> Result<bool> {
 }
 
 /// Every generated folder directly in `mods_dir`.
+///
+/// Dot-prefixed directories are skipped: they are HFC's own staging and swap
+/// folders ([`STAGING_PREFIX`], [`BACKUP_PREFIX`]), and a leftover backup
+/// carries a marker, so enumerating it would turn a stale copy into a second
+/// "generated mod" that cleanup could keep beside the real one.
 pub fn generated_folders(mods_dir: &Path) -> Result<Vec<(PathBuf, GeneratedMarker)>> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(mods_dir) {
@@ -161,6 +312,9 @@ pub fn generated_folders(mods_dir: &Path) -> Result<Vec<(PathBuf, GeneratedMarke
     for entry in entries {
         let entry = entry.map_err(|e| Error::io(mods_dir, e))?;
         let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let kind = entry.file_type().map_err(|e| Error::io(&path, e))?;
         if !kind.is_dir() {
             continue;
@@ -311,6 +465,176 @@ mod tests {
         let found = generated_folders(&dir).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1.mod_id, "x");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_leftover_backup_is_not_enumerated_as_a_mod() {
+        let dir = temp("backup-not-mod");
+        // The real install, and the backup a crash left behind. Both carry a
+        // valid marker with the same mod id.
+        let target = dir.join("x");
+        fs::create_dir_all(&target).unwrap();
+        hfc_core::atomic_write_json(
+            &target.join(MARKER_FILE),
+            &GeneratedMarker::new("x", "x.jar", "s", 1),
+        )
+        .unwrap();
+        let backup = dir.join(format!("{BACKUP_PREFIX}1234-1"));
+        fs::create_dir_all(&backup).unwrap();
+        hfc_core::atomic_write_json(
+            &backup.join(MARKER_FILE),
+            &GeneratedMarker::new("x", "x.jar", "old", 0),
+        )
+        .unwrap();
+
+        let found = generated_folders(&dir).unwrap();
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].0, target);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_staging_folders_are_swept_and_unknown_hidden_folders_are_kept() {
+        let dir = temp("sweep");
+        // A staging folder from an interrupted copy of a marked mod.
+        let staging = dir.join(format!("{STAGING_PREFIX}1234-1"));
+        fs::create_dir_all(staging.join("assets")).unwrap();
+        hfc_core::atomic_write_json(
+            &staging.join(MARKER_FILE),
+            &GeneratedMarker::new("x", "x.jar", "s", 1),
+        )
+        .unwrap();
+        // An empty staging folder with no marker yet.
+        let empty = dir.join(format!("{STAGING_PREFIX}1234-2"));
+        fs::create_dir_all(&empty).unwrap();
+        // A hidden folder HFC cannot prove it made: left alone, with a note.
+        let unknown = dir.join(format!("{STAGING_PREFIX}1234-3"));
+        fs::create_dir_all(&unknown).unwrap();
+        fs::write(unknown.join("user.txt"), b"mine").unwrap();
+
+        let notes = recover(&dir).unwrap();
+        assert!(!staging.exists(), "marked staging was not swept");
+        assert!(!empty.exists(), "empty staging was not swept");
+        assert!(unknown.join("user.txt").is_file(), "user data was deleted");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains(STAGING_PREFIX) || n.contains("staging")),
+            "{notes:#?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("left")),
+            "the unmarked folder must be reported, not silently kept: {notes:#?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crash_between_the_two_renames_is_recovered_on_the_next_run() {
+        let dir = temp("recover-rollback");
+        let source = source(&dir);
+        let target = dir.join("x");
+        assert_eq!(
+            ensure_installed(
+                &source,
+                &target,
+                &GeneratedMarker::new("x", "x.jar", "sha1", 1)
+            )
+            .unwrap(),
+            InstallResult::Installed
+        );
+        let installed_sha = read_marker(&target).unwrap().source_sha256;
+
+        // Simulate the crash window: the old folder was renamed to the backup,
+        // and the process died before the staging rename.
+        let backup = dir.join(format!("{BACKUP_PREFIX}999-1"));
+        fs::rename(&target, &backup).unwrap();
+        assert!(!target.exists());
+
+        let notes = recover(&dir).unwrap();
+        assert!(target.exists(), "the target path was left absent");
+        assert_eq!(read_marker(&target).unwrap().source_sha256, installed_sha);
+        assert!(!backup.exists());
+        assert!(
+            notes.iter().any(|n| n.contains("rolled back")),
+            "{notes:#?}"
+        );
+
+        // The next install then replaces the recovered folder normally.
+        assert_eq!(
+            ensure_installed(
+                &source,
+                &target,
+                &GeneratedMarker::new("x", "x.jar", "sha2", 2)
+            )
+            .unwrap(),
+            InstallResult::Installed
+        );
+        assert_eq!(read_marker(&target).unwrap().source_sha256, "sha2");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(BACKUP_PREFIX) || name.starts_with(STAGING_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "swap folders left: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crash_after_the_swap_deletes_the_backup_not_the_install() {
+        let dir = temp("recover-forward");
+        let source = source(&dir);
+        let target = dir.join("x");
+        assert_eq!(
+            ensure_installed(
+                &source,
+                &target,
+                &GeneratedMarker::new("x", "x.jar", "new", 2)
+            )
+            .unwrap(),
+            InstallResult::Installed
+        );
+        // The swap finished; only the backup deletion was lost.
+        let backup = dir.join(format!("{BACKUP_PREFIX}999-1"));
+        fs::create_dir_all(backup.join("assets")).unwrap();
+        hfc_core::atomic_write_json(
+            &backup.join(MARKER_FILE),
+            &GeneratedMarker::new("x", "x.jar", "old", 1),
+        )
+        .unwrap();
+
+        let notes = recover(&dir).unwrap();
+        assert_eq!(read_marker(&target).unwrap().source_sha256, "new");
+        assert!(!backup.exists());
+        assert!(notes.iter().any(|n| n.contains("backup")), "{notes:#?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_never_restores_a_backup_over_someone_elses_folder() {
+        let dir = temp("recover-user");
+        // A player created `x` after the interrupted install. The backup is
+        // the only generated copy left, so it must survive.
+        let target = dir.join("x");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("mine.txt"), b"mine").unwrap();
+        let backup = dir.join(format!("{BACKUP_PREFIX}999-1"));
+        fs::create_dir_all(&backup).unwrap();
+        hfc_core::atomic_write_json(
+            &backup.join(MARKER_FILE),
+            &GeneratedMarker::new("x", "x.jar", "old", 1),
+        )
+        .unwrap();
+
+        let notes = recover(&dir).unwrap();
+        assert!(target.join("mine.txt").is_file());
+        assert!(backup.exists(), "the only generated copy was deleted");
+        assert!(
+            notes.iter().any(|n| n.contains("only generated copy")),
+            "{notes:#?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

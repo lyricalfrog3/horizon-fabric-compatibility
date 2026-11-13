@@ -73,6 +73,20 @@ pub struct ModReport {
     pub issues: Vec<Issue>,
 }
 
+impl ModReport {
+    /// The two questions the report never conflates: whether this run put the
+    /// mod's data in the mods folder (`status`), and whether HFC can claim its
+    /// Fabric behaviour is satisfied (`runtime_ready`). A content-only install
+    /// is `installed` *and* `content-only`, never `ready`.
+    pub fn runtime_label(&self) -> &'static str {
+        match (self.status, self.runtime_ready) {
+            (ModStatus::Blocked, _) => "blocked",
+            (_, true) => "ready",
+            _ => "content-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub jars_found: usize,
@@ -220,16 +234,17 @@ impl Report {
         } else {
             let _ = writeln!(
                 out,
-                "| Mod | Version | Status | Carry verdict | Installed as |"
+                "| Mod | Version | Status | Runtime | Carry verdict | Installed as |"
             );
-            let _ = writeln!(out, "|---|---|---|---|---|");
+            let _ = writeln!(out, "|---|---|---|---|---|---|");
             for m in &self.mods {
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} |",
                     cell(m.id.as_deref().unwrap_or(&m.file_name)),
                     cell(&m.version),
                     m.status.label(),
+                    m.runtime_label(),
                     m.verdict.as_deref().unwrap_or("—"),
                     m.installed_as
                         .as_deref()
@@ -256,11 +271,16 @@ impl Report {
                 }
                 let _ = writeln!(
                     out,
-                    "- Fabric behaviour: {}",
+                    "- Fabric code: {}",
                     if m.runtime_ready {
-                        "satisfied as far as HFC can tell"
+                        "none declared (no entrypoints, mixins or access widener), so there is \
+                         no Fabric behaviour HFC could run or fail to run; the metadata's \
+                         dependency contract resolved"
+                    } else if m.installed_as.is_some() {
+                        "declared but never executed; only data was carried, and the mod's Java \
+                         behaviour is not provided"
                     } else {
-                        "not satisfied (content may still be carried)"
+                        "declared but never executed, and no data was installed in this run"
                     }
                 );
                 if !m.ports.is_empty() {
@@ -320,8 +340,9 @@ impl Report {
         let _ = writeln!(
             out,
             "HFC reads jars as data, never decompiles or executes them, and never \
-             modifies the original files. A mod listed as content-only has had its \
-             data carried, not its Java code run."
+             modifies the original files. A mod with Runtime `content-only` has had its \
+             data carried, not its Java code run; `ready` only means it declared no code \
+             and its metadata's dependency contract resolved."
         );
         out
     }
@@ -412,7 +433,16 @@ mod tests {
         assert_eq!(report.summary.warnings, 1);
         assert_eq!(report.summary.installed, 1);
         let text = report.markdown();
-        assert!(text.contains("| ruby | 1 | installed | Partly | ruby |"));
+        assert!(
+            text.contains("| ruby | 1 | installed | content-only | Partly | ruby |"),
+            "{text}"
+        );
         assert!(text.contains("recommends cloth-config"));
+        // The report never claims a content-only install runs Fabric code.
+        assert!(text.contains("declared but never executed"), "{text}");
+        assert!(
+            !text.contains("satisfied as far as HFC can tell"),
+            "the old blanket claim survived: {text}"
+        );
     }
 }

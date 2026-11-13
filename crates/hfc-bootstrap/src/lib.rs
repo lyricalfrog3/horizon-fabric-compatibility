@@ -112,6 +112,23 @@ impl Bootstrap {
         if let Some(note) = state_note {
             report.notes.push(note);
         }
+        // Repair work on the mods folder is an install action: only a real
+        // run with installation enabled does it. A dry run reports that the
+        // work is pending instead of touching anything.
+        let may_install =
+            !options.dry_run && self.config.compat.enabled && self.config.carry.enabled;
+        if may_install {
+            // Finish or roll back an install a previous run died in the middle
+            // of, and drop stale staging folders. This happens before anything
+            // is scanned so the recovered folder is the one this run sees.
+            report.notes.extend(install::recover(&self.mods_dir)?);
+        } else if install::pending_recovery(&self.mods_dir) {
+            report.notes.push(
+                "a previous run left an interrupted install; the next run that is allowed \
+                 to install will finish or roll it back (this run touched no files)"
+                    .into(),
+            );
+        }
 
         let mut discovered = hfc_fabric::discover(&self.mods_dir)?;
         if discovered.len() > self.config.compat.max_mods {
@@ -146,14 +163,14 @@ impl Bootstrap {
 
         // One report row per top-level mod, in the resolver's deterministic
         // order. Nested providers are noted, not installed as siblings.
-        let scan_by_id: BTreeMap<String, &JarScan> = scans
-            .iter()
-            .filter_map(|scan| {
-                scan.metadata
-                    .as_ref()
-                    .map(|metadata| (metadata.id.clone(), scan))
-            })
-            .collect();
+        //
+        // The lookup is keyed by the identity the resolver actually chose, not
+        // by re-deriving a winner from the scans. Re-deriving (for example a
+        // `BTreeMap` built with `.collect()`) silently keeps the *last* scan
+        // per id while the resolver keeps the lexically first file, so the
+        // report and the converted jar could disagree. `Resolution` itself is
+        // the only source of the winner.
+        let scan_for = |node: &ModNode| scans.iter().find(|scan| scan_matches(scan, node));
         for node in resolution
             .mods
             .iter()
@@ -203,7 +220,10 @@ impl Bootstrap {
             let Some(node) = resolution.node(id) else {
                 continue;
             };
-            let Some(scan) = scan_by_id.get(id) else {
+            // The scan comes from the resolver's own answer: `node.origin`
+            // names the exact file the resolution chose, so the report, the
+            // conversion and the install can never look at different jars.
+            let Some(scan) = scan_for(node) else {
                 continue;
             };
             let Some(entry) = report.mods.iter_mut().find(|m| m.id.as_deref() == Some(id)) else {
@@ -405,14 +425,13 @@ impl Bootstrap {
         match install::ensure_installed(&cached.carry_dir(), &target, &marker) {
             Ok(install::InstallResult::Installed) => {
                 entry.status = ModStatus::Installed;
-                entry.runtime_ready = true;
             }
             Ok(install::InstallResult::Reused) => {
                 entry.status = ModStatus::Reused;
-                entry.runtime_ready = true;
             }
             Err(error) => {
                 entry.status = ModStatus::Failed;
+                entry.runtime_ready = false;
                 entry.issues.push(Issue {
                     severity: hfc_fabric::Severity::Error,
                     code: hfc_fabric::IssueCode::InvalidMetadata,
@@ -496,6 +515,10 @@ impl Bootstrap {
 
     /// Write `mod.<id>:true` for installed mods and `mod.<id>:false` for
     /// generated mods that are no longer present. Other lines are preserved.
+    ///
+    /// Both sides of the key are trimmed: `mod.x :true`, `mod. x:true` and
+    /// ` mod.x:true ` all name the same managed mod, so a hand-edited list
+    /// never grows a second, conflicting line for one id.
     fn sync_mod_list(
         &self,
         desired: &BTreeMap<String, (String, String, String)>,
@@ -517,7 +540,7 @@ impl Bootstrap {
             let Some((key, _)) = line.split_once(':') else {
                 return true;
             };
-            let Some(id) = key.trim().strip_prefix("mod.") else {
+            let Some(id) = key.trim().strip_prefix("mod.").map(str::trim) else {
                 return true;
             };
             !managed.contains(id)
@@ -558,6 +581,25 @@ fn mod_report(node: &ModNode, issues: Vec<Issue>) -> ModReport {
         skipped_features: Vec::new(),
         issues,
     }
+}
+
+/// Whether `scan` is the jar a resolution node chose. Identity is the origin's
+/// file name plus the node id, never the id alone: two jars may share an id,
+/// and the resolver's winner is the only correct answer.
+fn scan_matches(scan: &JarScan, node: &ModNode) -> bool {
+    let hfc_fabric::Origin::Jar { file_name, sha256 } = &node.origin else {
+        return false;
+    };
+    // A file name is unique within one mods folder, so it alone identifies the
+    // jar. The hash is checked when both sides have one, and a hash mismatch
+    // still matches by name: the scan list is the resolver's own input, so a
+    // mismatch would be a bug in HFC, not a reason to silently skip the mod.
+    &scan.file_name == file_name
+        && scan
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.id == node.id)
+        && (sha256.is_empty() || scan.sha256.is_empty() || &scan.sha256 == sha256)
 }
 
 /// Read one carried folder with Horizon's own loader. This is the same
@@ -658,5 +700,156 @@ mod tests {
         assert!(err.contains("ships code"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn scan_for_test(id: &str, file_name: &str, version: &str, sha: &str) -> JarScan {
+        use hfc_fabric::{Census, Loader, Metadata};
+        let metadata = Metadata {
+            schema_version: 1,
+            id: id.into(),
+            version: version.into(),
+            name: id.into(),
+            description: String::new(),
+            authors: Vec::new(),
+            contributors: Vec::new(),
+            contact: Default::default(),
+            license: vec!["MIT".into()],
+            environment: hfc_fabric::Environment::Both,
+            entrypoints: Default::default(),
+            mixins: Vec::new(),
+            access_widener: None,
+            jars: Vec::new(),
+            depends: Vec::new(),
+            recommends: Vec::new(),
+            suggests: Vec::new(),
+            conflicts: Vec::new(),
+            breaks: Vec::new(),
+            custom: serde_json::Value::Null,
+            icon: None,
+        };
+        JarScan {
+            path: PathBuf::from(file_name),
+            file_name: file_name.into(),
+            sha256: sha.into(),
+            size: 1,
+            loader: Loader::Fabric,
+            metadata: Some(metadata),
+            nested: Vec::new(),
+            census: Census::default(),
+            mixin_targets: Vec::new(),
+            warnings: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn sync_list(text: &str, desired: &[(&str, &str)], removed: &[&str]) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "hfc-list-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("horizon-mods.txt");
+        fs::write(&path, text).unwrap();
+        // A Bootstrap whose config is irrelevant here; the path is overridden.
+        let mods = dir.join("horizon-mods");
+        let compat = mods.join("HorizonFabricCompat");
+        fs::create_dir_all(&compat).unwrap();
+        fs::write(compat.join("hfc.toml"), config::Config::template()).unwrap();
+        let bootstrap = Bootstrap::open(&mods)
+            .unwrap()
+            .unwrap()
+            .with_mod_list(&path);
+        let desired: BTreeMap<String, (String, String, String)> = desired
+            .iter()
+            .map(|(id, sha)| {
+                (
+                    (*id).to_owned(),
+                    (format!("{id}.jar"), (*sha).to_owned(), String::new()),
+                )
+            })
+            .collect();
+        let removed = removed.iter().map(|id| (*id).to_owned()).collect();
+        bootstrap.sync_mod_list(&desired, &removed).unwrap();
+        let out = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn the_mod_list_is_trimmed_when_it_is_read_and_written() {
+        // A hand-edited file with spaces around the id and the colon. Every one
+        // of these names the managed mod `ruby`, so none may survive beside the
+        // line this run appends.
+        let out = sync_list(
+            "mod.ruby:true\nmod.ruby :true\nmod. ruby:false\n  mod.ruby:true\n\nmod.other:true\n",
+            &[("ruby", "sha1")],
+            &[],
+        );
+        let ruby_lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.contains("mod.") && line.contains("ruby"))
+            .collect();
+        assert_eq!(ruby_lines, ["mod.ruby:true"], "{out:?}");
+        assert!(out.contains("mod.other:true"), "{out:?}");
+        // Exactly one managed line even though four spellings existed.
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.trim() == "mod.ruby:true")
+                .count(),
+            1,
+            "{out:?}"
+        );
+
+        // A removed mod is written once as false, and whitespace variants of it
+        // are replaced too.
+        let out = sync_list("mod.gone :true\nkeep:me\n", &[], &["gone"]);
+        assert_eq!(out, "keep:me\nmod.gone:false\n", "{out:?}");
+    }
+
+    #[test]
+    fn the_scan_lookup_follows_the_resolver_winner_not_the_last_scan() {
+        // Two scans, one id. The resolver keeps the lexically first file; the
+        // lookup must resolve to the same scan for the chosen node, no matter
+        // where the loser sits in the vector.
+        let first = scan_for_test("ruby", "a-ruby.jar", "1", "aaaa");
+        let second = scan_for_test("ruby", "zzz-ruby.jar", "2", "bbbb");
+        let environment = EnvironmentInfo::default();
+        let resolution = resolve(&[first.clone(), second.clone()], &environment).unwrap();
+        let node = resolution.node("ruby").unwrap();
+        assert_eq!(node.version, "1");
+        let chosen = [&first, &second]
+            .into_iter()
+            .find(|scan| scan_matches(scan, node));
+        assert_eq!(
+            chosen.map(|scan| scan.file_name.as_str()),
+            Some("a-ruby.jar")
+        );
+        // Feed the candidate list loser-first. Discovery happens to hand the
+        // scans over in name order, so a `find` over that order returns the
+        // winner even when it ignores the file name; only a reversed list
+        // proves the lookup selects by the node's own origin instead of
+        // taking whatever sits first (or last) in the vector.
+        let reversed = [&second, &first]
+            .into_iter()
+            .find(|scan| scan_matches(scan, node));
+        assert_eq!(
+            reversed.map(|scan| scan.file_name.as_str()),
+            Some("a-ruby.jar"),
+            "the lookup must not depend on scan order"
+        );
+        // The resolver's loser is still a scan of the same id and hash; only
+        // its file name distinguishes them, so the lookup has to compare it.
+        assert_ne!(second.file_name, "a-ruby.jar");
+        assert!(!scan_matches(&second, node));
+        // A nested origin never matches a top-level scan.
+        let mut nested = node.clone();
+        nested.origin = hfc_fabric::Origin::NestedJar {
+            parent_file: "a-ruby.jar".into(),
+            path: "META-INF/jars/x.jar".into(),
+            sha256: "aaaa".into(),
+        };
+        assert!(!scan_matches(&first, &nested));
     }
 }

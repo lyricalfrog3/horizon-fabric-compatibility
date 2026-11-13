@@ -38,12 +38,16 @@ impl Default for EnvironmentInfo {
 
 impl EnvironmentInfo {
     /// The version HFC should use for a built-in provider id.
+    ///
+    /// Only the providers the environment itself supplies belong here. Fabric
+    /// API is an ordinary mod: its version is whatever jar is installed, so it
+    /// is resolved from the scan set like any other provider and a missing jar
+    /// is a missing dependency rather than an assumed version.
     pub fn version_of(&self, id: &str) -> Option<&str> {
         match id {
             "minecraft" => Some(&self.minecraft),
             "fabricloader" | "quilt_loader" => Some(&self.fabric_loader),
             "java" => Some(&self.java),
-            "fabric-api" | "fabric" => Some("0.165.0+26.3"),
             _ => None,
         }
     }
@@ -396,6 +400,7 @@ pub fn resolve(scans: &[JarScan], env: &EnvironmentInfo) -> Result<Resolution, S
     let mut mods: Vec<ModNode> = by_id.values().map(|c| c.node.clone()).collect();
 
     // Built-in environment dependencies are checked, never listed as mods.
+    // Everything else is an ordinary installed mod; a missing one is missing.
     let provider_version = |id: &str| -> Option<String> {
         if let Some(version) = env.version_of(id) {
             return Some(version.to_owned());
@@ -879,12 +884,53 @@ mod tests {
                 ("minecraft", "^1.21"),
                 ("fabricloader", ">=0.15"),
                 ("java", ">=21"),
-                ("fabric-api", ">=0.160"),
-                ("fabric", "*"),
             ],
         )];
         let resolution = resolve(&scans, &env).unwrap();
         assert!(resolution.node("ok").unwrap().runtime_ready);
         assert!(!resolution.has_errors());
+    }
+
+    #[test]
+    fn fabric_api_is_resolved_from_the_installed_jar_not_a_constant() {
+        // The installed version is what counts: a mod needing >=0.170 is
+        // satisfied by an installed 0.170.0, and one needing >=0.180 is not.
+        let scans = [
+            scan("fabric-api", "0.170.0+26.3", &[]),
+            scan("newer", "1", &[("fabric-api", ">=0.170")]),
+            scan("too-new", "1", &[("fabric-api", ">=0.180")]),
+        ];
+        let resolution = resolve(&scans, &EnvironmentInfo::default()).unwrap();
+        assert!(resolution.node("newer").unwrap().runtime_ready);
+        assert!(!resolution.node("too-new").unwrap().runtime_ready);
+        let issue = resolution
+            .issues_for("too-new")
+            .find(|issue| issue.code == IssueCode::VersionMismatch)
+            .expect("a version mismatch against the installed version");
+        assert!(issue.message.contains("0.170.0+26.3"), "{}", issue.message);
+    }
+
+    #[test]
+    fn a_missing_fabric_api_is_a_missing_dependency() {
+        // Nothing supplies Fabric API here, so it must not be reported present.
+        let scans = [scan("needs-api", "1", &[("fabric-api", "*")])];
+        let resolution = resolve(&scans, &EnvironmentInfo::default()).unwrap();
+        assert!(!resolution.node("needs-api").unwrap().runtime_ready);
+        let codes: Vec<IssueCode> = resolution
+            .issues_for("needs-api")
+            .map(|issue| issue.code)
+            .collect();
+        assert!(codes.contains(&IssueCode::MissingDependency), "{codes:?}");
+        assert!(!codes.contains(&IssueCode::VersionMismatch), "{codes:?}");
+    }
+
+    #[test]
+    fn environment_info_no_longer_invents_fabric_api() {
+        let env = EnvironmentInfo::default();
+        assert!(env.version_of("fabric-api").is_none());
+        assert!(env.version_of("fabric").is_none());
+        assert!(env.version_of("minecraft").is_some());
+        assert!(env.version_of("fabricloader").is_some());
+        assert!(env.version_of("java").is_some());
     }
 }

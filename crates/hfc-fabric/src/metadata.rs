@@ -159,10 +159,7 @@ impl Metadata {
         let object = value
             .as_object()
             .ok_or_else(|| format!("{FABRIC_MOD_JSON}: not an object"))?;
-        let schema_version = object
-            .get("schemaVersion")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let schema_version = schema_version(object)?;
         if schema_version > 1 {
             return Err(format!(
                 "{FABRIC_MOD_JSON}: schemaVersion {schema_version} is newer than HFC reads (1)"
@@ -382,6 +379,28 @@ fn string(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> 
     object.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// `schemaVersion`, which is optional (absent means 0, Loader's inferred
+/// version). A present value must be a non-negative integer that fits `u32`:
+/// truncating a larger number would wrap `4294967296` to `0` and
+/// `4294967297` to `1`, silently passing the "newer than HFC reads" guard.
+fn schema_version(object: &serde_json::Map<String, Value>) -> Result<u32, String> {
+    let Some(value) = object.get("schemaVersion") else {
+        return Ok(0);
+    };
+    let number = value.as_u64().ok_or_else(|| {
+        format!(
+            "{FABRIC_MOD_JSON}: \"schemaVersion\" is {}, not a non-negative integer",
+            kind(value)
+        )
+    })?;
+    u32::try_from(number).map_err(|_| {
+        format!(
+            "{FABRIC_MOD_JSON}: schemaVersion {number} does not fit a 32-bit integer; \
+             this metadata is not readable as schema 1"
+        )
+    })
+}
+
 fn kind(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -556,6 +575,40 @@ mod tests {
         assert!(Metadata::parse(br#"{"id": "x", "version": "1", "license": 3}"#).is_err());
         assert!(Metadata::parse(br#"[]"#).is_err());
         assert!(Metadata::parse(br#"{"id": "x", "version": "1", "schemaVersion": 9}"#).is_err());
+    }
+
+    #[test]
+    fn schema_version_is_not_truncated() {
+        // 2^32 wraps to 0 and 2^32 + 1 wraps to 1 under `as u32`; both are
+        // newer than HFC reads and must be rejected, not accepted as 0/1.
+        for number in ["4294967296", "4294967297", "18446744073709551615"] {
+            let json = format!(r#"{{"id":"x","version":"1","schemaVersion":{number}}}"#);
+            let error = Metadata::parse(json.as_bytes()).unwrap_err();
+            assert!(error.contains("schemaVersion"), "{number}: {error}");
+        }
+        // A negative or fractional number is not a schema version either.
+        for number in ["-1", "1.5", "-0.5"] {
+            let json = format!(r#"{{"id":"x","version":"1","schemaVersion":{number}}}"#);
+            assert!(
+                Metadata::parse(json.as_bytes()).is_err(),
+                "{number} was accepted"
+            );
+        }
+        // A string is not a number, even when it looks like one.
+        assert!(Metadata::parse(br#"{"id":"x","version":"1","schemaVersion":"1"}"#).is_err());
+        // The supported values still parse, and an absent one means schema 0.
+        assert_eq!(
+            Metadata::parse(br#"{"id":"x","version":"1","schemaVersion":1}"#)
+                .unwrap()
+                .schema_version,
+            1
+        );
+        assert_eq!(
+            Metadata::parse(br#"{"id":"x","version":"1"}"#)
+                .unwrap()
+                .schema_version,
+            0
+        );
     }
 
     #[test]

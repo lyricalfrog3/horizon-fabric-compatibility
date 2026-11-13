@@ -102,8 +102,9 @@ pub struct JarScan {
     pub metadata: Option<Metadata>,
     pub nested: Vec<NestedScan>,
     pub census: Census,
-    /// Class names named by the declared mixin configurations (`target`, or
-    /// the configuration's package plus the mixin's name).
+    /// The mixin classes named by the declared mixin configurations: the
+    /// configuration's `package` plus each string entry of `mixins`, `client`
+    /// and `server`.
     pub mixin_targets: Vec<String>,
     /// Non-fatal problems: a missing mixin config, a nested jar that is not
     /// there, a second loader's metadata file.
@@ -584,30 +585,76 @@ fn read_mixin_targets(
     };
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("{path}: malformed mixin JSON: {e}"))?;
+    Ok(mixin_config_classes(&value))
+}
+
+/// The mixin classes a configuration declares, named by their fully qualified
+/// class.
+///
+/// A real Mixin config lists class names as an array of strings, relative to
+/// `"package"`:
+///
+/// ```json
+/// {"package": "com.example.mixin", "mixins": ["ChestMixin"],
+///  "client": ["client.ScreenMixin"], "server": []}
+/// ```
+///
+/// The legacy object form (`{"name": "ChestMixin"}`, `{"target": "…"}`) is
+/// accepted too, but it is not what mods ship. Only `mixins`, `client` and
+/// `server` are read; `plugin` names a config plugin, not a mixin class.
+fn mixin_config_classes(value: &serde_json::Value) -> Vec<String> {
     let package = value
         .get("package")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let mut targets = Vec::new();
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('.');
+    let mut classes = Vec::new();
     for key in ["mixins", "client", "server"] {
         let Some(items) = value.get(key).and_then(serde_json::Value::as_array) else {
             continue;
         };
         for item in items {
-            if let Some(target) = item.get("target").and_then(serde_json::Value::as_str) {
-                targets.push(target.to_owned());
-            } else if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
-                if package.is_empty() {
-                    targets.push(name.to_owned());
-                } else {
-                    targets.push(format!("{package}.{name}"));
+            match item {
+                // The real form: a class name relative to `package`.
+                serde_json::Value::String(name) => {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if package.is_empty() {
+                        classes.push(name.to_owned());
+                    } else {
+                        classes.push(format!("{package}.{name}"));
+                    }
                 }
+                // The legacy object form. `name` is the mixin class; `target`
+                // names the class it is mixed into, which is not this config's
+                // own class and is only kept when `name` is absent.
+                serde_json::Value::Object(object) => {
+                    if let Some(name) = object.get("name").and_then(serde_json::Value::as_str) {
+                        let name = name.trim();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        if package.is_empty() {
+                            classes.push(name.to_owned());
+                        } else {
+                            classes.push(format!("{package}.{name}"));
+                        }
+                    } else if let Some(target) =
+                        object.get("target").and_then(serde_json::Value::as_str)
+                    {
+                        classes.push(target.trim().to_owned());
+                    }
+                }
+                _ => {}
             }
         }
     }
-    targets.sort();
-    targets.dedup();
-    Ok(targets)
+    classes.sort();
+    classes.dedup();
+    classes
 }
 
 fn merge_targets(into: &mut Vec<String>, targets: Vec<String>) {
@@ -780,6 +827,15 @@ mod tests {
         "name":"Ruby","depends":{"minecraft":">=1.20","cloth-config":"*"},
         "entrypoints":{"main":["ruby.Ruby"]},"mixins":["ruby.mixins.json"]}"#;
 
+    /// The real Mixin config shape: `mixins`/`client`/`server` are arrays of
+    /// class names relative to `"package"`. This is what Fabric mods ship (and
+    /// what `hfc-runtime`'s `mixin::config_classes` parses); the object form
+    /// HFC used to require appears in no real jar.
+    const MIXINS: &[u8] = br#"{"required":true,"minVersion":"0.8","package":"ruby.mixin",
+        "compatibilityLevel":"JAVA_21",
+        "mixins":["Chest","event.PlayerMixin"],"client":["client.ScreenMixin"],"server":[],
+        "injectors":{"defaultRequire":1}}"#;
+
     #[test]
     fn reads_metadata_census_and_mixin_targets() {
         let dir = temp("full");
@@ -788,10 +844,7 @@ mod tests {
             "ruby.jar",
             &[
                 ("fabric.mod.json", MOD),
-                (
-                    "ruby.mixins.json",
-                    br#"{"package":"ruby.mixin","mixins":[{"name":"Chest"},{"target":"net.minecraft.Foo"}]}"#,
-                ),
+                ("ruby.mixins.json", MIXINS),
                 ("assets/ruby/blockstates/ruby_block.json", b"{}"),
                 ("assets/ruby/textures/block/ruby.png", b"png"),
                 ("data/ruby/recipe/ruby.json", b"{}"),
@@ -809,11 +862,84 @@ mod tests {
         assert_eq!(scan.census.classes, 1);
         assert_eq!(
             scan.mixin_targets,
-            ["net.minecraft.Foo", "ruby.mixin.Chest"]
+            [
+                "ruby.mixin.Chest",
+                "ruby.mixin.client.ScreenMixin",
+                "ruby.mixin.event.PlayerMixin",
+            ]
         );
-        assert_eq!(&scan.sha256[..8], &scan.sha256[..8]);
+        assert_eq!(
+            scan.sha256,
+            hfc_core::sha256_bytes(&std::fs::read(&path).unwrap())
+        );
         assert_eq!(scan.sha256.len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixin_config_classes_reads_the_string_arrays() {
+        // The exact shape jamlib ships, with a nested package suffix.
+        let value: serde_json::Value = serde_json::from_slice(
+            br#"{"package":"io.github.jamalam360.jamlib.impl.mixin",
+                 "mixins":["event.MinecraftServerMixin","event.PlayerListMixin"],
+                 "client":[],"server":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mixin_config_classes(&value),
+            [
+                "io.github.jamalam360.jamlib.impl.mixin.event.MinecraftServerMixin",
+                "io.github.jamalam360.jamlib.impl.mixin.event.PlayerListMixin",
+            ]
+        );
+        // A config with no package is used as written, and a trailing dot in
+        // the package does not double up.
+        let value: serde_json::Value =
+            serde_json::from_slice(br#"{"mixins":["a.B"],"client":["C"]}"#).unwrap();
+        assert_eq!(mixin_config_classes(&value), ["C", "a.B"]);
+        let value: serde_json::Value =
+            serde_json::from_slice(br#"{"package":"x.y.","mixins":["B"]}"#).unwrap();
+        assert_eq!(mixin_config_classes(&value), ["x.y.B"]);
+        // Non-string junk is ignored rather than crashing the scan.
+        let value: serde_json::Value =
+            serde_json::from_slice(br#"{"package":"p","mixins":["M",7,null],"client":"nope"}"#)
+                .unwrap();
+        assert_eq!(mixin_config_classes(&value), ["p.M"]);
+        // The legacy object form still works, but only as a fallback.
+        let value: serde_json::Value = serde_json::from_slice(
+            br#"{"package":"p","mixins":[{"name":"Old"},{"target":"net.minecraft.Foo"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(mixin_config_classes(&value), ["net.minecraft.Foo", "p.Old"]);
+    }
+
+    /// Cross-check against a real jar when the local `test-mods` fixtures are
+    /// present. The jars are ignored by Git, so this skips with a clear message
+    /// instead of passing on a fabricated archive.
+    #[test]
+    fn mixin_targets_match_a_real_fixture_jar() {
+        let path = std::path::Path::new("../../test-mods/jamlib-fabric-2.3.1+26.3.x.jar");
+        if !path.is_file() {
+            eprintln!("skipped: {} is not present", path.display());
+            return;
+        }
+        let scan = scan_path(path, &Limits::default()).unwrap();
+        assert!(scan.error.is_none(), "{:?}", scan.error);
+        assert_eq!(scan.metadata.as_ref().unwrap().mixins.len(), 3);
+        assert!(
+            scan.mixin_targets.iter().any(|target| {
+                target == "io.github.jamalam360.jamlib.impl.mixin.event.PlayerListMixin"
+            }),
+            "{:?}",
+            scan.mixin_targets
+        );
+        assert!(
+            scan.mixin_targets
+                .iter()
+                .all(|target| !target.contains(".mixins.json")),
+            "config paths must not be reported as classes: {:?}",
+            scan.mixin_targets
+        );
     }
 
     #[test]

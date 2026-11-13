@@ -5,10 +5,238 @@ use crate::minecraft::*;
 use crate::value::{JavaObject, Value};
 use std::collections::HashMap;
 
+/// Java's `Math.min(double, double)`: a NaN argument wins, and `-0.0` is the
+/// smaller of the two zeroes. Rust's `f64::min` returns the non-NaN operand
+/// instead, which is the opposite of what Java specifies.
+pub(crate) fn java_min_double(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == 0.0 && b == 0.0 {
+        // Both zero: the sign bit of either marks the smaller.
+        f64::from_bits(a.to_bits() | b.to_bits())
+    } else {
+        a.min(b)
+    }
+}
+
+/// Java's `Math.max(double, double)`.
+pub(crate) fn java_max_double(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == 0.0 && b == 0.0 {
+        f64::from_bits(a.to_bits() & b.to_bits())
+    } else {
+        a.max(b)
+    }
+}
+
+/// Java's `Math.min(float, float)`.
+pub(crate) fn java_min_float(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == 0.0 && b == 0.0 {
+        f32::from_bits(a.to_bits() | b.to_bits())
+    } else {
+        a.min(b)
+    }
+}
+
+/// Java's `Math.max(float, float)`.
+pub(crate) fn java_max_float(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == 0.0 && b == 0.0 {
+        f32::from_bits(a.to_bits() & b.to_bits())
+    } else {
+        a.max(b)
+    }
+}
+
+/// A string's text as Java sees it: its UTF-16 code units. `String` indexes
+/// (`charAt`, `substring`, `indexOf`) count code units, and an astral character
+/// is two of them. The runtime keeps a Rust `String` (Unicode scalars), so every
+/// such index is resolved through this view.
+pub(crate) fn utf16_units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+/// The text of a run of UTF-16 code units. A range that cuts a surrogate pair
+/// in half yields a lone surrogate, which a Java `String` can hold and a Rust
+/// `String` cannot: those units are replaced with U+FFFD. Every range that does
+/// not split a pair (which is every range a well-formed caller asks for) is
+/// reproduced exactly.
+pub(crate) fn text_of_units(units: &[u16]) -> String {
+    String::from_utf16_lossy(units)
+}
+
+/// A new `String` object with `text`.
+///
+/// Java allocates a fresh string for `StringBuilder.toString()`, `substring`,
+/// a case conversion, `trim`, `concatenation` and the rest: two such calls with
+/// the same text are different objects, and only literals and `intern()` are
+/// shared. `Heap::alloc_string` interns by text, which is right for the
+/// constant pool and wrong for all of these, so they must allocate here.
+pub(crate) fn new_string(heap: &mut Heap, text: impl Into<String>) -> usize {
+    heap.alloc_string_uninterned(text)
+}
+
+/// Java's `String.trim()`: strips leading and trailing characters whose code is
+/// at most `\u0020` (not Unicode whitespace, so a non-breaking space stays).
+pub(crate) fn java_trim(text: &str) -> &str {
+    text.trim_matches(|c: char| (c as u32) <= 0x20)
+}
+
+/// Java's `String.strip()`: strips leading and trailing characters
+/// `Character.isWhitespace` accepts. NBSP is a space character but not
+/// whitespace, so `strip` keeps it, unlike Rust's `str::trim`.
+pub(crate) fn java_strip(text: &str) -> &str {
+    text.trim_matches(crate::num_builtins::is_whitespace)
+}
+
+/// Java's `String.hashCode`: `s[0]*31^(n-1) + ... + s[n-1]` over UTF-16 code
+/// units. Hashing UTF-8 bytes would give `"\u00e9"` a different hash than the
+/// JVM does, so a mod's string-keyed map would not find its own value.
+pub(crate) fn java_string_hash(text: &str) -> i32 {
+    let mut hash: i32 = 0;
+    for unit in text.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(unit as i32);
+    }
+    hash
+}
+
+/// `Object.equals` as Java means it for the values the runtime keeps unboxed:
+/// strings compare by text, boxed numbers and booleans by value, and everything
+/// else by identity. Collections use this so a `HashSet<String>` finds an equal
+/// string that is a different object.
+pub(crate) fn java_equals(heap: &Heap, a: &Value, b: &Value) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(left), Some(right)) = (a.as_obj(), b.as_obj()) else {
+        return false;
+    };
+    match (heap.get(left), heap.get(right)) {
+        (Some(JavaObject::String(x)), Some(JavaObject::String(y))) => x == y,
+        (
+            Some(JavaObject::Instance {
+                class_name: x_class,
+                fields: x,
+            }),
+            Some(JavaObject::Instance {
+                class_name: y_class,
+                fields: y,
+            }),
+        ) if x_class == y_class && x_class.starts_with("java/lang/") => {
+            // A boxed value (`Integer`, `Boolean`, `Character`, ...): equal when
+            // the boxed value is.
+            match (x.get("value"), y.get("value")) {
+                (Some(x), Some(y)) => java_equals(heap, x, y),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Reverse a string the way Java's `StringBuilder.reverse` does when the text
+/// contains no surrogate pair: unit by unit. A pair cannot be split into lone
+/// surrogate halves here (a Rust `String` holds scalars), so a pair is kept
+/// together and moves as one unit, which is the one place this reversal differs
+/// from Java's.
+fn reverse_keeping_pairs(text: &str) -> String {
+    let mut units = utf16_units(text);
+    // Reverse the units, then repair any surrogate pair the reversal split by
+    // swapping the halves back.
+    units.reverse();
+    let mut index = 0;
+    while index + 1 < units.len() {
+        let (first, second) = (units[index], units[index + 1]);
+        if (0xDC00..=0xDFFF).contains(&first) && (0xD800..=0xDBFF).contains(&second) {
+            units.swap(index, index + 1);
+        }
+        index += 1;
+    }
+    text_of_units(&units)
+}
+
+/// `String.substring`'s out-of-range exception: `Range [start, end) out of
+/// bounds for length n`, the message the JDK's own `String.checkBoundsBeginEnd`
+/// produces.
+fn sioobe(heap: &mut Heap, units: &[u16], start: i32, end: i32) -> BuiltinResult {
+    BuiltinResult::Threw(crate::num_builtins::exception(
+        heap,
+        "java/lang/StringIndexOutOfBoundsException",
+        &format!(
+            "Range [{start}, {end}) out of bounds for length {}",
+            units.len()
+        ),
+    ))
+}
+
+/// The first index at or after `from` where `needle` occurs in `haystack`, both
+/// as UTF-16 code units. An empty needle occurs at `from` (clamped to the
+/// haystack's length), as Java's `String.indexOf` specifies.
+fn index_of_units(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from.min(haystack.len()));
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (from..=haystack.len() - needle.len()).find(|&i| haystack[i..i + needle.len()] == needle[..])
+}
+
+/// The last index at or before `from` where `needle` occurs, where `from` is a
+/// unit index (as `String.lastIndexOf` takes it) rather than the last possible
+/// start: an empty needle matches at `min(from, len)`.
+pub(crate) fn last_index_of_units_at(
+    haystack: &[u16],
+    needle: &[u16],
+    from: usize,
+) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from.min(haystack.len()));
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let last_start = from.min(haystack.len() - needle.len());
+    (0..=last_start)
+        .rev()
+        .find(|&i| haystack[i..i + needle.len()] == needle[..])
+}
+
+/// The first index at or after `from` where `needle` occurs, as UTF-16 units.
+pub(crate) fn index_of_units_from(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    index_of_units(haystack, needle, from)
+}
+
+/// `Math.round(double)`: Java's `floor(x + 0.5)` semantics, saturated to the
+/// long range with NaN answering 0. Rust's `round` rounds half away from zero,
+/// so `Math.round(-0.5)` (0 in Java) would come out -1.
+fn java_round(value: f64) -> i64 {
+    if value.is_nan() {
+        return 0;
+    }
+    let floored = (value + 0.5).floor();
+    if floored >= i64::MAX as f64 {
+        i64::MAX
+    } else if floored <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        floored as i64
+    }
+}
+
 /// Result of dispatching a method to builtins.
 pub enum BuiltinResult {
     /// Handled by a builtin; returns a value (or Value::NULL for void).
     Handled(Value),
+    /// The builtin raised a Java exception. The value is the exception object
+    /// (an instance of its class with `detailMessage` set); the interpreter
+    /// makes it the pending exception, so the calling frame catches it or
+    /// unwinds exactly as if interpreted code had thrown it.
+    Threw(Value),
     /// Not a builtin; should be executed as bytecode.
     NotHandled,
 }
@@ -126,17 +354,34 @@ pub(crate) fn text_of_value(heap: &Heap, val: &Value) -> String {
                     return if inner.as_bool() { "true" } else { "false" }.to_string();
                 }
             }
+            // Java's `Component.getString()` is the component's own text followed
+            // by every sibling's, recursively. Answering only the first field
+            // loses real text whenever a mod rebuilds a line as an empty root
+            // whose content lives in `siblings` — which is exactly what a
+            // centring mixin does when it wraps a title in padding. The own text
+            // may also be absent (`null`) while the siblings carry content, so
+            // both parts are collected rather than one replacing the other.
+            let mut out = String::new();
             for key in ["text", "value", "string", "contents"] {
                 if let Some(inner) = fields.get(key) {
                     if !inner.is_null() {
-                        return text_of_value(heap, inner);
+                        out.push_str(&text_of_value(heap, inner));
+                        break;
                     }
                 }
             }
             if let Some(sibs_id) = fields.get("siblings").and_then(|v| v.as_obj()) {
                 if let Some(JavaObject::List(parts)) = heap.get(sibs_id) {
-                    return parts.iter().map(|p| text_of_value(heap, p)).collect();
+                    // `parts` borrows the heap, so collect the sibling texts
+                    // through a copy of the list.
+                    let parts = parts.clone();
+                    for part in &parts {
+                        out.push_str(&text_of_value(heap, part));
+                    }
                 }
+            }
+            if !out.is_empty() || fields.contains_key("text") || fields.contains_key("siblings") {
+                return out;
             }
         }
         if let Some(JavaObject::Lambda {
@@ -2217,6 +2462,24 @@ pub fn dispatch_builtin(
     args: &[Value],
     virtual_dispatch: bool,
 ) -> BuiltinResult {
+    dispatch_builtin_inner(
+        heap,
+        class_name,
+        method_name,
+        descriptor,
+        args,
+        virtual_dispatch,
+    )
+}
+
+fn dispatch_builtin_inner(
+    heap: &mut Heap,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+    virtual_dispatch: bool,
+) -> BuiltinResult {
     // LWJGL's windowing natives (SDL, GLFW) belong to the host: the window, its
     // cursor and text input are the host's, and the interpreter cannot load a
     // shared library. A call into them does nothing and answers the type's zero.
@@ -3880,18 +4143,23 @@ pub fn dispatch_builtin(
                     (Value::Double(_), _) | (_, Value::Double(_))
                 )
             {
-                return BuiltinResult::Handled(Value::Double(
-                    args[0].as_double().min(args[1].as_double()),
-                ));
+                // Java's `Math.min` propagates NaN and orders `-0.0` below
+                // `0.0`; Rust's `f64::min` returns the non-NaN operand instead,
+                // so both sides have to be ordered explicitly.
+                return BuiltinResult::Handled(Value::Double(java_min_double(
+                    args[0].as_double(),
+                    args[1].as_double(),
+                )));
             } else if descriptor == "(FF)F"
                 || matches!(
                     (&args[0], &args[1]),
                     (Value::Float(_), _) | (_, Value::Float(_))
                 )
             {
-                return BuiltinResult::Handled(Value::Float(
-                    args[0].as_float().min(args[1].as_float()),
-                ));
+                return BuiltinResult::Handled(Value::Float(java_min_float(
+                    args[0].as_float(),
+                    args[1].as_float(),
+                )));
             } else {
                 return BuiltinResult::Handled(Value::Int(args[0].as_int().min(args[1].as_int())));
             }
@@ -3911,30 +4179,34 @@ pub fn dispatch_builtin(
                     (Value::Double(_), _) | (_, Value::Double(_))
                 )
             {
-                return BuiltinResult::Handled(Value::Double(
-                    args[0].as_double().max(args[1].as_double()),
-                ));
+                return BuiltinResult::Handled(Value::Double(java_max_double(
+                    args[0].as_double(),
+                    args[1].as_double(),
+                )));
             } else if descriptor == "(FF)F"
                 || matches!(
                     (&args[0], &args[1]),
                     (Value::Float(_), _) | (_, Value::Float(_))
                 )
             {
-                return BuiltinResult::Handled(Value::Float(
-                    args[0].as_float().max(args[1].as_float()),
-                ));
+                return BuiltinResult::Handled(Value::Float(java_max_float(
+                    args[0].as_float(),
+                    args[1].as_float(),
+                )));
             } else {
                 return BuiltinResult::Handled(Value::Int(args[0].as_int().max(args[1].as_int())));
             }
         } else if method_name == "abs" && !args.is_empty() {
             if descriptor == "(J)J" || matches!(&args[0], Value::Long(_)) {
-                return BuiltinResult::Handled(Value::Long(args[0].as_long().abs()));
+                return BuiltinResult::Handled(Value::Long(args[0].as_long().wrapping_abs()));
             } else if descriptor == "(D)D" || matches!(&args[0], Value::Double(_)) {
                 return BuiltinResult::Handled(Value::Double(args[0].as_double().abs()));
             } else if descriptor == "(F)F" || matches!(&args[0], Value::Float(_)) {
                 return BuiltinResult::Handled(Value::Float(args[0].as_float().abs()));
             } else {
-                return BuiltinResult::Handled(Value::Int(args[0].as_int().abs()));
+                // `Math.abs(MIN_VALUE)` is MIN_VALUE in Java (the magnitude is
+                // not representable); `i32::abs` panics on it in a debug build.
+                return BuiltinResult::Handled(Value::Int(args[0].as_int().wrapping_abs()));
             }
         } else if method_name == "ceil" && !args.is_empty() {
             return BuiltinResult::Handled(Value::Double(args[0].as_double().ceil()));
@@ -3951,11 +4223,79 @@ pub fn dispatch_builtin(
                 args[0].as_double().powf(args[1].as_double()),
             ));
         } else if method_name == "round" && !args.is_empty() {
+            // Java rounds half UP (`floor(x + 0.5)`), so `-0.5` is 0. Rust's
+            // `f64::round` rounds half away from zero and gives -1. A NaN is 0
+            // and an out-of-range value saturates, as the narrowing casts do.
             if descriptor == "(F)I" || matches!(&args[0], Value::Float(_)) {
-                return BuiltinResult::Handled(Value::Int(args[0].as_float().round() as i32));
+                return BuiltinResult::Handled(Value::Int(
+                    java_round(args[0].as_float() as f64) as i32
+                ));
             } else {
-                return BuiltinResult::Handled(Value::Long(args[0].as_double().round() as i64));
+                return BuiltinResult::Handled(Value::Long(java_round(args[0].as_double())));
             }
+        } else if method_name == "floorMod" && args.len() >= 2 {
+            // `floorMod(a, b) = a - floorDiv(a, b) * b`, whose sign follows the
+            // divisor: `floorMod(7, -3)` is -2.
+            if descriptor == "(JJ)J" || matches!((&args[0], &args[1]), (Value::Long(_), _)) {
+                let (a, b) = (args[0].as_long(), args[1].as_long());
+                return BuiltinResult::Handled(Value::Long(if b == 0 {
+                    // Java throws `ArithmeticException`; a builtin cannot throw
+                    // here, so answer 0 rather than abort.
+                    0
+                } else if a == i64::MIN && b == -1 {
+                    // `MIN_VALUE % -1` overflows in Rust and is 0 in Java.
+                    0
+                } else {
+                    let m = a % b;
+                    if m != 0 && ((m < 0) != (b < 0)) {
+                        m + b
+                    } else {
+                        m
+                    }
+                }));
+            }
+            let (a, b) = (args[0].as_int(), args[1].as_int());
+            return BuiltinResult::Handled(Value::Int(if b == 0 {
+                0
+            } else if a == i32::MIN && b == -1 {
+                0
+            } else {
+                let m = a % b;
+                if m != 0 && ((m < 0) != (b < 0)) {
+                    m + b
+                } else {
+                    m
+                }
+            }));
+        } else if method_name == "floorDiv" && args.len() >= 2 {
+            if descriptor == "(JJ)J" || matches!((&args[0], &args[1]), (Value::Long(_), _)) {
+                let (a, b) = (args[0].as_long(), args[1].as_long());
+                return BuiltinResult::Handled(Value::Long(if b == 0 {
+                    0
+                } else if a == i64::MIN && b == -1 {
+                    i64::MIN
+                } else {
+                    let q = a / b;
+                    if (a % b != 0) && ((a < 0) != (b < 0)) {
+                        q - 1
+                    } else {
+                        q
+                    }
+                }));
+            }
+            let (a, b) = (args[0].as_int(), args[1].as_int());
+            return BuiltinResult::Handled(Value::Int(if b == 0 {
+                0
+            } else if a == i32::MIN && b == -1 {
+                i32::MIN
+            } else {
+                let q = a / b;
+                if (a % b != 0) && ((a < 0) != (b < 0)) {
+                    q - 1
+                } else {
+                    q
+                }
+            }));
         }
     }
 
@@ -4055,16 +4395,20 @@ pub fn dispatch_builtin(
                     (args[1].as_int() != 0).to_string()
                 } else if descriptor.starts_with("([C)") {
                     // `append(char[])`: Iceberg's tooltip text sink builds a
-                    // line one copied codepoint at a time.
+                    // line one copied code point at a time. A `char[]` holds
+                    // UTF-16 code units, so the units are read as units (a lone
+                    // surrogate is legal) and the run is decoded once, which
+                    // keeps a supplementary pair the caller split across two
+                    // `toChars` calls intact.
                     args[1]
                         .as_obj()
                         .and_then(|id| match heap.get(id) {
-                            Some(JavaObject::Array { elements, .. }) => Some(
-                                elements
+                            Some(JavaObject::Array { elements, .. }) => Some(text_of_units(
+                                &elements
                                     .iter()
-                                    .filter_map(|value| char::from_u32(value.as_int() as u32))
-                                    .collect::<String>(),
-                            ),
+                                    .map(|value| value.as_int() as u16)
+                                    .collect::<Vec<_>>(),
+                            )),
                             _ => None,
                         })
                         .unwrap_or_default()
@@ -4160,34 +4504,52 @@ pub fn dispatch_builtin(
                 return BuiltinResult::Handled(Value::NULL);
             }
         } else if method_name == "charAt" && args.len() >= 2 {
+            // `AbstractStringBuilder.charAt` indexes UTF-16 code units, like
+            // `String.charAt`, and throws for an out-of-range index.
             if let Some(id) = args[0].as_obj() {
                 if let Some(JavaObject::String(s)) = heap.get(id) {
-                    let ch = s
-                        .chars()
-                        .nth(args[1].as_int().max(0) as usize)
-                        .unwrap_or('\0');
-                    return BuiltinResult::Handled(Value::Int(ch as i32));
+                    let units = utf16_units(s);
+                    let index = args[1].as_int();
+                    return match usize::try_from(index).ok().and_then(|i| units.get(i)) {
+                        Some(unit) => BuiltinResult::Handled(Value::Int(*unit as i32)),
+                        None => BuiltinResult::Threw(crate::num_builtins::exception(
+                            heap,
+                            "java/lang/StringIndexOutOfBoundsException",
+                            &format!("index {index}, length {}", units.len()),
+                        )),
+                    };
                 }
             }
             return BuiltinResult::Handled(Value::Int(0));
         } else if method_name == "length" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {
                 if let Some(JavaObject::String(s)) = heap.get(id) {
-                    return BuiltinResult::Handled(Value::Int(s.chars().count() as i32));
+                    return BuiltinResult::Handled(Value::Int(s.encode_utf16().count() as i32));
                 }
             }
             return BuiltinResult::Handled(Value::Int(0));
         } else if method_name == "reverse" && !args.is_empty() {
             if let Some(this_id) = args[0].as_obj() {
                 if let Some(JavaObject::String(s)) = heap.get_mut(this_id) {
-                    *s = s.chars().rev().collect();
+                    // Reverses UTF-16 code units, which splits a surrogate pair
+                    // (`"a😀"` becomes the lone low surrogate then the high
+                    // one). The runtime's text cannot hold a lone surrogate, so
+                    // the pair keeps its order and only the other units move;
+                    // the reversal of a string with astral characters therefore
+                    // differs from Java's. Documented in `docs/`.
+                    *s = reverse_keeping_pairs(s);
                 }
                 return BuiltinResult::Handled(Value::Object(Some(this_id)));
             }
         } else if method_name == "toString" && !args.is_empty() {
             if let Some(this_id) = args[0].as_obj() {
+                // A new object every call: `sb.toString() == sb.toString()` is
+                // false in Java, and the result is not the equal literal's
+                // object either. `alloc_string` would intern it and make both
+                // true, so a mod comparing strings by `==` would see a match
+                // where a JVM sees none.
                 let s = heap.get_string(this_id).unwrap_or("").to_string();
-                let sid = heap.alloc_string(s);
+                let sid = new_string(heap, s);
                 return BuiltinResult::Handled(Value::Object(Some(sid)));
             }
         }
@@ -4205,8 +4567,8 @@ pub fn dispatch_builtin(
             // through `CharSequence`, as `StringJoiner` does).
             return BuiltinResult::Handled(args[0].clone());
         } else if method_name == "intern" && !args.is_empty() {
-            // `Heap::alloc_string` interns by text; a `new String(...)` is a
-            // separate object, so answer the interned one.
+            // `Heap::alloc_string` interns by text, which is exactly what
+            // `intern` answers: the one shared object for that text.
             let text = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
@@ -4216,6 +4578,14 @@ pub fn dispatch_builtin(
                 None => args[0].clone(),
             });
         } else if method_name == "valueOf" && !args.is_empty() {
+            // `valueOf(String)` answers its argument, so it must not allocate a
+            // second object for the same text; every other overload produces a
+            // fresh string, as a JVM does.
+            if let Some(id) = args[0].as_obj() {
+                if heap.get_string(id).is_some() && descriptor.starts_with("(Ljava/lang/String;)") {
+                    return BuiltinResult::Handled(args[0].clone());
+                }
+            }
             let s = match &args[0] {
                 Value::Int(i) if descriptor.starts_with("(Z)") => (*i != 0).to_string(),
                 Value::Int(i) if descriptor.starts_with("(C)") => char::from_u32(*i as u32)
@@ -4228,7 +4598,7 @@ pub fn dispatch_builtin(
                 Value::Object(Some(id)) => heap.get_string(*id).unwrap_or("").to_string(),
                 Value::Object(None) => "null".to_string(),
             };
-            let sid = heap.alloc_string(s);
+            let sid = new_string(heap, s);
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         } else if method_name == "equals" && args.len() >= 2 {
             let s1 = args[0].as_obj().and_then(|id| heap.get_string(id));
@@ -4252,10 +4622,19 @@ pub fn dispatch_builtin(
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("");
-            let res = match s1.cmp(s2) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
+            // Java compares UTF-16 code units and returns their difference, so
+            // an astral character sorts by its surrogates, not by its code
+            // point.
+            let mut left = s1.encode_utf16();
+            let mut right = s2.encode_utf16();
+            let res = loop {
+                match (left.next(), right.next()) {
+                    (Some(a), Some(b)) if a == b => {}
+                    (Some(a), Some(b)) => break a as i32 - b as i32,
+                    (Some(_), None) => break 1,
+                    (None, Some(_)) => break -1,
+                    (None, None) => break 0,
+                }
             };
             return BuiltinResult::Handled(Value::Int(res));
         } else if method_name == "compareToIgnoreCase" && args.len() >= 2 {
@@ -4273,88 +4652,243 @@ pub fn dispatch_builtin(
                 std::cmp::Ordering::Greater => 1,
             };
             return BuiltinResult::Handled(Value::Int(res));
-        } else if method_name == "toLowerCase" && !args.is_empty() {
+        } else if (method_name == "toLowerCase" || method_name == "toUpperCase") && !args.is_empty()
+        {
             let s = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("");
-            let sid = heap.alloc_string(s.to_lowercase());
-            return BuiltinResult::Handled(Value::Object(Some(sid)));
-        } else if method_name == "toUpperCase" && !args.is_empty() {
-            let s = args[0]
-                .as_obj()
-                .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            let sid = heap.alloc_string(s.to_uppercase());
+            // A conversion that changes nothing answers the same object, which
+            // is what a JVM's `toLowerCase` does.
+            let converted = if method_name == "toLowerCase" {
+                s.to_lowercase()
+            } else {
+                s.to_uppercase()
+            };
+            if converted == s {
+                return BuiltinResult::Handled(args[0].clone());
+            }
+            let sid = new_string(heap, converted);
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         } else if (method_name == "trim" || method_name == "strip") && !args.is_empty() {
             let s = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let sid = heap.alloc_string(s);
+                .unwrap_or("");
+            // `trim` strips only characters at or below U+0020; `strip` strips
+            // `Character.isWhitespace`. They differ on NBSP, which `trim`
+            // keeps. Either answers the same object when nothing is stripped.
+            let stripped = if method_name == "trim" {
+                java_trim(s)
+            } else {
+                java_strip(s)
+            };
+            if stripped == s {
+                return BuiltinResult::Handled(args[0].clone());
+            }
+            let sid = new_string(heap, stripped.to_string());
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         } else if method_name == "substring" && args.len() >= 2 {
             let s = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("");
-            let chars: Vec<char> = s.chars().collect();
-            let start = args[1].as_int().max(0) as usize;
-            let end = args
-                .get(2)
-                .map(|v| v.as_int().max(0) as usize)
-                .unwrap_or(chars.len())
-                .min(chars.len());
-            let out: String = chars
-                .get(start.min(chars.len())..end.max(start.min(chars.len())))
-                .unwrap_or_default()
-                .iter()
-                .collect();
-            let sid = heap.alloc_string(out);
+            // Indices are UTF-16 code units, and an out-of-range one throws
+            // `StringIndexOutOfBoundsException` rather than clamping.
+            let units = utf16_units(s);
+            let length = units.len();
+            let start = args[1].as_int();
+            let end = args.get(2).map(Value::as_int).unwrap_or(length as i32);
+            let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+                return sioobe(heap, &units, start, end);
+            };
+            if start > end || end > length {
+                return sioobe(heap, &units, start as i32, end as i32);
+            }
+            // A range covering the whole string is the string itself.
+            if start == 0 && end == length {
+                return BuiltinResult::Handled(args[0].clone());
+            }
+            let sid = new_string(heap, text_of_units(&units[start..end]));
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         } else if method_name == "charAt" && args.len() >= 2 {
             let s = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("");
-            let ch = s
-                .chars()
-                .nth(args[1].as_int().max(0) as usize)
-                .unwrap_or('\0');
-            return BuiltinResult::Handled(Value::Int(ch as i32));
+            let units = utf16_units(s);
+            let index = args[1].as_int();
+            match usize::try_from(index).ok().and_then(|i| units.get(i)) {
+                Some(unit) => return BuiltinResult::Handled(Value::Int(*unit as i32)),
+                None => {
+                    return BuiltinResult::Threw(crate::num_builtins::exception(
+                        heap,
+                        "java/lang/StringIndexOutOfBoundsException",
+                        &format!("Index {index} out of bounds for length {}", units.len()),
+                    ));
+                }
+            }
+        } else if method_name == "codePointAt" && args.len() >= 2 {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let units = utf16_units(s);
+            let index = args[1].as_int();
+            let Some(first) = usize::try_from(index).ok().and_then(|i| units.get(i)) else {
+                return BuiltinResult::Threw(crate::num_builtins::exception(
+                    heap,
+                    "java/lang/StringIndexOutOfBoundsException",
+                    &format!("Index {index} out of bounds for length {}", units.len()),
+                ));
+            };
+            let codepoint = match (first, units.get(index as usize + 1)) {
+                (0xD800..=0xDBFF, Some(low @ 0xDC00..=0xDFFF)) => {
+                    0x10000 + (((*first as i32) - 0xD800) << 10) + ((*low as i32) - 0xDC00)
+                }
+                (unit, _) => *unit as i32,
+            };
+            return BuiltinResult::Handled(Value::Int(codepoint));
+        } else if method_name == "codePointBefore" && args.len() >= 2 {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let units = utf16_units(s);
+            let index = args[1].as_int();
+            let Some(position) = usize::try_from(index)
+                .ok()
+                .filter(|i| *i >= 1 && *i <= units.len())
+            else {
+                return BuiltinResult::Threw(crate::num_builtins::exception(
+                    heap,
+                    "java/lang/StringIndexOutOfBoundsException",
+                    &format!("Index {index} out of bounds for length {}", units.len()),
+                ));
+            };
+            // `position >= 1`, so `position - 1` is a valid index; there is no
+            // earlier unit to look at for the first position.
+            let first = units[position - 1];
+            let second = position.checked_sub(2).and_then(|i| units.get(i)).copied();
+            let codepoint = match (second, first) {
+                (Some(high), first)
+                    if (0xD800..=0xDBFF).contains(&high) && (0xDC00..=0xDFFF).contains(&first) =>
+                {
+                    0x10000 + ((high as i32 - 0xD800) << 10) + (first as i32 - 0xDC00)
+                }
+                _ => first as i32,
+            };
+            return BuiltinResult::Handled(Value::Int(codepoint));
+        } else if method_name == "codePointCount" && args.len() >= 3 {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let units = utf16_units(s);
+            let (begin, end) = (args[1].as_int(), args[2].as_int());
+            let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end)) else {
+                return sioobe(heap, &units, begin, end);
+            };
+            if begin > end || end > units.len() {
+                return sioobe(heap, &units, begin as i32, end as i32);
+            }
+            let mut count = 0usize;
+            let mut index = begin;
+            while index < end {
+                let unit = units[index];
+                index += if (0xD800..=0xDBFF).contains(&unit)
+                    && index + 1 < end
+                    && (0xDC00..=0xDFFF).contains(&units[index + 1])
+                {
+                    2
+                } else {
+                    1
+                };
+                count += 1;
+            }
+            return BuiltinResult::Handled(Value::Int(count as i32));
+        } else if method_name == "offsetByCodePoints" && args.len() >= 3 {
+            let s = args[0]
+                .as_obj()
+                .and_then(|id| heap.get_string(id))
+                .unwrap_or("");
+            let units = utf16_units(s);
+            let start = args[1].as_int();
+            let Some(mut index) = usize::try_from(start).ok().filter(|i| *i <= units.len()) else {
+                return sioobe(heap, &units, start, start);
+            };
+            let mut left = args[2].as_int();
+            while left > 0 {
+                if index >= units.len() {
+                    return sioobe(heap, &units, index as i32, units.len() as i32);
+                }
+                index += 1;
+                if (0xD800..=0xDBFF).contains(&units[index - 1])
+                    && index < units.len()
+                    && (0xDC00..=0xDFFF).contains(&units[index])
+                {
+                    index += 1;
+                }
+                left -= 1;
+            }
+            while left < 0 {
+                if index == 0 {
+                    return sioobe(heap, &units, 0, units.len() as i32);
+                }
+                index -= 1;
+                if (0xDC00..=0xDFFF).contains(&units[index])
+                    && index > 0
+                    && (0xD800..=0xDBFF).contains(&units[index - 1])
+                {
+                    index -= 1;
+                }
+                left += 1;
+            }
+            return BuiltinResult::Handled(Value::Int(index as i32));
         } else if method_name == "contains" && args.len() >= 2 {
-            let s1 = args[0]
+            let haystack = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            let s2 = args[1]
+                .map(utf16_units)
+                .unwrap_or_default();
+            let needle = args[1]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            return BuiltinResult::Handled(Value::from_bool(s1.contains(s2)));
+                .map(utf16_units)
+                .unwrap_or_default();
+            return BuiltinResult::Handled(Value::from_bool(
+                index_of_units(&haystack, &needle, 0).is_some(),
+            ));
         } else if method_name == "startsWith" && args.len() >= 2 {
-            let s1 = args[0]
+            let text = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            let s2 = args[1]
+                .map(utf16_units)
+                .unwrap_or_default();
+            let prefix = args[1]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            return BuiltinResult::Handled(Value::from_bool(s1.starts_with(s2)));
+                .map(utf16_units)
+                .unwrap_or_default();
+            let offset = args.get(2).map(Value::as_int).unwrap_or(0).max(0) as usize;
+            let starts = offset <= text.len()
+                && text[offset..].len() >= prefix.len()
+                && text[offset..offset + prefix.len()] == prefix[..];
+            return BuiltinResult::Handled(Value::from_bool(starts));
         } else if method_name == "endsWith" && args.len() >= 2 {
-            let s1 = args[0]
+            let text = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            let s2 = args[1]
+                .map(utf16_units)
+                .unwrap_or_default();
+            let suffix = args[1]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
-                .unwrap_or("");
-            return BuiltinResult::Handled(Value::from_bool(s1.ends_with(s2)));
+                .map(utf16_units)
+                .unwrap_or_default();
+            let ends =
+                text.len() >= suffix.len() && text[text.len() - suffix.len()..] == suffix[..];
+            return BuiltinResult::Handled(Value::from_bool(ends));
         } else if method_name == "isEmpty" && !args.is_empty() {
             let s = args[0]
                 .as_obj()
@@ -4362,15 +4896,13 @@ pub fn dispatch_builtin(
                 .unwrap_or("");
             return BuiltinResult::Handled(Value::from_bool(s.is_empty()));
         } else if method_name == "hashCode" && !args.is_empty() {
+            // Over UTF-16 code units, so a string hashes as it does on a JVM
+            // (hashing the UTF-8 bytes gives a different value for `é`).
             let s = args[0]
                 .as_obj()
                 .and_then(|id| heap.get_string(id))
                 .unwrap_or("");
-            let mut h: i32 = 0;
-            for b in s.bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as i32);
-            }
-            return BuiltinResult::Handled(Value::Int(h));
+            return BuiltinResult::Handled(Value::Int(java_string_hash(s)));
         } else if method_name == "format" && !args.is_empty() {
             let (fmt_str, varargs_val) = if args.len() >= 3 {
                 (
@@ -4408,7 +4940,7 @@ pub fn dispatch_builtin(
                     }
                 }
             }
-            let sid = heap.alloc_string(formatted);
+            let sid = new_string(heap, formatted);
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         }
     }
@@ -4454,7 +4986,9 @@ pub fn dispatch_builtin(
         if method_name == "requireNonNull" && !args.is_empty() {
             return BuiltinResult::Handled(args[0].clone());
         } else if method_name == "equals" && args.len() >= 2 {
-            return BuiltinResult::Handled(Value::from_bool(args[0] == args[1]));
+            // `Objects.equals` is `a == b || a.equals(b)`, so strings and
+            // boxed values compare by value.
+            return BuiltinResult::Handled(Value::from_bool(java_equals(heap, &args[0], &args[1])));
         } else if method_name == "hashCode" && !args.is_empty() {
             return BuiltinResult::Handled(Value::Int(args[0].as_int()));
         } else if method_name == "isNull" && !args.is_empty() {
@@ -4668,10 +5202,18 @@ pub fn dispatch_builtin(
             return BuiltinResult::Handled(Value::NULL);
         } else if matches!(method_name, "contains" | "indexOf" | "lastIndexOf") && args.len() == 2 {
             if let Some(JavaObject::List(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
+                // `List.contains`/`indexOf` use `equals`, not identity, so an
+                // equal string or boxed value that is a different object still
+                // matches (`sb.toString()` results are no longer the literal's
+                // object).
                 let position = if method_name == "lastIndexOf" {
-                    items.iter().rposition(|item| *item == args[1])
+                    items
+                        .iter()
+                        .rposition(|item| java_equals(heap, item, &args[1]))
                 } else {
-                    items.iter().position(|item| *item == args[1])
+                    items
+                        .iter()
+                        .position(|item| java_equals(heap, item, &args[1]))
                 };
                 return BuiltinResult::Handled(if method_name == "contains" {
                     Value::from_bool(position.is_some())
@@ -4701,7 +5243,9 @@ pub fn dispatch_builtin(
             let wanted = collection_items(heap, &args[1]);
             if let Some(JavaObject::List(items)) = args[0].as_obj().and_then(|id| heap.get(id)) {
                 return BuiltinResult::Handled(Value::from_bool(
-                    wanted.iter().all(|w| items.contains(w)),
+                    wanted
+                        .iter()
+                        .all(|w| items.iter().any(|item| java_equals(heap, item, w))),
                 ));
             }
         } else if method_name == "iterator" && !args.is_empty() {
@@ -4937,7 +5481,7 @@ pub fn dispatch_builtin(
         } else if method_name == "requireNonNull" && !args.is_empty() {
             return BuiltinResult::Handled(args[0].clone());
         } else if method_name == "equals" && args.len() >= 2 {
-            return BuiltinResult::Handled(Value::from_bool(args[0] == args[1]));
+            return BuiltinResult::Handled(Value::from_bool(java_equals(heap, &args[0], &args[1])));
         }
     }
 
@@ -5251,8 +5795,14 @@ pub fn dispatch_builtin(
         } else if method_name == "add" && args.len() >= 2 {
             let item = args[1].clone();
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
-                    if !items.contains(&item) {
+                let present = match heap.get(id) {
+                    Some(JavaObject::Set(items)) => {
+                        items.iter().any(|have| java_equals(heap, have, &item))
+                    }
+                    _ => true,
+                };
+                if !present {
+                    if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
                         items.push(item);
                         return BuiltinResult::Handled(Value::from_bool(true));
                     }
@@ -5262,9 +5812,15 @@ pub fn dispatch_builtin(
         } else if method_name == "remove" && args.len() >= 2 {
             let item = &args[1];
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
-                    if let Some(pos) = items.iter().position(|x| x == item) {
-                        items.remove(pos);
+                let position = match heap.get(id) {
+                    Some(JavaObject::Set(items)) => {
+                        items.iter().position(|x| java_equals(heap, x, item))
+                    }
+                    _ => None,
+                };
+                if let Some(position) = position {
+                    if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
+                        items.remove(position);
                         return BuiltinResult::Handled(Value::from_bool(true));
                     }
                 }
@@ -5281,7 +5837,9 @@ pub fn dispatch_builtin(
             let item = &args[1];
             if let Some(id) = args[0].as_obj() {
                 if let Some(JavaObject::Set(items)) = heap.get(id) {
-                    return BuiltinResult::Handled(Value::from_bool(items.contains(item)));
+                    return BuiltinResult::Handled(Value::from_bool(
+                        items.iter().any(|have| java_equals(heap, have, item)),
+                    ));
                 }
             }
             return BuiltinResult::Handled(Value::from_bool(false));
@@ -5306,12 +5864,19 @@ pub fn dispatch_builtin(
         {
             let other = collection_items(heap, &args[1]);
             if let Some(id) = args[0].as_obj() {
-                if let Some(JavaObject::Set(items)) = heap.get_mut(id) {
+                // Decide membership with `equals` before taking the mutable
+                // borrow the update needs.
+                let current = match heap.get(id) {
+                    Some(JavaObject::Set(items)) => Some(items.clone()),
+                    _ => None,
+                };
+                if let Some(items) = current {
+                    let mut items = items;
                     let changed = match method_name {
                         "addAll" => {
                             let before = items.len();
                             for item in other {
-                                if !items.contains(&item) {
+                                if !items.iter().any(|have| java_equals(heap, have, &item)) {
                                     items.push(item);
                                 }
                             }
@@ -5319,16 +5884,27 @@ pub fn dispatch_builtin(
                         }
                         "removeAll" => {
                             let before = items.len();
-                            items.retain(|item| !other.contains(item));
+                            items.retain(|item| {
+                                !other.iter().any(|remove| java_equals(heap, item, remove))
+                            });
                             items.len() != before
                         }
                         "retainAll" => {
                             let before = items.len();
-                            items.retain(|item| other.contains(item));
+                            items.retain(|item| {
+                                other.iter().any(|keep| java_equals(heap, item, keep))
+                            });
                             items.len() != before
                         }
-                        _ => other.iter().all(|item| items.contains(item)),
+                        _ => other
+                            .iter()
+                            .all(|wanted| items.iter().any(|item| java_equals(heap, item, wanted))),
                     };
+                    // Write the (possibly filtered) set back: `removeAll` and
+                    // `retainAll` changed the copy this matched on.
+                    if let Some(JavaObject::Set(stored)) = heap.get_mut(id) {
+                        *stored = items;
+                    }
                     return BuiltinResult::Handled(Value::from_bool(changed));
                 }
             }
@@ -9079,14 +9655,16 @@ pub fn dispatch_builtin(
             let other = args[1].clone();
             if let Some(this_id) = this_id {
                 let other_text = if let Some(oid) = other.as_obj() {
-                    if let Some(s) = heap.get_string(oid) {
-                        Some(s.to_string())
-                    } else if let Some(JavaObject::Instance { fields, .. }) = heap.get(oid) {
-                        fields
-                            .get("text")
-                            .and_then(|v| v.as_obj())
-                            .and_then(|sid| heap.get_string(sid))
-                            .map(str::to_string)
+                    // `text_of_value` reads a component's own text AND its
+                    // siblings, which is what Java's `getString()` answers.
+                    // Reading only the `text` field dropped every appended
+                    // component whose content lived in `siblings`, so a title
+                    // rebuilt as `root.append(padding).append(word)` came out
+                    // empty.
+                    if heap.get_string(oid).is_some() {
+                        heap.get_string(oid).map(str::to_string)
+                    } else if matches!(heap.get(oid), Some(JavaObject::Instance { .. })) {
+                        Some(text_of_value(heap, &other))
                     } else {
                         None
                     }
@@ -9134,18 +9712,36 @@ pub fn dispatch_builtin(
             }
             return BuiltinResult::Handled(args[0].clone());
         } else if method_name == "getString" && !args.is_empty() {
+            // Java's `Component.getString()` concatenates the component's own
+            // text and every sibling's, recursively. A centring mixin rebuilds a
+            // title as a component whose own text is empty and whose content is
+            // in `siblings` (or the reverse); answering only `text` made such a
+            // title render blank while its frame and item model still drew.
             if let Some(id) = args[0].as_obj() {
                 if heap.get_string(id).is_some() {
                     return BuiltinResult::Handled(Value::Object(Some(id)));
-                } else if let Some(JavaObject::Instance { fields, .. }) = heap.get(id) {
-                    if let Some(Value::Object(Some(sid))) = fields.get("text") {
-                        return BuiltinResult::Handled(Value::Object(Some(*sid)));
-                    }
+                }
+                if matches!(heap.get(id), Some(JavaObject::Instance { .. })) {
+                    let text = text_of_value(heap, &args[0]);
+                    let sid = heap.alloc_string_uninterned(text);
+                    return BuiltinResult::Handled(Value::Object(Some(sid)));
                 }
             }
             let sid = heap.alloc_string("");
             return BuiltinResult::Handled(Value::Object(Some(sid)));
         } else if (method_name == "copy" || method_name == "plainCopy") && !args.is_empty() {
+            // A real copy: Java's `Component.copy()` answers a NEW component that
+            // shares its style and siblings. Answering the receiver itself makes
+            // a mod that copies and then mutates the copy destroy the original —
+            // Legendary Tooltips blanks a copied title's text before rebuilding
+            // it, which took the host's own title with it.
+            if let Some(id) = args[0].as_obj() {
+                if let Some(JavaObject::Instance { class_name, fields }) = heap.get(id) {
+                    let (class_name, fields) = (class_name.clone(), fields.clone());
+                    let copy = heap.alloc(JavaObject::Instance { class_name, fields });
+                    return BuiltinResult::Handled(Value::Object(Some(copy)));
+                }
+            }
             return BuiltinResult::Handled(args[0].clone());
         } else if method_name == "getSiblings" && !args.is_empty() {
             if let Some(id) = args[0].as_obj() {

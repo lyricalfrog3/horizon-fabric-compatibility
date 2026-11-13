@@ -35,6 +35,12 @@ macro_rules! native {
             fn as_any_mut(&mut self) -> &mut dyn Any {
                 self
             }
+            fn held_ids(&self) -> Vec<usize> {
+                // The three text natives are `Console` (a `String` line),
+                // `CharReader` (decoded `char`s) and `StringSink` (written
+                // text): none holds a heap id.
+                Vec::new()
+            }
         }
     };
 }
@@ -55,8 +61,13 @@ fn string_of(heap: &Heap, value: &Value) -> Option<String> {
     heap.get_string(value.as_obj()?).map(str::to_string)
 }
 
+/// Allocate a NEW string object. Every `String` method that returns a string
+/// (a case conversion, a slice, `concat`, `replace`, `trim`, ...) allocates a
+/// fresh object in Java: only literals and `String.intern()` are shared, so two
+/// results with the same text are different objects. `Heap::alloc_string`
+/// interns by text, so it must not be used here.
 fn alloc_str(heap: &mut Heap, s: impl Into<String>) -> Value {
-    Value::Object(Some(heap.alloc_string(s)))
+    Value::Object(Some(crate::builtins::new_string(heap, s)))
 }
 
 fn byte_array(heap: &mut Heap, bytes: &[u8]) -> Value {
@@ -157,39 +168,87 @@ pub fn text_method(
             return handled(Value::NULL);
         }
         ("java/lang/String", "indexOf" | "lastIndexOf") if args.len() >= 2 => {
-            let text: Vec<char> = string_of(heap, &args[0])?.chars().collect();
-            let needle: Vec<char> = match &args[1] {
-                Value::Int(c) => vec![char::from_u32(*c as u32)?],
-                other => string_of(heap, other)?.chars().collect(),
+            // Indices are UTF-16 code units: `"a😀b".indexOf("b")` is 3, not 2,
+            // and an `int` argument is ONE code unit (a surrogate is a legal
+            // needle, and a value above 0xFFFF is not a character at all and
+            // matches nothing).
+            let text = crate::builtins::utf16_units(&string_of(heap, &args[0])?);
+            let needle: Vec<u16> = match &args[1] {
+                // `indexOf(int)`: a BMP value is one code unit, and a
+                // supplementary code point is the pair of surrogates that
+                // encodes it (Java searches for the code point, not the unit).
+                Value::Int(c) if (0..=0xFFFF).contains(c) => vec![*c as u16],
+                Value::Int(c) => match u32::try_from(*c).ok().and_then(char::from_u32) {
+                    Some(c) => c.encode_utf16(&mut [0; 2]).to_vec(),
+                    None => return handled(Value::Int(-1)),
+                },
+                other => crate::builtins::utf16_units(&string_of(heap, other)?),
             };
             let last = method_name == "lastIndexOf";
-            let found = if needle.is_empty() || needle.len() > text.len() {
-                if needle.is_empty() { Some(0) } else { None }
-            } else if last {
-                let from = args.get(2).map_or(text.len() - needle.len(), |v| {
-                    (v.as_int().max(0) as usize).min(text.len() - needle.len())
-                });
-                (0..=from)
-                    .rev()
-                    .find(|&i| text[i..i + needle.len()] == needle[..])
+            let found = if last {
+                // A negative start answers -1 in Java, and the default start is
+                // the last place the needle still fits.
+                let from = match args.get(2) {
+                    None => text.len(),
+                    Some(v) => usize::try_from(v.as_int()).ok().unwrap_or(0),
+                };
+                if args.get(2).is_some_and(|v| v.as_int() < 0) {
+                    None
+                } else {
+                    crate::builtins::last_index_of_units_at(&text, &needle, from)
+                }
             } else {
-                let from = args.get(2).map_or(0, |v| v.as_int().max(0) as usize);
-                (from..=text.len() - needle.len())
-                    .find(|&i| text[i..i + needle.len()] == needle[..])
+                let from = args.get(2).map(|v| v.as_int().max(0) as usize).unwrap_or(0);
+                crate::builtins::index_of_units_from(&text, &needle, from)
             };
             return handled(Value::Int(found.map_or(-1, |i| i as i32)));
         }
         ("java/lang/String", "replace") if args.len() == 3 => {
+            // `replace(char, char)` works on code units, so it can replace half
+            // of a surrogate pair; `replace(CharSequence, CharSequence)` works
+            // on text. A replacement that changes nothing answers this string.
             let text = string_of(heap, &args[0])?;
-            let as_text = |v: &Value, heap: &Heap| match v {
-                Value::Int(c) => char::from_u32(*c as u32).map(String::from),
-                other => string_of(heap, other),
+            let replaced = match (&args[1], &args[2]) {
+                (Value::Int(from), Value::Int(to)) => {
+                    let (from, to) = (*from as u16, *to as u16);
+                    if from == to {
+                        None
+                    } else {
+                        let units: Vec<u16> = text
+                            .encode_utf16()
+                            .map(|unit| if unit == from { to } else { unit })
+                            .collect();
+                        // Java answers this string when nothing matched.
+                        (crate::builtins::text_of_units(&units) != text)
+                            .then(|| crate::builtins::text_of_units(&units))
+                    }
+                }
+                other => {
+                    let (Value::Object(Some(_)) | Value::Object(None), _) = other else {
+                        return None;
+                    };
+                    let from = string_of(heap, &args[1])?;
+                    let to = string_of(heap, &args[2])?;
+                    if from.is_empty() || !text.contains(&from) {
+                        None
+                    } else {
+                        Some(text.replace(&from, &to))
+                    }
+                }
             };
-            let (from, to) = (as_text(&args[1], heap)?, as_text(&args[2], heap)?);
-            return handled(alloc_str(heap, text.replace(&from, &to)));
+            return handled(match replaced {
+                Some(text) => alloc_str(heap, text),
+                None => args[0].clone(),
+            });
         }
         ("java/lang/String", "concat") if args.len() == 2 => {
-            let text = string_of(heap, &args[0])? + &string_of(heap, &args[1])?;
+            let other = string_of(heap, &args[1])?;
+            // `concat` answers this string when the argument is empty, and
+            // allocates a new one otherwise.
+            if other.is_empty() {
+                return handled(args[0].clone());
+            }
+            let text = string_of(heap, &args[0])? + &other;
             return handled(alloc_str(heap, text));
         }
         ("java/lang/String", "isBlank") => {

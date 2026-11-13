@@ -2107,7 +2107,7 @@ fn java_double_hex(value: f64) -> String {
 
 /// Java's `Float.toHexString`, the `f32` form of [`java_double_hex`].
 fn java_float_hex(value: f32) -> String {
-    java_double_hex(value as f64).replace("p", "p")
+    java_double_hex(value as f64)
 }
 
 /// Java's `Character.isTitleCase`: the category is `Lt`.

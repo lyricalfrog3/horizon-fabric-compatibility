@@ -1351,7 +1351,7 @@ fn round_half_even(value: f64, digits: u32) -> String {
     let remainder = scaled - floor;
     let rounded = if (remainder - 0.5).abs() < f64::EPSILON * scaled.abs().max(1.0) {
         // A tie: pick the even neighbour.
-        if (floor as u64) % 2 == 0 {
+        if (floor as u64).is_multiple_of(2) {
             floor
         } else {
             floor + 1.0
@@ -4345,9 +4345,8 @@ fn dispatch_builtin_inner(
                 }));
             }
             let (a, b) = (args[0].as_int(), args[1].as_int());
-            return BuiltinResult::Handled(Value::Int(if b == 0 {
-                0
-            } else if a == i32::MIN && b == -1 {
+            // Division by zero and `MIN % -1` both leave a zero modulus here.
+            return BuiltinResult::Handled(Value::Int(if b == 0 || (a == i32::MIN && b == -1) {
                 0
             } else {
                 let m = a % b;
@@ -8005,9 +8004,7 @@ fn dispatch_builtin_inner(
             }
             return BuiltinResult::Handled(if method_name == "containsPointInScissor" {
                 Value::from_bool(true)
-            } else if method_name == "guiWidth" {
-                Value::Int(0)
-            } else if method_name == "guiHeight" {
+            } else if method_name == "guiWidth" || method_name == "guiHeight" {
                 Value::Int(0)
             } else {
                 Value::NULL
@@ -8462,16 +8459,14 @@ fn dispatch_builtin_inner(
             let size = match args.get(2) {
                 Some(Value::Long(size)) => *size,
                 Some(Value::Int(size)) => i64::from(*size),
-                _ => match args
+                _ => args
                     .get(2)
                     .and_then(|v| v.as_obj())
                     .and_then(|id| match heap.get(id) {
                         Some(JavaObject::Array { elements, .. }) => Some(elements.len() as i64),
                         _ => None,
-                    }) {
-                    Some(size) => size,
-                    None => 0,
-                },
+                    })
+                    .unwrap_or_default(),
             };
             let mut fields = HashMap::new();
             fields.insert("size".to_string(), Value::Long(size));

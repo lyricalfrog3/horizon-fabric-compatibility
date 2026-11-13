@@ -58,16 +58,10 @@ jobs:
 
       # `--no-deps` keeps clippy off the Horizon submodule's own crates, which
       # are path dependencies this repository does not own.
-      - name: Clippy (installer crates)
+      - name: Clippy
         run: >
-          cargo clippy -p hfc-core -p hfc-fabric -p hfc-cache -p hfc-bootstrap
-          -p hfc-cli --all-targets --no-deps -- -D warnings
-
-      # The runtime has never been lint-clean (dead code, needless clones), so
-      # its findings are reported without failing the job until they are fixed.
-      - name: Clippy (runtime, advisory)
-        continue-on-error: true
-        run: cargo clippy -p hfc-runtime --all-targets --no-deps -- -D warnings
+          cargo clippy -p hfc-core -p hfc-fabric -p hfc-cache -p hfc-runtime
+          -p hfc-bootstrap -p hfc-cli --all-targets --no-deps -- -D warnings
 
       - name: Installer crates
         run: cargo test -p hfc-core -p hfc-fabric -p hfc-cache -p hfc-bootstrap -p hfc-cli

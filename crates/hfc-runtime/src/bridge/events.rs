@@ -283,7 +283,7 @@ impl FabricBridge {
             "com/anthonyhilyard/iceberg/events/client/RenderTickEvents$Start",
             "onStart",
             "(Lnet/minecraft/client/DeltaTracker;)V",
-            &[Value::Object(Some(tracker.clone()))],
+            &[Value::Object(Some(tracker))],
         );
         let _ = self.dispatch_event(
             "com/anthonyhilyard/prism/events/client/RenderTickEvent",
@@ -924,7 +924,7 @@ impl FabricBridge {
                         "com/anthonyhilyard/iceberg/util/Tooltips",
                         "getClientComponent",
                         "(Lnet/minecraft/world/inventory/tooltip/TooltipComponent;)Lnet/minecraft/client/gui/screens/inventory/tooltip/ClientTooltipComponent;",
-                        &[component.clone()],
+                        std::slice::from_ref(&component),
                     )
                     .unwrap_or(Value::NULL);
                 if client.is_null()

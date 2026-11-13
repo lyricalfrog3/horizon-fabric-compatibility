@@ -342,7 +342,7 @@ fn inflate(body: &[u8], expected: usize) -> Result<Vec<u8>> {
         Ok(_) => Ok(out),
         Err(_) => {
             let mut out = Vec::with_capacity(expected);
-            let mut decoder = flate2::read::DeflateDecoder::new(body);
+            let decoder = flate2::read::DeflateDecoder::new(body);
             decoder
                 .take(limit.saturating_add(1))
                 .read_to_end(&mut out)

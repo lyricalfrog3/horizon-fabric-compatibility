@@ -90,7 +90,7 @@ impl Interpreter {
         }
         // `AbstractContainerMenu.slots`: a `NonNullList<Slot>`.
         let slots = self
-            .execute_method(MENU, "slotCount", "()I", &[menu.clone()])
+            .execute_method(MENU, "slotCount", "()I", std::slice::from_ref(&menu))
             .ok()
             .map(|value| value.as_int())
             .filter(|count| *count > 0)

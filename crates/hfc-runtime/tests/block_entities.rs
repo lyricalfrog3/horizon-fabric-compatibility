@@ -15,6 +15,7 @@ use hfc_runtime::value::Value;
 use std::path::PathBuf;
 
 const POT: &str = "farmersdelight:cooking_pot";
+#[allow(dead_code)]
 const POT_STATE: &str = "facing=north,support=none,waterlogged=false";
 
 fn root() -> PathBuf {
@@ -953,7 +954,7 @@ fn a_mod_formatting_a_date_reaches_no_tzdata_native() {
             "java/util/TimeZone",
             "getID",
             "()Ljava/lang/String;",
-            &[timezone.clone()],
+            std::slice::from_ref(&timezone),
         )
         .expect("TimeZone.getID threw");
     assert!(

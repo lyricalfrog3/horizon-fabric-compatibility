@@ -427,7 +427,7 @@ fn the_mod_list_search_box_accepts_focus_and_filters_the_list() {
         .expect("the unfiltered mod count was not rendered")
         .to_string();
     assert!(
-        !before_texts.iter().any(|text| *text == "Search for mods"),
+        !before_texts.contains(&"Search for mods"),
         "a search hint appeared even though Mod Menu never calls setHint: {before_texts:?}"
     );
     assert!(

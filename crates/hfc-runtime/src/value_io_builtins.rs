@@ -129,9 +129,7 @@ pub fn dispatch(
     }
     let this = args.first()?.as_obj()?;
     let output = class_name == OUTPUT;
-    if heap.get_native::<ValueTreeNode>(this).is_none() {
-        return None;
-    }
+    heap.get_native::<ValueTreeNode>(this)?;
     let key = |index: usize| -> Option<String> {
         let value = args.get(index)?;
         Some(text_of(heap, value))
@@ -208,7 +206,7 @@ pub fn dispatch(
             Some(Value::NULL)
         }
         (true, "putIntArray") => {
-            let Some(k) = key(1) else { return None };
+            let k = key(1)?;
             let values = args
                 .get(2)
                 .and_then(Value::as_obj)

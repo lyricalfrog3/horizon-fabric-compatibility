@@ -80,7 +80,7 @@ fn started_bridge() -> Option<FabricBridge> {
             || name.starts_with("fabric-language")
             || name.starts_with("veinminer")
         {
-            bridge.load_mod_jar(&jar.path()).unwrap();
+            bridge.load_mod_jar(jar.path()).unwrap();
         }
     }
     bridge.load_registries(&registries);

@@ -62,7 +62,12 @@ impl Interpreter {
             return Ok(ContainerRead::NotVanillaContainer(class.replace('/', ".")));
         }
         let slots = self
-            .execute_method(CONTAINER, "getContainerSize", "()I", &[entity.clone()])?
+            .execute_method(
+                CONTAINER,
+                "getContainerSize",
+                "()I",
+                std::slice::from_ref(&entity),
+            )?
             .as_int();
         if slots <= 0 {
             return Err(failure(format!("getContainerSize() is {slots}")));
@@ -72,7 +77,7 @@ impl Interpreter {
                 "net/minecraft/world/MenuProvider",
                 "getDisplayName",
                 "()Lnet/minecraft/network/chat/Component;",
-                &[entity.clone()],
+                std::slice::from_ref(&entity),
             )
             .ok();
         let title = display

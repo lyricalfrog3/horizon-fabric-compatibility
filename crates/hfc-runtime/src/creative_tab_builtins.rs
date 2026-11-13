@@ -215,9 +215,7 @@ pub(crate) fn tab_items_method(
     args: &[Value],
 ) -> Option<BuiltinResult> {
     let this = args.first()?.as_obj()?;
-    if heap.get_native::<CreativeTabItems>(this).is_none() {
-        return None;
-    }
+    heap.get_native::<CreativeTabItems>(this)?;
     let item = |heap: &Heap, value: &Value| item_id(heap, value);
     let add = |heap: &mut Heap, item: String, after: Option<(&str, bool)>| {
         let Some(list) = heap.get_native_mut::<CreativeTabItems>(this) else {

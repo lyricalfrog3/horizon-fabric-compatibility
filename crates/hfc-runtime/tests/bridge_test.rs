@@ -72,7 +72,7 @@ fn test_fabric_bridge_right_click_harvest() {
         "rightclickharvest-fabric-4.6.2+26.3.x.jar",
     ] {
         bridge
-            .load_mod_jar(&root.join("test-mods").join(jar))
+            .load_mod_jar(root.join("test-mods").join(jar))
             .expect("load jar");
     }
 

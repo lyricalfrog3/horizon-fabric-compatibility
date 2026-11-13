@@ -254,7 +254,6 @@ impl Vfs {
             use std::io::Write;
             let file = std::fs::OpenOptions::new()
                 .create(true)
-                .write(true)
                 .append(true)
                 .open(real);
             return file.and_then(|mut f| f.write_all(bytes)).is_ok();

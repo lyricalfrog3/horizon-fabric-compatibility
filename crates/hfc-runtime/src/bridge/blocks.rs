@@ -79,6 +79,8 @@ pub struct BlockContainer {
 
 /// What reading a block's container found.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+// `Container` is large, but boxing it changes the type every caller matches on.
+#[allow(clippy::large_enum_variant)]
 pub enum ContainerRead {
     /// The block has no block entity (or none was asked for).
     #[default]
@@ -1076,7 +1078,7 @@ mod tests {
         level.mod_states.insert([4, 1, 4], 1234);
         assert!(level.destroy_block(&pos, false));
         assert_eq!(level.get_block_state(&pos).block.id, "minecraft:air");
-        assert!(level.mod_states.get(&[4, 1, 4]).is_none());
+        assert!(!level.mod_states.contains_key(&[4, 1, 4]));
         assert_eq!(level.broken, [(pos.clone(), false)]);
         // Nothing is there now: no removal is recorded.
         assert!(!level.destroy_block(&pos, true));
@@ -1087,6 +1089,7 @@ mod tests {
 /// A block entity as the host keeps it: the block it belongs to, its position,
 /// and the mod's own object.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // the host does not construct one yet
 pub struct BlockEntityKeeper {
     pub block: String,
     pub pos: [i32; 3],

@@ -280,7 +280,7 @@ pub fn injectors_from_class(class: &Class) -> Vec<MixinInjector> {
     targets.sort();
     targets.dedup();
 
-    for (_, method) in class.methods.iter() {
+    for method in class.methods.values() {
         let Some(inject) = method.annotations.iter().find(|annotation| {
             annotation.type_name == "org/spongepowered/asm/mixin/injection/Inject"
         }) else {
@@ -340,7 +340,7 @@ pub fn accessors_from_class(class: &Class) -> Vec<MixinAccessor> {
     let Some(target_class) = targets.first().cloned() else {
         return out;
     };
-    for (_, method) in class.methods.iter() {
+    for method in class.methods.values() {
         for annotation in &method.annotations {
             // Mixin accepts a full member reference (`name(descriptor)return`)
             // and keeps only the name; the generated bridge uses the
@@ -520,9 +520,7 @@ fn parse_member_ref(value: &str) -> Option<(String, String, String)> {
 /// The parameter types of a JVM method descriptor.
 pub fn descriptor_parameter_types(descriptor: &str) -> Vec<String> {
     fn parse_type(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
-        let Some(c) = chars.next() else {
-            return None;
-        };
+        let c = chars.next()?;
         let mut ty = String::new();
         match c {
             'L' => {

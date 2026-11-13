@@ -145,7 +145,7 @@ impl Interpreter {
         // The block's block entity, made the first time it is used: the mod's
         // own code reads it (`getBlockEntity` on the level answers it), and a
         // pot's contents live there.
-        let block_object = Value::Object(Some(block.clone()));
+        let block_object = Value::Object(Some(block));
         let _ = self.block_entity_at(
             &block_object,
             &request.block,

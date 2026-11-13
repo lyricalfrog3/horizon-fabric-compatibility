@@ -339,7 +339,7 @@ impl Interpreter {
     /// with none, which made every later callback fail at its first
     /// instruction; this keeps one failure from poisoning the next.
     pub(crate) fn with_budget<R>(&mut self, budget: u64, f: impl FnOnce(&mut Self) -> R) -> R {
-        let previous = std::mem::replace(&mut self.step_budget, Some(budget));
+        let previous = self.step_budget.replace(budget);
         let result = f(self);
         self.step_budget = previous;
         result
@@ -755,7 +755,7 @@ impl Interpreter {
                 let added = intersections.clone();
                 let wanted = target_type.to_string();
                 implemented == wanted
-                    || added.iter().any(|name| *name == wanted)
+                    || added.contains(&wanted)
                     || self.class_is_assignable_to(&implemented, &wanted)
             }
             JavaObject::Native(n) => {
@@ -802,7 +802,6 @@ impl Interpreter {
                 }
                 self.class_is_assignable_to(&cls, target_type)
             }
-            _ => false,
         }
     }
 
@@ -3334,7 +3333,8 @@ impl Interpreter {
     /// `getClass().getSimpleName()` are the real class's answers.
     pub(crate) fn new_exception(&mut self, class: &str, message: &str) -> Value {
         let text = Value::Object(Some(self.heap.alloc_string(message)));
-        let value = self.new_exception_with(class, "(Ljava/lang/String;)V", &[text.clone()]);
+        let value =
+            self.new_exception_with(class, "(Ljava/lang/String;)V", std::slice::from_ref(&text));
         // A class with no usable constructor still keeps its message where
         // `Throwable.getMessage` reads it.
         if let Some(JavaObject::Instance { fields, .. }) =
@@ -4369,10 +4369,6 @@ impl Interpreter {
                         }
                     }
                     let val = stack.pop().unwrap_or(Value::NULL);
-                    if class_name.contains("ServerConfigurationConnectionEvents")
-                        || (class_name == "java/nio/Buffer" && field_name == "UNSAFE")
-                    {
-                    }
                     if let Some(c) = self.loader.get_mut(&owner) {
                         c.static_fields.insert(field_name.clone(), val);
                     }
@@ -5199,10 +5195,6 @@ impl Interpreter {
                     && !(class_name.starts_with("java/")
                         && matches!(field_name, "NEXT" | "PREV" | "HEAD" | "TAIL" | "ITEM"));
                 if (!platform || jdk) && class.fields.get(field_name).is_some_and(|f| f.is_static) {
-                    if !self.building_exception
-                        && (class_name.starts_with("net/fabricmc/") || field_name == "UNSAFE")
-                    {
-                    }
                     return Value::NULL;
                 }
             }
@@ -5649,7 +5641,6 @@ fn natural_order(heap: &Heap, a: &Value, b: &Value) -> i32 {
         // A `boolean` and a `Character` both arrive as `Int`. Java orders
         // `false` before `true` (exactly what 0/1 gives) and a `char` by its
         // code unit, which is what the `Int` holds.
-        (Value::Int(a), Value::Int(b)) => a.cmp(b),
         _ => return 0,
     };
     ordering_to_int(order)
@@ -5823,85 +5814,6 @@ fn class_descriptor(name: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod exception_tests {
-    use super::*;
-    use crate::class::ExceptionHandler;
-
-    fn run(opcodes: Vec<Opcode>, handlers: Vec<ExceptionHandler>) -> Value {
-        let code = CodeInfo {
-            max_stack: 4,
-            max_locals: 0,
-            opcodes: opcodes.into_iter().enumerate().collect(),
-            handlers,
-        };
-        Interpreter::new()
-            .interpret_code("T", "m", "()I", &[], &code, &[])
-            .expect("the method runs")
-    }
-
-    fn catching(class: Option<&str>) -> Vec<ExceptionHandler> {
-        vec![ExceptionHandler {
-            start: 0,
-            end: 3,
-            handler: 4,
-            catch_type: class.map(str::to_string),
-        }]
-    }
-
-    fn divide_by_zero() -> Vec<Opcode> {
-        vec![
-            Opcode::Iconst(7),
-            Opcode::Iconst(0),
-            Opcode::Idiv,
-            Opcode::Ireturn,
-            Opcode::Pop,
-            Opcode::Iconst(-5),
-            Opcode::Ireturn,
-        ]
-    }
-
-    #[test]
-    fn a_handler_of_the_method_catches_division_by_zero() {
-        let result = run(
-            divide_by_zero(),
-            catching(Some("java/lang/ArithmeticException")),
-        );
-        assert_eq!(result.as_int(), -5);
-    }
-
-    #[test]
-    fn a_handler_for_another_class_does_not_catch_it() {
-        let result = run(
-            divide_by_zero(),
-            catching(Some("java/lang/IllegalStateException")),
-        );
-        assert_eq!(result.as_int(), 0, "falls through to the lenient result");
-    }
-
-    #[test]
-    fn a_catch_all_handler_catches_athrow() {
-        let result = run(
-            vec![
-                Opcode::Iconst(1),
-                Opcode::Pop,
-                Opcode::AconstNull,
-                Opcode::Athrow,
-                Opcode::Pop,
-                Opcode::Iconst(9),
-                Opcode::Ireturn,
-            ],
-            vec![ExceptionHandler {
-                start: 0,
-                end: 4,
-                handler: 4,
-                catch_type: None,
-            }],
-        );
-        assert_eq!(result.as_int(), 9);
-    }
-}
-
 /// Calls that copy the elements of a collection argument into a heap-modelled
 /// list or set.
 fn collection_copy_call(class_name: &str, method_name: &str) -> bool {
@@ -6000,5 +5912,84 @@ pub(crate) fn collection_skeleton(object: &JavaObject) -> Option<&'static str> {
         JavaObject::Set(_) => Some("java/util/AbstractSet"),
         JavaObject::Map(_) => Some("java/util/AbstractMap"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod exception_tests {
+    use super::*;
+    use crate::class::ExceptionHandler;
+
+    fn run(opcodes: Vec<Opcode>, handlers: Vec<ExceptionHandler>) -> Value {
+        let code = CodeInfo {
+            max_stack: 4,
+            max_locals: 0,
+            opcodes: opcodes.into_iter().enumerate().collect(),
+            handlers,
+        };
+        Interpreter::new()
+            .interpret_code("T", "m", "()I", &[], &code, &[])
+            .expect("the method runs")
+    }
+
+    fn catching(class: Option<&str>) -> Vec<ExceptionHandler> {
+        vec![ExceptionHandler {
+            start: 0,
+            end: 3,
+            handler: 4,
+            catch_type: class.map(str::to_string),
+        }]
+    }
+
+    fn divide_by_zero() -> Vec<Opcode> {
+        vec![
+            Opcode::Iconst(7),
+            Opcode::Iconst(0),
+            Opcode::Idiv,
+            Opcode::Ireturn,
+            Opcode::Pop,
+            Opcode::Iconst(-5),
+            Opcode::Ireturn,
+        ]
+    }
+
+    #[test]
+    fn a_handler_of_the_method_catches_division_by_zero() {
+        let result = run(
+            divide_by_zero(),
+            catching(Some("java/lang/ArithmeticException")),
+        );
+        assert_eq!(result.as_int(), -5);
+    }
+
+    #[test]
+    fn a_handler_for_another_class_does_not_catch_it() {
+        let result = run(
+            divide_by_zero(),
+            catching(Some("java/lang/IllegalStateException")),
+        );
+        assert_eq!(result.as_int(), 0, "falls through to the lenient result");
+    }
+
+    #[test]
+    fn a_catch_all_handler_catches_athrow() {
+        let result = run(
+            vec![
+                Opcode::Iconst(1),
+                Opcode::Pop,
+                Opcode::AconstNull,
+                Opcode::Athrow,
+                Opcode::Pop,
+                Opcode::Iconst(9),
+                Opcode::Ireturn,
+            ],
+            vec![ExceptionHandler {
+                start: 0,
+                end: 4,
+                handler: 4,
+                catch_type: None,
+            }],
+        );
+        assert_eq!(result.as_int(), 9);
     }
 }

@@ -627,7 +627,7 @@ pub fn scan_method_refs(bytes: &[u8]) -> Vec<(String, String, String)> {
                 }
                 offset += 4;
             }
-            9 | 10 | 11 => {
+            9..=11 => {
                 let (Some(owner), Some(name)) = (be_u16(bytes, offset), be_u16(bytes, offset + 2))
                 else {
                     break;

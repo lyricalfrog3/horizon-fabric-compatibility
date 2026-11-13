@@ -203,9 +203,7 @@ fn unix_file_system(
             // resolve(parent, child): an absolute child stands on its own.
             let parent = file_path(heap, &args[1])?;
             let child = file_path(heap, &args[2])?;
-            let joined = if child.starts_with('/') {
-                child
-            } else if parent.is_empty() {
+            let joined = if child.starts_with('/') || parent.is_empty() {
                 child
             } else {
                 vfs::join(&parent, &child)
@@ -483,7 +481,7 @@ pub fn file_system_method(
                 ("newFileSystem" | "getFileSystem" | "getPath", Some(_)) => {
                     handled(inert(heap, "java/nio/file/FileSystem"))
                 }
-                _ => return None,
+                _ => None,
             }
         }
         "java/nio/file/FileSystem" if method_name == "newWatchService" => {

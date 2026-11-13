@@ -22,6 +22,7 @@ const NEW_BLOCK_ENTITY: &str = "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/wor
 const GET_TICKER: &str = "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/block/entity/BlockEntityType;)Lnet/minecraft/world/level/block/entity/BlockEntityTicker;";
 const TICK: &str = "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/block/entity/BlockEntity;)V";
 
+#[allow(dead_code)] // kept for the container read path that is not wired in yet
 fn failure(message: impl Into<String>) -> Error {
     Error::new("interpreter", message.into())
 }
@@ -139,6 +140,7 @@ impl Interpreter {
     /// Whether the block's block entity is a container the mod's code fills
     /// itself: not a vanilla `BaseContainerBlockEntity`, but a `Container`
     /// (`CookingPotBlockEntity` holds an inventory of its own).
+    #[allow(dead_code)] // not wired into a caller yet
     pub(crate) fn block_entity_is_container(&mut self, entity: usize) -> bool {
         let class = match self.heap.get(entity) {
             Some(JavaObject::Instance { class_name, .. }) => class_name.clone(),
@@ -150,6 +152,7 @@ impl Interpreter {
     /// The read of a block whose block entity is a `Container` of the mod's
     /// own: its slot count, and the menu its `createMenu` builds. `None` when
     /// the entity is not a container.
+    #[allow(dead_code)] // not wired into a caller yet
     pub(crate) fn read_mod_container(&mut self, entity: usize) -> Result<Option<ContainerRead>> {
         let value = Value::Object(Some(entity));
         let class = match self.heap.get(entity) {

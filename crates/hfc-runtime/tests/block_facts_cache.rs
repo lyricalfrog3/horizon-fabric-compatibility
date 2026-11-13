@@ -119,7 +119,7 @@ fn cached_facts_are_the_facts_a_fresh_read_produces() {
         .store_block_facts_cache()
         .expect("the facts are written for the next start");
     assert!(written.is_file(), "{}", written.display());
-    assert_eq!(cache.files(), [written.clone()]);
+    assert_eq!(cache.files(), std::slice::from_ref(&written));
 
     // Warm: another start over the same classpath reads them back.
     let Some(warm) = bridge(&jars, &cache) else {

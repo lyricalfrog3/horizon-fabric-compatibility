@@ -301,7 +301,7 @@ impl Interpreter {
             PROPERTY,
             "getName",
             "()Ljava/lang/String;",
-            &[property.clone()],
+            std::slice::from_ref(property),
         )?;
         let name = self
             .text(&name)
@@ -310,7 +310,7 @@ impl Interpreter {
             PROPERTY,
             "getPossibleValues",
             "()Ljava/util/List;",
-            &[property.clone()],
+            std::slice::from_ref(property),
         )?;
         let mut names = Vec::new();
         for value in self.collection_elements(&values)? {
@@ -348,8 +348,12 @@ impl Interpreter {
         };
         let mut parts = Vec::new();
         for (key, value) in keys.iter().zip(&values) {
-            let name =
-                self.call_object(PROPERTY, "getName", "()Ljava/lang/String;", &[key.clone()])?;
+            let name = self.call_object(
+                PROPERTY,
+                "getName",
+                "()Ljava/lang/String;",
+                std::slice::from_ref(key),
+            )?;
             let name = self.text(&name).unwrap_or_default();
             parts.push(format!("{name}={}", self.property_value_name(key, value)?));
         }
@@ -381,7 +385,7 @@ impl Interpreter {
             VOXEL_SHAPE,
             "toAabbs",
             "()Ljava/util/List;",
-            &[shape.clone()],
+            std::slice::from_ref(shape),
         )?;
         let mut boxes = Vec::new();
         for aabb in self.collection_elements(&list)? {

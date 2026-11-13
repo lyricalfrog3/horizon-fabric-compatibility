@@ -125,7 +125,7 @@ collector's supplier/accumulator/finisher. `BuiltInRegistries` take registration
 `register`, `createIntrusiveHolder`, `getKey`), and `Block.asItem()`/`new ItemStack(item)` work
 for registered block items, so creative-tab generators record their items. On the test mods the
 census's unresolved symbols went from 55 to 18 with the JDK slice and to 3 with this one, and the
-interpreter's known divergences from a real JVM from 32 to 16. The design is in
+interpreter's known divergences from a real JVM from 32 to 6. The design is in
 [docs/architecture/fabric-runtime.md](docs/architecture/fabric-runtime.md), and the reasoning
 behind the content-first installer in
 [docs/decisions/0001-hybrid-content-first.md](docs/decisions/0001-hybrid-content-first.md).

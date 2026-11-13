@@ -32,21 +32,19 @@ mod's id or class name is not coverage and must not be added.
 
 | Suite | Tests |
 |---|---:|
-| `hfc-core` (paths, atomic writes, limits) | 3 |
-| `hfc-fabric` (version, metadata, archive, graph) | 18 |
+| `hfc-core` (paths, atomic writes, limits) | 7 |
+| `hfc-fabric` (version, metadata, archive, graph) | 31 |
 | `hfc-cache` (keying, commit, recovery, prune, stats) | 6 |
-| `hfc-bootstrap` unit (config, state, report, install, ids, carry verification) | 12 |
-| `hfc-bootstrap` end to end | 5 |
-| `hfc-runtime` unit (`src/`: vfs, census, heap, use_builtins, registry, builtins, bridge/blocks, mixin, interp) | 32 |
-| `hfc-runtime` integration (20 test binaries: block entities, registered blocks/items, Mod Menu screen, Legendary tooltip, classpath, JImage, JVM diff, …) | 80 |
-| **HFC total** | **156** |
+| `hfc-bootstrap` (config, state, report, install, ids, carry verification, end to end) | 27 |
+| `hfc-cli` (argument parsing) | 5 |
+| `hfc-runtime` unit (`src/`: vfs, census, heap, use_builtins, registry, builtins, bridge/blocks, mixin, interp) | 47 |
+| `hfc-runtime` integration (20 test binaries: block entities, registered blocks/items, Mod Menu screen, Legendary tooltip, classpath, JImage, JVM diff, …) | 99 |
+| **HFC total** | **222** |
 | Launcher `fabric_compat` (`cargo test --lib fabric_compat`) | 3 |
 
-The `hfc-runtime` rows are 112 tests (32 unit + 80 integration across 20 binaries), counted at
-`ad2b274` with `--list` on the built test binaries. The other rows were checked against their own
-built binaries and match: `hfc-core` 3, `hfc-fabric` 18, `hfc-cache` 6, `hfc-bootstrap` 12 + 5.
-One uncommitted test in the working tree (`a_mod_formatting_a_date_reaches_no_tzdata_native` in
-`tests/block_entities.rs`) brings the on-disk count to 113/157; it is not part of `HEAD`.
+Counts from `--list` on the built test binaries. The runtime's integration row includes the JVM
+differential suite, whose cases live in `crates/hfc-runtime/tests/jvm/hfc/cases/` and are
+compiled against the local JDK at test time.
 
 Status at `ad2b274`, from `cargo test --release -j2 -p hfc-runtime --test modmenu_screen`:
 9 passed, 2 failed. Both failures are Mod Menu's
@@ -227,8 +225,8 @@ cargo run --release -p hfc-runtime --example census --     --mods test-mods/corp
   plus manual compatibility runs.
 - **Behavioral parity.** No block behaviour, inventory transition, recipe result, entity or
   worldgen output is compared against the Java mod. HFC therefore does not claim it.
-- **Windows/macOS.** Path and rename code uses `std`, but no CI run on those platforms is
-  recorded.
+- **Windows/macOS.** Path and rename code uses `std`, but CI runs on Linux only; neither of
+  those platforms is exercised by a recorded run.
 - **Performance.** Cold/warm timings are not benchmarked. The design predicts a one-time cost
   per new jar and near-zero warm cost; that prediction should be measured on a real pack.
 - **Concurrency.** Atomicity is reasoned and unit-tested at the entry level; no stress test

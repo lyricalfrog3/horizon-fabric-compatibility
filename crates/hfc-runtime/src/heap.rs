@@ -375,6 +375,25 @@ impl Heap {
                 .values()
                 .any(|states| states.values().any(value))
             || self.block_entities.values().any(|id| *id >= mark)
+            // A `ThreadLocal`'s value outlives the call that set it: a
+            // recursion guard (`ThreadLocal<Deque>` holding the call's own
+            // frames) is the common case, and truncating its contents leaves
+            // the id pointing at whatever the next scope allocates there —
+            // type confusion rather than a missed value. Both the values and
+            // the `withInitial` suppliers are roots.
+            || self.thread_locals.values().any(value)
+            || self.thread_local_initializers.values().any(value)
+            // A mod's `Registry.register` value and the `Holder.Reference`
+            // made for it are read back long after the call: a registry that
+            // lost its contents would answer a stale id for the same reason.
+            || self
+                .registry_entries
+                .iter()
+                .any(|entry| value(&entry.value) || entry.holder >= mark)
+            || self
+                .intrusive_holders
+                .iter()
+                .any(|(object, holder)| *object >= mark || *holder >= mark)
         {
             return true;
         }
@@ -455,6 +474,21 @@ impl Heap {
         let id = self.alloc(JavaObject::String(s.clone()));
         self.interned_strings.insert(s, id);
         id
+    }
+
+    /// Allocate a string that is **not** interned: a fresh object with a new
+    /// heap id on every call.
+    ///
+    /// A JVM interns only string literals (and `String.intern()`); every other
+    /// `String` is a distinct object, so `u + "" == u` is false even though the
+    /// text is equal. `alloc_string` interns by text, which is right for a
+    /// constant-pool literal but wrong for a string a program computes.
+    /// `StringBuilder.toString()`, a `new String(...)` and the `invokedynamic`
+    /// string-concatenation result all go through here, so identity behaves as
+    /// Java's does. Callers that already know they want the interned literal
+    /// must keep using [`Heap::alloc_string`].
+    pub fn alloc_string_uninterned(&mut self, s: impl Into<String>) -> usize {
+        self.alloc(JavaObject::String(s.into()))
     }
 
     /// Intern a class and return its heap ID.
@@ -581,54 +615,23 @@ fn object_refs_into(object: &JavaObject, mark: usize) -> bool {
             .any(|(key, value_)| value(key) || value(value_)),
         JavaObject::Iterator { items, .. } => items.iter().any(value),
         JavaObject::Lambda { captured, .. } => captured.iter().any(value),
-        JavaObject::Native(native) => native_refs_into(native.as_any(), mark),
+        JavaObject::Native(native) => native_refs_into(native.as_ref(), mark),
         JavaObject::String(_) | JavaObject::Class(_) => false,
     }
 }
 
-/// The heap ids the runtime's own native objects hold.
-fn native_refs_into(object: &dyn std::any::Any, mark: usize) -> bool {
-    use crate::minecraft::{BlockHitResult, EventResult, GuiGraphics, Level, Player};
-    use crate::place_builtins::PlaceContext;
-    let value = |value: &Value| value.as_obj().is_some_and(|id| id >= mark);
-    if let Some(level) = object.downcast_ref::<Level>() {
-        return level.mod_states.values().any(|id| *id >= mark)
-            || level.placed.iter().any(|(_, id)| *id >= mark)
-            || level.scheduled.iter().any(|(_, id, _)| *id >= mark);
-    }
-    if let Some(player) = object.downcast_ref::<Player>() {
-        return player.level_id >= mark
-            || player.uuid.is_some_and(|id| id >= mark)
-            || player.hand_stack.is_some_and(|id| id >= mark)
-            || player.hand_replaced.flatten().is_some_and(|id| id >= mark);
-    }
-    if let Some(context) = object.downcast_ref::<PlaceContext>() {
-        return [
-            &context.level,
-            &context.player,
-            &context.stack,
-            &context.pos,
-            &context.hit_pos,
-            &context.face,
-            &context.click_location,
-            &context.hit_result,
-            &context.horizontal,
-            &context.vertical,
-        ]
-        .into_iter()
-        .any(value)
-            || context.nearest.iter().any(value);
-    }
-    if let Some(hit) = object.downcast_ref::<BlockHitResult>() {
-        return hit.location.is_some_and(|id| id >= mark);
-    }
-    if let Some(result) = object.downcast_ref::<EventResult>() {
-        return value(&result.value);
-    }
-    if let Some(graphics) = object.downcast_ref::<GuiGraphics>() {
-        return graphics.pose.is_some_and(|id| id >= mark);
-    }
-    false
+/// Whether a native object holds a heap id `>= mark`.
+///
+/// The ids come from [`NativeObject::held_ids`], which every implementor whose
+/// fields can hold a [`Value`], a heap id or a collection of either overrides.
+/// Keeping this generic rather than down-casting a fixed list of types is what
+/// stops a newly added native from silently escaping the scan: before the
+/// trait method, only six types were covered and a callback info holding a
+/// `return_value`, a place context holding eleven `Value`s and a `Level`
+/// holding placed states were all invisible, so a scoped value they kept could
+/// be truncated and its id reused for an unrelated object.
+fn native_refs_into(object: &dyn NativeObject, mark: usize) -> bool {
+    object.held_ids().into_iter().any(|id| id >= mark)
 }
 
 #[cfg(test)]
@@ -759,6 +762,113 @@ mod scope_tests {
         heap.alloc(instance());
         assert!(!heap.refs_into(mark));
         assert_eq!(heap.refs_scanned(), 0);
+    }
+
+    /// A `ThreadLocal` value is a heap root: a recursion guard's deque lives
+    /// past the call that pushed onto it, and truncating it would leave the
+    /// id pointing at whatever the next scope allocates. This is the
+    /// regression guard for the four containers that used to be invisible to
+    /// the scan.
+    #[test]
+    fn a_thread_local_value_keeps_the_scope() {
+        let mut heap = Heap::new();
+        let guard = heap.alloc(instance());
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        let value = heap.alloc(instance());
+        heap.thread_locals
+            .insert(guard, super::Value::Object(Some(value)));
+        assert!(heap.refs_into(mark));
+        assert!(!heap.end_scope(true));
+        assert_eq!(
+            heap.thread_locals.get(&guard),
+            Some(&super::Value::Object(Some(value)))
+        );
+    }
+
+    /// A `ThreadLocal.withInitial` supplier is a root too: it runs later, when
+    /// its captured values must still be there.
+    #[test]
+    fn a_thread_local_initializer_keeps_the_scope() {
+        let mut heap = Heap::new();
+        let guard = heap.alloc(instance());
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        let supplier = heap.alloc(instance());
+        heap.thread_local_initializers
+            .insert(guard, super::Value::Object(Some(supplier)));
+        assert!(heap.refs_into(mark));
+        assert!(!heap.end_scope(true));
+    }
+
+    /// A registry entry's value and holder outlive the registering call: a
+    /// mod reads the registry back after `init`.
+    #[test]
+    fn a_registry_entry_keeps_the_scope() {
+        let mut heap = Heap::new();
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        let value = heap.alloc(instance());
+        let holder = heap.alloc(instance());
+        heap.registry_entries.push(super::RegistryEntry {
+            kind: "SOUND_EVENT".into(),
+            id: "example:sound".into(),
+            value: super::Value::Object(Some(value)),
+            holder,
+        });
+        assert!(heap.refs_into(mark));
+        assert!(!heap.end_scope(true));
+        assert_eq!(heap.registry_entries[0].holder, holder);
+    }
+
+    /// An intrusive holder is two heap ids that must agree with the object the
+    /// registry registered.
+    #[test]
+    fn an_intrusive_holder_keeps_the_scope() {
+        let mut heap = Heap::new();
+        let object = heap.alloc(instance());
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        let holder = heap.alloc(instance());
+        heap.intrusive_holders.insert(object, holder);
+        assert!(heap.refs_into(mark));
+        assert!(!heap.end_scope(true));
+    }
+
+    /// A native object reports the ids it holds through
+    /// [`super::NativeObject::held_ids`], not through a fixed downcast list:
+    /// a callback info's `return_value` is the case a scope must not lose.
+    #[test]
+    fn a_native_objects_held_value_keeps_the_scope() {
+        let mut heap = Heap::new();
+        // The native is allocated *before* the scope, as a real one is (a
+        // callback info exists before the callback runs); the value it is
+        // written with during the scope is the one the scan must find.
+        let info = heap.alloc_native(crate::minecraft::CallbackInfo::returnable(
+            "target",
+            true,
+            super::Value::NULL,
+        ));
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        let returned = heap.alloc(instance());
+        if let Some(callback) = heap.get_native_mut::<crate::minecraft::CallbackInfo>(info) {
+            callback.return_value = super::Value::Object(Some(returned));
+        }
+        assert!(heap.refs_into(mark));
+        assert!(!heap.end_scope(true));
+    }
+
+    /// A native that holds nothing reports no ids, so it neither keeps a scope
+    /// nor makes the scan do work.
+    #[test]
+    fn a_native_with_no_values_keeps_nothing() {
+        let mut heap = Heap::new();
+        heap.begin_scope();
+        let mark = heap.scope_mark().unwrap();
+        heap.alloc_native(crate::minecraft::BlockPos { x: 1, y: 2, z: 3 });
+        assert!(!heap.refs_into(mark));
+        assert!(heap.end_scope(false));
     }
 
     /// A write outside a scope that a *later* scope repeats is seen by that

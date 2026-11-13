@@ -15,6 +15,49 @@ const SHARED_SECRETS: &str = "jdk/internal/access/SharedSecrets";
 /// Marks a class initializer on the catch-site stack (not a class name).
 const CLINIT_BOUNDARY: &str = "<clinit>";
 
+/// How many interpreted frames may nest before `java.lang.StackOverflowError`
+/// is thrown.
+///
+/// A JVM's default is thousands of frames (a 512 KiB thread gives roughly
+/// 8,000 to 11,000 for a small frame), and legitimate mod code recurses far
+/// past the old cap of 100: a JSON parser descending a config tree, a
+/// `Gson`/`Klaxon` reader, a coroutine state machine or a tree walk all blew
+/// the old limit. 1024 is still a guard, not a policy: each interpreted frame
+/// costs a Rust stack frame (and `run_code`'s locals), and the host runs this
+/// on its own threads. A host with a smaller thread stack can lower
+/// [`Interpreter::max_call_depth`]; the value here assumes the 256 MiB
+/// `RUST_MIN_STACK` the test harness sets (`.cargo/config.toml`) and the
+/// client's own stack.
+const DEFAULT_MAX_CALL_DEPTH: usize = 1024;
+
+/// The native guard behind [`DEFAULT_MAX_CALL_DEPTH`].
+///
+/// The Java-visible limit is checked first and always answers a catchable
+/// `StackOverflowError`, so this one is reached only when the interpreter
+/// itself is re-entered while building that exception (or when a host lowered
+/// `max_call_depth` past it). It returns a hard `Error` instead of a Java
+/// exception because at that depth the Rust stack is the thing at risk.
+const HARD_MAX_CALL_DEPTH: usize = 4096;
+
+/// The largest array `newarray`, `anewarray` and `multianewarray` will build in
+/// one allocation: 256 MiB of `Value` slots.
+///
+/// A JVM throws `java.lang.OutOfMemoryError` when it cannot get the memory; it
+/// never truncates the request. The runtime's slots are 16 bytes each, so a
+/// `new int[Integer.MAX_VALUE]` would ask the host for 32 GiB and abort the
+/// process on the allocation failure — a mod bug became a client crash. This
+/// budget turns it into the `OutOfMemoryError` a JVM would throw, catchable by
+/// the same `catch (OutOfMemoryError e)`. It is a limit on one allocation, not
+/// a heap limit: many small arrays are unaffected. The value is deliberately
+/// generous (a real 256 MiB array still succeeds) and documented so a host
+/// with a hard memory cap can lower it.
+const MAX_ARRAY_BYTES: usize = 256 * 1024 * 1024;
+
+/// How many `Value` slots an array of `count` elements occupies.
+fn array_bytes(count: usize) -> usize {
+    count.saturating_mul(std::mem::size_of::<Value>())
+}
+
 /// JDK bootstrap classes whose statics the runtime supplies instead of running
 /// their initializers: they build the module/CDS class-loader hierarchy of a
 /// JVM, and the runtime is a single loader ([`crate::builtins`] answers
@@ -114,6 +157,10 @@ pub struct Interpreter {
     /// A finite budget keeps a mis-decoded branch from hanging the host.
     pub step_budget: Option<u64>,
     pub call_depth: usize,
+    /// Frames may nest this deep before `java.lang.StackOverflowError` is
+    /// raised. See [`DEFAULT_MAX_CALL_DEPTH`]; a host on a small thread stack
+    /// can lower it.
+    pub max_call_depth: usize,
     /// When set, every entered method is pushed onto [`Self::call_stack`] so a
     /// budget exhaustion can name the Java frames it happened under. Off in
     /// normal runs: the bookkeeping allocates a string per call.
@@ -217,6 +264,7 @@ impl Interpreter {
             missing: Vec::new(),
             step_budget: None,
             call_depth: 0,
+            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
             trace_calls: false,
             pending_exception: None,
             catch_sites: Vec::new(),
@@ -256,6 +304,7 @@ impl Interpreter {
             missing: Vec::new(),
             step_budget: None,
             call_depth: 0,
+            max_call_depth: DEFAULT_MAX_CALL_DEPTH,
             trace_calls: false,
             pending_exception: None,
             catch_sites: Vec::new(),
@@ -343,22 +392,43 @@ impl Interpreter {
         }
     }
 
-    /// Allocate a `Multianewarray` value: `counts[0]` outer length, and so on.
-    fn build_multidim(&mut self, elem: &str, counts: &[usize]) -> Value {
+    /// Allocate a `Multianewarray` value: `counts[0]` outer length, and so on,
+    /// for the array type `descriptor` (`[[I` for `new int[a][b]`).
+    ///
+    /// The caller has already rejected a negative dimension and checked
+    /// [`array_bytes`] for the whole shape. Each level's `elem_type` is the
+    /// component type one dimension in (`[[I` → `[I` → `int`), which is what a
+    /// later `instanceof int[]` compares against; the innermost level holds the
+    /// primitive's zero rather than `null`, as the JVM's array does.
+    fn build_multidim(&mut self, descriptor: &str, counts: &[usize]) -> Value {
         let (len, rest) = match counts.split_first() {
             Some((len, rest)) => (*len, rest),
             None => return Value::NULL,
         };
+        // The component type of this level: drop one `[`. For `[[I` at the
+        // outer level that is `[I`; for the innermost `[I` it is the element
+        // type, spelled as `newarray` spells it (`int`).
+        let component = descriptor.strip_prefix('[').unwrap_or(descriptor);
+        let element_type = if rest.is_empty() {
+            primitive_name(component).unwrap_or(component).to_string()
+        } else {
+            component.to_string()
+        };
+        let filler = if rest.is_empty() {
+            default_for_descriptor(component)
+        } else {
+            Value::NULL
+        };
         let mut elements = Vec::with_capacity(len);
         for _ in 0..len {
             elements.push(if rest.is_empty() {
-                Value::NULL
+                filler.clone()
             } else {
-                self.build_multidim(elem, rest)
+                self.build_multidim(component, rest)
             });
         }
         let id = self.heap.alloc(JavaObject::Array {
-            elem_type: elem.to_string(),
+            elem_type: element_type,
             elements,
         });
         Value::Object(Some(id))
@@ -655,8 +725,24 @@ impl Interpreter {
                     | "java/lang/reflect/AnnotatedElement"
                     | "java/lang/Object"
             ),
-            JavaObject::Array { .. } => {
-                target_type.starts_with('[') || target_type == "java/lang/Object"
+            // An array's recorded element type is not its class when casting
+            // between arrays: Java compares array *descriptors* component by
+            // component. `int[] instanceof String[]` is false, `int[]
+            // instanceof Object[]` is false, `String[] instanceof Object[]`
+            // is true, `String[][] instanceof Object[]` is true (its
+            // components are `String[]`, which are references) and `Object[]
+            // instanceof String[]` is false. Every array also implements
+            // `Cloneable` and `java.io.Serializable` whatever its component
+            // type (`Object` already answered true above).
+            JavaObject::Array { elem_type, .. } => {
+                if target_type == "java/lang/Cloneable" || target_type == "java/io/Serializable" {
+                    return true;
+                }
+                // Clone out of the `obj` borrow before calling `self`: the
+                // check loads classes, so it needs `&mut self`.
+                let elem_type = elem_type.clone();
+                let target_type = target_type.to_string();
+                self.array_is_instance_of(&elem_type, &target_type)
             }
             // A lambda is an instance of the interface it implements, and of
             // that interface's supertypes.
@@ -843,6 +929,67 @@ impl Interpreter {
         false
     }
 
+    /// Whether an array whose `JavaObject::Array::elem_type` is `elem_type` is
+    /// an instance of the class `target_type` names, by Java's array rules.
+    ///
+    /// The runtime records one *component* type, in three spellings that all
+    /// occur: a primitive name (`int`, what `newarray` writes and what the
+    /// array consumers in `builtins.rs` match), a class name (what
+    /// `anewarray`/`multianewarray` write, possibly itself starting with `[`
+    /// when the components are arrays), and a primitive descriptor letter
+    /// (`I`, written by the NBT value tree). [`component_descriptor`] turns
+    /// any of them into the array's own JVM descriptor, and the comparison then
+    /// walks both descriptors one `[` at a time, which is exactly what the JVM
+    /// does: a component type is assignable only when it is the same primitive,
+    /// or a reference type assignable from the other component.
+    fn array_is_instance_of(&mut self, elem_type: &str, target_type: &str) -> bool {
+        let Some(source) = component_descriptor(elem_type) else {
+            return false;
+        };
+        if target_type == "java/lang/Cloneable" || target_type == "java/io/Serializable" {
+            return true;
+        }
+        // Only an array descriptor names an array: a class name is not one.
+        if !target_type.starts_with('[') {
+            return false;
+        }
+        self.array_descriptor_assignable(&format!("[{source}"), target_type)
+    }
+
+    /// `isAssignable(source, target)` for two array descriptors, both of which
+    /// start with `[`.
+    fn array_descriptor_assignable(&mut self, source: &str, target: &str) -> bool {
+        let (Some(source), Some(target)) = (source.strip_prefix('['), target.strip_prefix('['))
+        else {
+            return false;
+        };
+        // A primitive component can only match the identical primitive: an
+        // `int[]` is neither an `Object[]` nor a `long[]`.
+        let source_primitive = primitive_component(source);
+        let target_primitive = primitive_component(target);
+        match (source_primitive, target_primitive) {
+            (Some(a), Some(b)) => a == b,
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => match (source.starts_with('['), target.starts_with('[')) {
+                // Both components are arrays: compare them as arrays.
+                (true, true) => self.array_descriptor_assignable(source, target),
+                // An array component is a reference, so an `int[][]` is an
+                // `Object[]`; a *non-array* component is never an array type,
+                // so an `Object[]` is not an `int[][]`.
+                (true, false) => matches!(
+                    target,
+                    "Ljava/lang/Object;" | "Ljava/lang/Cloneable;" | "Ljava/io/Serializable;"
+                ),
+                (false, true) => false,
+                (false, false) => {
+                    let source = reference_component_name(source);
+                    let target = reference_component_name(target);
+                    source == target || self.class_is_assignable_to(source, target)
+                }
+            },
+        }
+    }
+
     /// Execute a method using virtual dispatch.
     pub fn execute_method(
         &mut self,
@@ -873,25 +1020,51 @@ impl Interpreter {
         args: &[Value],
         virtual_dispatch: bool,
     ) -> Result<Value> {
-        if self.call_depth > 100 {
-            let stack = if self.trace_calls {
-                let from = self.call_stack.len().saturating_sub(12);
-                format!(
-                    "; stack: {}",
-                    self.call_stack[from..]
-                        .iter()
-                        .rev()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" <- ")
-                )
-            } else {
-                String::new()
-            };
-            return Err(Error::new(
-                "interpreter",
-                format!("call stack overflow at {class_name}.{method_name}{descriptor}{stack}"),
-            ));
+        // `java.lang.StackOverflowError` is what a JVM throws when a frame
+        // would exceed the stack, and it is catchable: a recursive descent
+        // guarded by `try { ... } catch (StackOverflowError e)` depends on
+        // that. It cannot be answered leniently the way `raise` answers the
+        // faults the runtime detects (a null receiver, a bad cast): the callee
+        // never ran, so there is no result to fall back on. Leaving it pending
+        // unwinds exactly as an `athrow` in the callee would — the first
+        // caller whose handler covers the call site catches it, and one that
+        // nothing catches reaches the host as "threw
+        // java.lang.StackOverflowError".
+        if self.call_depth >= self.max_call_depth
+            // Building the exception itself re-enters the interpreter for its
+            // constructor; that re-entry must not overflow again, or the
+            // report would recurse forever. `HARD_MAX_CALL_DEPTH` still guards
+            // the Rust stack underneath it.
+            && !(self.building_exception && self.call_depth < HARD_MAX_CALL_DEPTH)
+        {
+            let stack = self.frame_stack_summary();
+            if self.call_depth >= HARD_MAX_CALL_DEPTH {
+                // The Java limit was bypassed (the interpreter is re-entering
+                // itself while building the exception, or a host set
+                // `max_call_depth` above this): the Rust stack is now the risk,
+                // so this is a hard failure, not a Java exception.
+                return Err(Error::new(
+                    "interpreter",
+                    format!(
+                        "native call stack guard at {HARD_MAX_CALL_DEPTH} frames reached in \
+                         {class_name}.{method_name}{descriptor}{stack}; the Java-visible \
+                         StackOverflowError is at {} frames",
+                        self.max_call_depth
+                    ),
+                ));
+            }
+            log::warn!(
+                "java.lang.StackOverflowError: {} frames deep, calling \
+                 {class_name}.{method_name}{descriptor}{stack}",
+                self.call_depth
+            );
+            // A JVM's StackOverflowError carries no message, and neither does
+            // this one; the frames above are logged instead.
+            let exception = self.new_exception_with("java/lang/StackOverflowError", "()V", &[]);
+            if self.pending_exception.is_none() {
+                self.pending_exception = Some(exception);
+            }
+            return Ok(Value::NULL);
         }
         self.call_depth += 1;
         let traced = self.trace_calls;
@@ -2032,7 +2205,7 @@ impl Interpreter {
                             let mut j = i;
                             while j > 0 {
                                 let order = if comparator.is_null() {
-                                    natural_order(&sorted[j - 1], &sorted[j])
+                                    natural_order(&self.heap, &sorted[j - 1], &sorted[j])
                                 } else {
                                     self.execute_method(
                                         "java/util/Comparator",
@@ -2269,6 +2442,10 @@ impl Interpreter {
                     class_name: "java/lang/ThreadLocal".into(),
                     fields: HashMap::new(),
                 });
+                // `thread_local_initializers` is one of the containers
+                // `Heap::refs_into` scans, so a scoped supplier stored here
+                // keeps the scope alive without a `note_escape`; see the
+                // comment on that method's root set.
                 self.heap
                     .thread_local_initializers
                     .insert(id, args[0].clone());
@@ -2277,6 +2454,11 @@ impl Interpreter {
             if let Some(this_id) = args.first().and_then(Value::as_obj) {
                 match method_name {
                     "set" if args.len() == 2 => {
+                        // A `ThreadLocal` outlives the call that set it (the
+                        // usual use is a recursion guard), so the value is a
+                        // heap root. `Heap::refs_into` scans `thread_locals`,
+                        // which keeps a scoped value alive; inserting it here
+                        // is enough, no `note_escape` needed.
                         self.heap.thread_locals.insert(this_id, args[1].clone());
                         return Ok(Value::NULL);
                     }
@@ -2305,6 +2487,8 @@ impl Interpreter {
                                 std::slice::from_ref(&args[0]),
                             )?,
                         };
+                        // Lazily built values are roots for the same reason
+                        // `set`'s are (see above).
                         self.heap.thread_locals.insert(this_id, value.clone());
                         return Ok(value);
                     }
@@ -2544,6 +2728,17 @@ impl Interpreter {
                 log::trace!("  Builtin returned: {:?}", v);
                 return Ok(v);
             }
+            // A builtin that raises a Java exception (a bad `String` index, a
+            // malformed number) hands the exception object back instead of
+            // returning a made-up value. Leaving it pending is exactly the
+            // state a callee frame is in when its own `athrow` runs: the invoke
+            // site's `unwind_here` catches it here or the caller does.
+            BuiltinResult::Threw(exception) => {
+                if self.pending_exception.is_none() {
+                    self.pending_exception = Some(exception);
+                }
+                return Ok(Value::NULL);
+            }
             BuiltinResult::NotHandled => {}
         }
 
@@ -2740,14 +2935,56 @@ impl Interpreter {
         let Some(id) = value.as_obj() else {
             return false;
         };
-        if target.starts_with('[') {
-            return false;
+        // An array cast is decided from the two array descriptors: the runtime
+        // knows the array's component type, and whether that component is
+        // assignable to the target's is a question the loader can answer. A
+        // primitive component on either side decides it outright, which is what
+        // makes `String[] → int[]` throw `ClassCastException` without needing a
+        // class file for either array.
+        if let Some(JavaObject::Array { elem_type, .. }) = self.heap.get(id) {
+            let elem_type = elem_type.clone();
+            let target_type = target.to_string();
+            if !target_type.starts_with('[') {
+                // An array cast to a class: `Object`, `Cloneable` and
+                // `Serializable` are fine and anything else throws, so the
+                // answer is always decidable.
+                return true;
+            }
+            let Some(source) = component_descriptor(&elem_type) else {
+                return false;
+            };
+            let source_component = source.trim_start_matches('[').to_string();
+            let target_component = target_type.trim_start_matches('[').to_string();
+            if primitive_component(&source_component).is_some()
+                || primitive_component(&target_component).is_some()
+            {
+                return true;
+            }
+            let source_name = reference_component_name(&source_component).to_string();
+            let target_name = reference_component_name(&target_component).to_string();
+            let source_known = self
+                .loader
+                .get_or_load(&source_name)
+                .is_ok_and(|class| class.is_some());
+            let target_known = self
+                .loader
+                .get_or_load(&target_name)
+                .is_ok_and(|class| class.is_some());
+            return source_known && target_known;
         }
         let class = match self.heap.get(id) {
             Some(JavaObject::String(_)) => "java/lang/String".to_string(),
             Some(JavaObject::Instance { class_name, .. }) => class_name.clone(),
             _ => return false,
         };
+        if target.starts_with('[') {
+            // A real object (a string, a class instance) cast to an array type
+            // is never an instance of it: Java's arrays are a separate branch
+            // of the type lattice. The runtime's stand-ins (natives, modelled
+            // collections, lambdas) fall through the `_ =>` above and keep
+            // their lenient answer.
+            return true;
+        }
         if !matches!(self.loader.get_or_load(&class), Ok(Some(_))) {
             return false;
         }
@@ -3070,6 +3307,26 @@ impl Interpreter {
             }
         }
         None
+    }
+
+    /// The interpreted frames an overflow happened under, for the log line:
+    /// the innermost dozen, which is what a JVM's stack trace's top looks like.
+    /// Empty unless [`Interpreter::trace_calls`] is on, because the frame names
+    /// cost a string per call.
+    fn frame_stack_summary(&self) -> String {
+        if !self.trace_calls || self.call_stack.is_empty() {
+            return String::new();
+        }
+        let from = self.call_stack.len().saturating_sub(12);
+        format!(
+            "; stack: {}",
+            self.call_stack[from..]
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" <- ")
+        )
     }
 
     /// A `Throwable` of `class` with `message`, built by the JDK's own
@@ -3511,8 +3768,11 @@ impl Interpreter {
                     }
                 }
                 Opcode::Ineg => {
+                    // JVM `ineg` wraps: `-Integer.MIN_VALUE` is
+                    // `Integer.MIN_VALUE`, and plain `-a` panics on it in a
+                    // debug build.
                     let a = stack.pop().unwrap_or(Value::Int(0)).as_int();
-                    stack.push(Value::Int(-a));
+                    stack.push(Value::Int(a.wrapping_neg()));
                 }
                 Opcode::Iinc(idx, c) => {
                     let i = *idx as usize;
@@ -3565,6 +3825,23 @@ impl Interpreter {
                         _ => 0.0,
                     };
                     stack.push(Value::Float(a / b));
+                }
+                Opcode::Frem => {
+                    // JVM `frem` is IEEE 754 remainder with the dividend's
+                    // sign, which is exactly Java's float `%` and exactly
+                    // Rust's `f32` `%`: `inf % x`, `x % 0.0` and `inf % inf`
+                    // are NaN, and `x % inf` is `x` for finite `x`. (The
+                    // operand order matters only for the sign: Rust takes it
+                    // from the left operand, as the JVM does.)
+                    let b = match stack.pop() {
+                        Some(Value::Float(f)) => f,
+                        _ => 1.0,
+                    };
+                    let a = match stack.pop() {
+                        Some(Value::Float(f)) => f,
+                        _ => 0.0,
+                    };
+                    stack.push(Value::Float(a % b));
                 }
                 Opcode::Fneg => {
                     let a = stack.pop().unwrap_or(Value::Float(0.0)).as_float();
@@ -3826,11 +4103,67 @@ impl Interpreter {
                     stack.pop();
                 }
                 Opcode::Multianewarray(elem, dims) => {
-                    let mut counts = Vec::with_capacity(*dims as usize);
+                    let mut sizes = Vec::with_capacity(*dims as usize);
                     for _ in 0..*dims {
-                        counts.push(stack.pop().unwrap_or(Value::Int(0)).as_int().max(0) as usize);
+                        sizes.push(stack.pop().unwrap_or(Value::Int(0)).as_int());
                     }
-                    counts.reverse();
+                    sizes.reverse();
+                    // A negative dimension throws, as `newarray` does: the JVM
+                    // checks each dimension against its own size and never
+                    // treats `-1` as `0`. Popping first keeps the operand stack
+                    // consistent with the JVM's, which consumes all of them.
+                    if let Some(&negative) = sizes.iter().find(|size| **size < 0) {
+                        if let Some(target) = self.raise(
+                            code,
+                            byte_offset,
+                            "java/lang/NegativeArraySizeException",
+                            &negative.to_string(),
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                    }
+                    let counts: Vec<usize> =
+                        sizes.iter().map(|size| (*size).max(0) as usize).collect();
+                    // The whole shape's slot count: each level holds the product
+                    // of the lengths above it, times its own length.
+                    let mut bytes = 0usize;
+                    let mut level = 1usize;
+                    for count in &counts {
+                        level = level.saturating_mul(*count);
+                        bytes = bytes.saturating_add(array_bytes(level).min(usize::MAX / 2));
+                    }
+                    if bytes > MAX_ARRAY_BYTES {
+                        if let Some(target) = self.raise(
+                            code,
+                            byte_offset,
+                            "java/lang/OutOfMemoryError",
+                            "Java heap space",
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        self.note_missing(format!(
+                            "new {elem} with dimensions {counts:?} ({dims} dims) exceeds the \
+                             runtime's {MAX_ARRAY_BYTES}-byte array budget"
+                        ));
+                        return Err(Error::new(
+                            "interpreter",
+                            format!(
+                                "java.lang.OutOfMemoryError: new {elem} with dimensions \
+                                 {counts:?} exceeds the runtime's {MAX_ARRAY_BYTES}-byte array \
+                                 budget"
+                            ),
+                        ));
+                    }
                     let value = self.build_multidim(elem, &counts);
                     stack.push(value);
                 }
@@ -4154,6 +4487,44 @@ impl Interpreter {
                         }
                     }
                     let count = size.max(0) as usize;
+                    // Refuse the allocation a JVM would throw `OutOfMemoryError`
+                    // for, instead of asking the host for gigabytes and letting
+                    // the allocator abort the process. Never clamp: a smaller
+                    // array would index out of bounds later with no hint why.
+                    if array_bytes(count) > MAX_ARRAY_BYTES {
+                        if let Some(target) = self.raise(
+                            code,
+                            byte_offset,
+                            "java/lang/OutOfMemoryError",
+                            "Java heap space",
+                            stack,
+                        ) {
+                            pc = target;
+                            continue;
+                        }
+                        if self.pending_exception.is_some() {
+                            return Ok(Value::NULL);
+                        }
+                        // Nothing on the interpreted stack catches it, so the
+                        // lenient answer `raise` leaves is unavailable: the
+                        // array does not exist. Fail the call and make the gap
+                        // visible in `Interpreter::missing`, as with any other
+                        // symbol the runtime cannot provide.
+                        self.note_missing(format!(
+                            "new {elem}[{count}] ({} MiB) exceeds the runtime's \
+                             {MAX_ARRAY_BYTES}-byte array budget",
+                            array_bytes(count) / (1024 * 1024)
+                        ));
+                        return Err(Error::new(
+                            "interpreter",
+                            format!(
+                                "java.lang.OutOfMemoryError: new {elem}[{count}] needs \
+                                 {} MiB, over the runtime's {MAX_ARRAY_BYTES}-byte array \
+                                 budget",
+                                array_bytes(count) / (1024 * 1024)
+                            ),
+                        ));
+                    }
                     let default_val = match elem.as_str() {
                         "boolean" | "byte" | "short" | "char" | "int" => Value::Int(0),
                         "long" => Value::Long(0),
@@ -4285,8 +4656,6 @@ impl Interpreter {
                 }
 
                 Opcode::Checkcast(target_type) => {
-                    // A reference that is not an instance of the target throws;
-                    // `null` passes through every cast.
                     let value = stack.last().cloned().unwrap_or(Value::NULL);
                     if self.cast_is_checkable(&value, target_type)
                         && !self.is_instance_of(&value, target_type)
@@ -4526,7 +4895,10 @@ impl Interpreter {
                                 out.push_str(&text);
                             }
                         }
-                        let sid = self.heap.alloc_string(out);
+                        // A concatenation produces a NEW `String`: `u + ""`
+                        // must not be the interned `u`, which is only true if
+                        // the result is allocated without interning.
+                        let sid = self.heap.alloc_string_uninterned(out);
                         stack.push(Value::Object(Some(sid)));
                         continue;
                     }
@@ -4836,13 +5208,22 @@ impl Interpreter {
             }
         }
 
-        // A platform class's statics are what its initializer built. Reading
-        // one before that initializer ran would hand back a synthesized
-        // placeholder that a later `putstatic` replaces, and two readers of
-        // "the same" static would then hold different objects
-        // (`BlockStateProperties.AGE_7` in a block's state definition and in
-        // `setValue`). Initialize first, then synthesize only what is still
-        // null.
+        // A class's statics are what its initializer built, and a JVM
+        // initializes the declaring class on the first `getstatic` — whatever
+        // the class is. That includes a *library's* class the runtime has not
+        // loaded yet: JamLib's `InteractionEvent.USE_BLOCK` is created by its
+        // own `<clinit>`, and skipping the initializer left it null for a mod
+        // that registered a listener on it. Reading a static before its
+        // initializer ran would also hand back a placeholder a later
+        // `putstatic` replaces, so two readers of "the same" static would hold
+        // different objects (`BlockStateProperties.AGE_7` in a block's state
+        // definition and in `setValue`).
+        //
+        // The exceptions are the registry-sized classes
+        // (`has_synthetic_statics`, `runtime_supplied_state`): their
+        // initializers build Minecraft's whole item/block/tag registry, which
+        // the runtime answers from its own data instead (AGENTS.md records the
+        // measured ~34 s stall this avoids).
         let platform = ["net/minecraft/", "com/mojang/", "java/", "jdk/", "sun/"]
             .iter()
             .any(|prefix| class_name.starts_with(prefix));
@@ -4864,6 +5245,27 @@ impl Interpreter {
                 .insert(field_name.to_string(), val.clone());
         }
         val
+    }
+
+    /// The descriptor of a static field the loaded class declares, walking the
+    /// superclass chain the way `getstatic` resolution does.
+    fn field_descriptor(&mut self, class_name: &str, field_name: &str) -> Option<String> {
+        let mut current = Some(class_name.to_string());
+        let mut seen = std::collections::HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return None;
+            }
+            let _ = self.loader.get_or_load(&name);
+            let class = self.loader.get(&name)?;
+            if let Some(field) = class.fields.get(field_name) {
+                if field.is_static {
+                    return Some(field.descriptor.clone());
+                }
+            }
+            current = class.super_class.clone();
+        }
+        None
     }
 
     fn values_equal(&self, a: &Value, b: &Value) -> bool {
@@ -4890,14 +5292,6 @@ impl Interpreter {
     }
 
     fn create_static_field_val(&mut self, class_name: &str, field_name: &str) -> Value {
-        if field_name.starts_with("$SwitchMap$") {
-            let arr_id = self.heap.alloc(JavaObject::Array {
-                elem_type: "int".into(),
-                elements: vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
-            });
-            return Value::Object(Some(arr_id));
-        }
-
         if class_name.starts_with("java/")
             && matches!(field_name, "NEXT" | "PREV" | "HEAD" | "TAIL" | "ITEM")
         {
@@ -5106,15 +5500,19 @@ impl Interpreter {
             return Value::Object(Some(id));
         }
 
-        if class_name == "io/github/jamalam360/jamlib/api/events/InteractionEvent" {
-            let id = self.heap.alloc(JavaObject::Instance {
-                class_name: "io/github/jamalam360/jamlib/api/events/core/CancellableEvent".into(),
-                fields: HashMap::new(),
-            });
-            return Value::Object(Some(id));
-        }
-
-        if field_name == "EVENT" || field_name.ends_with("_EVENT") || class_name.contains("Event") {
+        // Fabric's own event objects. A mod never builds one: Fabric API's
+        // `EventFactory.createArrayBacked` does, and the runtime answers that
+        // call in `builtins.rs` with the same shape. This branch is for the
+        // case where the event class's real `<clinit>` did not run (an
+        // `arrayBacked` field assigned by a `<clinit>` the runtime skipped):
+        // the mod's listener registration then still lands somewhere it can
+        // read back. It is keyed on the *declaring class* being Fabric's event
+        // package, never on "the class name contains Event", so a mod's own
+        // class with an `EVENT` field is not mistaken for a Fabric event.
+        if field_name == "EVENT"
+            && class_name.starts_with("net/fabricmc/fabric/api/")
+            && !field_name.is_empty()
+        {
             let mut fields = HashMap::new();
             let arr_id = self.heap.alloc(JavaObject::Array {
                 elem_type: "java/lang/Object".into(),
@@ -5128,6 +5526,9 @@ impl Interpreter {
             return Value::Object(Some(id));
         }
 
+        // A genuine singleton (`X.INSTANCE`, `X.INSTANCE_HOLDER`). The class
+        // is a real loaded class and the object is an instance of that very
+        // class, so a `getfield` on it reads its real field map.
         if field_name == "INSTANCE" {
             let id = self.heap.alloc(JavaObject::Instance {
                 class_name: class_name.to_string(),
@@ -5136,18 +5537,106 @@ impl Interpreter {
             return Value::Object(Some(id));
         }
 
-        // TagKey fallback (e.g. RightClickHarvest.BLACKLIST, HOE_NEVER_REQUIRED)
-        let id = self.heap.alloc_native(TagKey {
-            registry: "tag".into(),
-            id: field_name.to_lowercase(),
-        });
-        Value::Object(Some(id))
+        // Anything the branches above did not produce is a static the runtime
+        // has no value for.
+        //
+        // Platforms first. Minecraft's and Mojang's own statics are registry
+        // and codec data the host supplies; a `Minecraft`/`ResourceLocation`/
+        // `Codec` field read before its `<clinit>` ran (or while the registry
+        // it comes from is unavailable) is answered with the runtime's
+        // long-standing `TagKey` stand-in, whose `id` is the lower-cased field
+        // name. `block_builtins.rs` reads that id as a block-state property
+        // name (`BlockStateProperties.WATERLOGGED`), and menu/`MenuScreens`
+        // paths read it as a `MenuType`/`BlockEntityType` handle, so the
+        // stand-in is what those consumers are written against. This branch is
+        // deliberately limited to `net/minecraft/`, `com/mojang/`, `java/`,
+        // `jdk/` and `sun/`: a *mod's* unresolved static is not registry data.
+        //
+        // A mod's own class is different. `EnvType.CLIENT` (Fabric's enum) and
+        // JamLib's `InteractionEvent.USE_BLOCK` are values their own
+        // `<clinit>` builds; the JVM initializes the declaring class on the
+        // first `getstatic`, so the honest answer is to run it (see the
+        // `ensure_initialized` above, which every non-registry class now gets)
+        // and, when that still leaves nothing, answer the JVM's own default for
+        // the field's type rather than fabricate an object the field cannot
+        // hold. A mod reading an unresolved `static int` must see `0`.
+        let platform = ["net/minecraft/", "com/mojang/", "java/", "jdk/", "sun/"]
+            .iter()
+            .any(|prefix| class_name.starts_with(prefix));
+        if platform {
+            let id = self.heap.alloc_native(TagKey {
+                registry: "tag".into(),
+                id: field_name.to_lowercase(),
+            });
+            return Value::Object(Some(id));
+        }
+        if std::env::var_os("HFC_TRACE_NULLSTATIC").is_some() {
+            eprintln!("NULLSTATIC {class_name} {field_name}");
+        }
+        let default = self
+            .field_descriptor(class_name, field_name)
+            .map(|descriptor| default_for_descriptor(&descriptor))
+            .unwrap_or(Value::NULL);
+        log::trace!(
+            "{class_name}.{field_name} has no value the runtime can supply; answering the \
+             field's JVM default ({default:?})"
+        );
+        default
     }
 }
 
-/// Order two values for `Stream.sorted()` without a comparator. Objects have
-/// no natural order here; callers that need one pass a comparator.
-fn natural_order(a: &Value, b: &Value) -> i32 {
+/// Compare two strings the way `String.compareTo` does: **UTF-16 code units**,
+/// stopping at the first that differs, so an astral character sorts by its
+/// surrogates and a prefix sorts before its extension.
+fn compare_java_strings(a: &str, b: &str) -> i32 {
+    let mut left = a.encode_utf16();
+    let mut right = b.encode_utf16();
+    loop {
+        match (left.next(), right.next()) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) => return x as i32 - y as i32,
+            (Some(_), None) => return 1,
+            (None, Some(_)) => return -1,
+            (None, None) => return 0,
+        }
+    }
+}
+
+/// [`std::cmp::Ordering`] as the `-1`/`0`/`1` a `Comparator` returns.
+fn ordering_to_int(order: std::cmp::Ordering) -> i32 {
+    match order {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// The natural order `Stream.sorted()` uses with no comparator, as `Heap` gives
+/// it the strings the values name.
+///
+/// Java requires `T extends Comparable` here and throws
+/// `ClassCastException` from the terminal operation when an element is not.
+/// The interpreter's `Stream` is a plain `Vec<Value>` with no element type, so
+/// there is nothing to run that check against; inventing a `ClassCastException`
+/// at comparison time would fail at a point the JVM cannot fail at (the
+/// comparison, rather than the terminal call) and would break sorts that never
+/// compare two incomparable elements. So a value with no natural order keeps a
+/// stable, deterministic position (it sorts after the ordered values, in
+/// encounter order) instead of pretending to be equal to everything: equal
+/// would leave `Stream.of("b","a")` unsorted, which is the bug this fixes.
+///
+/// Ordered Java values and their representation here: `String` (a heap
+/// string), the wrappers (plain `Int`/`Long`/`Float`/`Double` values),
+/// `Character` (`Int`, its code point), `Boolean` (`Int` 0/1, `false` before
+/// `true`), and enums (sorted by `ordinal`, read from the instance).
+fn natural_order(heap: &Heap, a: &Value, b: &Value) -> i32 {
+    // Strings are the case mods actually hit. Both must be strings to compare
+    // as strings: a `String` next to an `Integer` is the JVM's
+    // `ClassCastException`, which the doc comment above deliberately does not
+    // raise.
+    if let (Some(x), Some(y)) = (string_of(heap, a), string_of(heap, b)) {
+        return compare_java_strings(x, y);
+    }
     let order = match (a, b) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Long(a), Value::Long(b)) => a.cmp(b),
@@ -5155,13 +5644,37 @@ fn natural_order(a: &Value, b: &Value) -> i32 {
         (Value::Double(a), Value::Double(b)) => {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
         }
-        _ => std::cmp::Ordering::Equal,
+        // Mixed numeric wrappers (`Integer` next to `Long`) are a
+        // `ClassCastException` in Java; comparing by value is the closest
+        // total order, and it keeps the sort stable instead of leaving the
+        // pair where it was.
+        (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_), other)
+            if is_number(other) =>
+        {
+            a.as_double()
+                .partial_cmp(&b.as_double())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+        // A `boolean` and a `Character` both arrive as `Int`. Java orders
+        // `false` before `true` (exactly what 0/1 gives) and a `char` by its
+        // code unit, which is what the `Int` holds.
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        _ => return 0,
     };
-    match order {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    }
+    ordering_to_int(order)
+}
+
+/// The text of a heap string value, when `value` is one.
+fn string_of<'a>(heap: &'a Heap, value: &Value) -> Option<&'a str> {
+    value.as_obj().and_then(|id| heap.get_string(id))
+}
+
+/// Whether a value is one of the runtime's primitive numbers.
+fn is_number(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)
+    )
 }
 
 /// Find index in opcodes corresponding to byte_offset + offset.
@@ -5225,7 +5738,85 @@ fn extract_return_type(desc: &str) -> String {
     "java/lang/Object".into()
 }
 
-/// The JVM descriptor of the class a `java.lang.Class` object names.
+/// The JVM descriptor of one array component type, as the runtime records it.
+///
+/// A `JavaObject::Array`'s `elem_type` is a *component*, not a full array type,
+/// and it is written in whichever spelling its producer used:
+/// `newarray` writes a primitive name (`int`), `anewarray` and
+/// `multianewarray` write a class name (possibly one that itself starts with
+/// `[`), the NBT value tree writes `I`, and `builtins.rs` matches the primitive
+/// names. All of them normalise to a descriptor (`I`, `Ljava/lang/String;`,
+/// `[I`) so array casts can compare descriptors instead of spellings.
+fn component_descriptor(elem_type: &str) -> Option<String> {
+    // Already a descriptor (`[I`, `[Ljava/lang/String;`, `I`).
+    if elem_type.starts_with('[') || elem_type.len() == 1 {
+        return match elem_type.as_bytes()[0] {
+            b'[' => Some(elem_type.to_string()),
+            b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D' => Some(elem_type.to_string()),
+            _ => None,
+        };
+    }
+    let primitive = match elem_type {
+        "boolean" => Some('Z'),
+        "byte" => Some('B'),
+        "char" => Some('C'),
+        "short" => Some('S'),
+        "int" => Some('I'),
+        "long" => Some('J'),
+        "float" => Some('F'),
+        "double" => Some('D'),
+        _ => None,
+    };
+    if let Some(primitive) = primitive {
+        return Some(primitive.to_string());
+    }
+    if elem_type.is_empty() {
+        return None;
+    }
+    Some(format!("L{elem_type};"))
+}
+
+/// The `newarray` spelling of a primitive descriptor (`I` → `int`), or `None`
+/// for a reference descriptor.
+fn primitive_name(descriptor: &str) -> Option<&'static str> {
+    Some(match descriptor {
+        "Z" => "boolean",
+        "B" => "byte",
+        "C" => "char",
+        "S" => "short",
+        "I" => "int",
+        "J" => "long",
+        "F" => "float",
+        "D" => "double",
+        _ => return None,
+    })
+}
+
+/// The primitive descriptor a component descriptor is (`I` → `Some("I")`), or
+/// `None` for a reference component.
+fn primitive_component(descriptor: &str) -> Option<&str> {
+    if descriptor.len() == 1
+        && matches!(
+            descriptor.as_bytes()[0],
+            b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D'
+        )
+    {
+        Some(descriptor)
+    } else {
+        None
+    }
+}
+
+/// The class name inside a reference component descriptor (`Ljava/lang/X;` →
+/// `java/lang/X`).
+fn reference_component_name(descriptor: &str) -> &str {
+    descriptor
+        .strip_prefix('L')
+        .and_then(|descriptor| descriptor.strip_suffix(';'))
+        .unwrap_or(descriptor)
+}
+
+/// The JVM descriptor of the class a `java.lang.Class` object names./// The JVM descriptor of the class a `java.lang.Class` object names.
 fn class_descriptor(name: &str) -> String {
     match name {
         "boolean" => "Z".into(),

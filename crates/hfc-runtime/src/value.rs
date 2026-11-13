@@ -84,6 +84,20 @@ pub trait NativeObject: fmt::Debug + Send + Sync {
     fn class_name(&self) -> &str;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// The heap ids this object holds, for the scoped heap's reference scan.
+    ///
+    /// A native object keeps its state in Rust fields, so a heap id it stores
+    /// is invisible to the scan that walks `JavaObject`s. A scoped value kept
+    /// only there would be truncated and its id later reused, so the object
+    /// that held it would point at an unrelated one. Every implementor whose
+    /// fields contain a [`Value`], a heap id or a collection of either must
+    /// report them here. The default — no ids — is correct only for a native
+    /// that holds nothing but plain data; say so in a comment when relying on
+    /// it, because a missed id is silent corruption rather than an error.
+    fn held_ids(&self) -> Vec<usize> {
+        Vec::new()
+    }
 }
 
 /// A heap-allocated Java object.

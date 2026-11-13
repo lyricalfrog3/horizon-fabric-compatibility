@@ -60,6 +60,12 @@ pub enum Opcode {
     Fsub,
     Fmul,
     Fdiv,
+    /// `frem`: Java's float `%`. Rust's `f32` `%` is the same IEEE 754
+    /// remainder (sign of the dividend; NaN for `inf % x`, `x % 0.0` and
+    /// `inf % inf`; `x % inf == x` for finite `x`), so the interpreter can use
+    /// it directly. The opcode was previously **missing from this enum**, and
+    /// the converter dropped it, so `a % b` left both operands on the stack.
+    Frem,
 
     Ifeq(i32),
     Ifne(i32),
@@ -873,8 +879,28 @@ impl Class {
                     let mut opcodes = Vec::new();
                     if let Some(bc) = &raw_code.bytecode {
                         for (offset, raw_op) in &bc.opcodes {
-                            if let Some(op) = convert_opcode(raw_op) {
-                                opcodes.push((*offset, op));
+                            match convert_opcode(raw_op) {
+                                Ok(op) => opcodes.push((*offset, op)),
+                                // An opcode the runtime does not model must fail
+                                // the load. Dropping it used to remove the
+                                // instruction silently while leaving its
+                                // operands on the stack: `a % b` became "leave
+                                // both floats, then `freturn` the lower one", so
+                                // `7.0f % 2.0f` answered 7.0 instead of 1.0 and
+                                // nothing (`Interpreter::missing`, a log line)
+                                // said so. A JVM verifier rejects a class it
+                                // cannot execute; this is the same contract.
+                                Err(raw_opcode) => {
+                                    return Err(Error::new(
+                                        "class",
+                                        format!(
+                                            "{}: cannot load method {}: unsupported opcode \
+                                             {raw_opcode} at bytecode offset {offset} \
+                                             (descriptor {})",
+                                            this_class, m.name, m.descriptor
+                                        ),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -935,8 +961,15 @@ fn obj_arr_to_string(o: &ObjectArrayType<'_>) -> String {
     }
 }
 
-fn convert_opcode(raw: &RawOpcode<'_>) -> Option<Opcode> {
-    Some(match raw {
+/// Convert one parsed opcode to the interpreter's own IR.
+///
+/// `Err` carries the reason the opcode cannot be executed, including the raw
+/// opcode itself; the caller turns that into a hard class-load error. Returning
+/// an `Option` and skipping the `None` was a silent-corruption bug: the
+/// instruction vanished while its stack operands stayed, so `frem` made
+/// `7.0f % 2.0f` answer `7.0f`.
+fn convert_opcode(raw: &RawOpcode<'_>) -> std::result::Result<Opcode, String> {
+    Ok(match raw {
         RawOpcode::Aload(i) => Opcode::Aload(*i),
         RawOpcode::Astore(i) => Opcode::Astore(*i),
         RawOpcode::Iload(i) => Opcode::Iload(*i),
@@ -982,12 +1015,29 @@ fn convert_opcode(raw: &RawOpcode<'_>) -> Option<Opcode> {
                 }
             },
             Loadable::ClassInfo(c) => Opcode::LdcClass(c.to_string()),
-            _ => return None,
+            // A `CONSTANT_MethodHandle`, `CONSTANT_MethodType` or
+            // `CONSTANT_Dynamic` has no value the runtime can hand out: a
+            // MethodHandle would need a call-site object the interpreter does
+            // not model, and a Dynamic constant is produced by a bootstrap
+            // method that has not been run. Answering null or a stand-in would
+            // be a fabricated value a mod then dereferences, so the class
+            // fails to load with the reason instead.
+            other => {
+                return Err(format!(
+                    "`ldc` of {other:?} (a MethodHandle, MethodType or Dynamic constant) \
+                     is not supported"
+                ));
+            }
         },
         RawOpcode::Ldc2W(entry) => match entry {
             Loadable::LiteralConstant(LiteralConstant::Long(l)) => Opcode::LdcLong(*l),
             Loadable::LiteralConstant(LiteralConstant::Double(d)) => Opcode::LdcDouble(*d),
-            _ => return None,
+            other => {
+                return Err(format!(
+                    "`ldc2_w` of {other:?} (a MethodHandle, MethodType or Dynamic constant) \
+                     is not supported"
+                ));
+            }
         },
 
         RawOpcode::Dup => Opcode::Dup,
@@ -1012,6 +1062,7 @@ fn convert_opcode(raw: &RawOpcode<'_>) -> Option<Opcode> {
         RawOpcode::Fsub => Opcode::Fsub,
         RawOpcode::Fmul => Opcode::Fmul,
         RawOpcode::Fdiv => Opcode::Fdiv,
+        RawOpcode::Frem => Opcode::Frem,
         RawOpcode::Fneg => Opcode::Fneg,
 
         RawOpcode::Ishl => Opcode::Ishl,
@@ -1179,6 +1230,17 @@ fn convert_opcode(raw: &RawOpcode<'_>) -> Option<Opcode> {
         RawOpcode::Instanceof(c) => Opcode::Instanceof(obj_arr_to_string(c)),
         RawOpcode::Athrow => Opcode::Athrow,
         RawOpcode::Nop => Opcode::Nop,
-        _ => return None,
+        // `Jsr`/`Ret` are the removed subroutine opcodes, `Breakpoint` and
+        // `Impdep1`/`Impdep2` are reserved for debuggers, and `JsrW` is the
+        // wide form of `jsr`. A `jsr` would need a return-address type the IR
+        // has no slot for, and the JVM verifier rejects new class files that
+        // use one, so no javac output reaches them. They must still be loud:
+        // silently dropping them skips a call and leaves the nothing `jsr`
+        // pushed on the stack.
+        other => {
+            return Err(format!(
+                "`{other:?}` is not implemented by this interpreter"
+            ));
+        }
     })
 }

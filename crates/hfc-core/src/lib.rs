@@ -11,7 +11,8 @@ use std::{
     fmt,
     fs::{self, File},
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// The compatibility layer's API line. Generated ports record it so a later
@@ -170,22 +171,90 @@ pub fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Write a file atomically: a sibling temporary file, flushed, then renamed
-/// over the destination. An interrupted write leaves the old file intact.
+/// The prefix every temporary file of [`atomic_write`] carries, so a stale one
+/// from a killed process can be recognised and swept.
+pub const PARTIAL_PREFIX: &str = ".hfc-part-";
+
+/// Distinguishes concurrent writers inside one process. The process id alone is
+/// not enough: two threads writing the same destination would otherwise pick
+/// the same name.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Deletes its temporary file unless the write completed, so a failed or
+/// unwinding write leaves nothing behind.
+struct TempGuard(Option<PathBuf>);
+
+impl TempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn keep(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Write a file atomically: a uniquely named sibling temporary file, flushed,
+/// then renamed over the destination, then the parent directory synced so the
+/// rename survives a crash. An interrupted write leaves the old file intact and
+/// (via [`TempGuard`]) no partial file behind.
+///
+/// Two writers to the same path in the same process do not collide: each gets
+/// its own temporary name, and the final content is whichever rename ran last,
+/// never a mixture.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_dir(path);
     fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into());
-    let tmp = parent.join(format!(".{name}.hfc-part"));
+    let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{name}{PARTIAL_PREFIX}{}-{sequence}",
+        std::process::id()
+    ));
+    let mut guard = TempGuard::new(tmp.clone());
     {
         let mut file = File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
         file.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
         file.sync_all().map_err(|e| Error::io(&tmp, e))?;
     }
-    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
+    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    guard.keep();
+    sync_parent(parent)?;
+    Ok(())
+}
+
+/// The directory holding `path`. `Path::new("a.json").parent()` is `Some("")`,
+/// not `None`, and an empty path cannot be opened, so both cases mean the
+/// current directory.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Make the rename durable. Without this an unflushed directory entry can be
+/// lost even though the file contents were synced.
+#[cfg(unix)]
+fn sync_parent(parent: &Path) -> Result<()> {
+    let dir = File::open(parent).map_err(|e| Error::io(parent, e))?;
+    dir.sync_all().map_err(|e| Error::io(parent, e))
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Write JSON atomically.
@@ -248,7 +317,114 @@ mod tests {
         atomic_write_json(&path, &serde_json::json!({"a": 2})).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"a\": 2"));
-        assert!(!dir.join(".value.json.hfc-part").exists());
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(PARTIAL_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_write_removes_its_temporary_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hfc-atomic-fail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // A directory at the destination makes the final rename fail after the
+        // temporary file was written.
+        let path = dir.join("occupied");
+        fs::create_dir_all(&path).unwrap();
+        assert!(atomic_write(&path, b"data").is_err());
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(PARTIAL_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_file_name_resolves_to_the_current_directory() {
+        // `Path::new("x").parent()` is `Some("")`, not `None`; an empty parent
+        // must mean ".", never an unopenable path.
+        assert_eq!(parent_dir(Path::new("bare.json")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("dir/file.json")), Path::new("dir"));
+        assert_eq!(parent_dir(Path::new("/abs/file.json")), Path::new("/abs"));
+    }
+
+    #[test]
+    fn a_bare_file_name_in_the_current_directory_works() {
+        // The same case end to end: the write and its parent fsync must
+        // succeed with only a file name. The guard restores the process's
+        // directory even if the write panics, so other tests are unaffected
+        // (they all use absolute temp paths).
+        struct RestoreDir(PathBuf);
+        impl Drop for RestoreDir {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("hfc-atomic-cwd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let _guard = RestoreDir(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&dir).unwrap();
+        atomic_write(Path::new("bare.json"), b"ok").unwrap();
+        assert_eq!(fs::read(dir.join("bare.json")).unwrap(), b"ok");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_collide() {
+        let dir = std::env::temp_dir().join(format!("hfc-atomic-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.json");
+
+        // Two distinct contents, one per writer. Each thread writes its own
+        // payload many times; every write must succeed and the surviving file
+        // must be exactly one of the two payloads, never a mixture.
+        let payload_a =
+            serde_json::to_vec_pretty(&serde_json::json!({"writer": "a", "n": 1})).unwrap();
+        let payload_b =
+            serde_json::to_vec_pretty(&serde_json::json!({"writer": "b", "n": 2})).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for payload in [payload_a.clone(), payload_b.clone()] {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..50 {
+                    atomic_write(&path, &payload).expect("concurrent atomic_write failed");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let final_bytes = fs::read(&path).unwrap();
+        assert!(
+            final_bytes == payload_a || final_bytes == payload_b,
+            "final file is not one of the two payloads: {:?}",
+            String::from_utf8_lossy(&final_bytes)
+        );
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(PARTIAL_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
